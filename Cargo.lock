@@ -291,7 +291,7 @@ dependencies = [
 name = "arceos-net-httpclient"
 version = "0.3.1"
 dependencies = [
- "ax-io",
+ "ax-io 0.5.4",
  "ax-std",
 ]
 
@@ -322,6 +322,23 @@ name = "arceos-priority"
 version = "0.3.1"
 dependencies = [
  "ax-std",
+]
+
+[[package]]
+name = "arceos-rust"
+version = "0.1.0"
+
+[[package]]
+name = "arceos-rust-interface"
+version = "1.0.0"
+dependencies = [
+ "ax-api",
+ "ax-feat",
+ "ax-io 0.5.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ax-posix-api",
+ "ax-runtime",
+ "kspin",
+ "rand 0.9.4",
 ]
 
 [[package]]
@@ -379,7 +396,7 @@ name = "arm_vcpu"
 version = "0.5.5"
 dependencies = [
  "aarch64-cpu 11.2.0",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-percpu",
  "axaddrspace",
  "axdevice_base",
@@ -396,7 +413,7 @@ version = "0.4.6"
 dependencies = [
  "aarch64-cpu 11.2.0",
  "aarch64_sysreg",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "axaddrspace",
  "axdevice_base",
@@ -496,7 +513,7 @@ name = "ax-alloc"
 version = "0.6.0"
 dependencies = [
  "ax-allocator",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-kspin",
  "ax-memory-addr",
  "ax-percpu",
@@ -513,7 +530,7 @@ name = "ax-allocator"
 version = "0.4.4"
 dependencies = [
  "ax-allocator",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax_slab_allocator",
  "bitmap-allocator",
  "buddy_system_allocator 0.10.0",
@@ -532,11 +549,11 @@ dependencies = [
  "ax-display",
  "ax-dma",
  "ax-driver",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-feat",
  "ax-fs",
  "ax-hal",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-ipi",
  "ax-log",
  "ax-mm",
@@ -689,7 +706,7 @@ dependencies = [
  "ax-driver-pci",
  "ax-driver-virtio",
  "ax-driver-vsock",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-hal",
  "axplat-dyn",
  "cfg-if",
@@ -778,6 +795,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ax-errno"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e1bccea08d962fa5ec84391917fda11165f320f27a092a910aa90070998bce"
+dependencies = [
+ "log",
+ "strum 0.27.2",
+]
+
+[[package]]
 name = "ax-feat"
 version = "0.5.12"
 dependencies = [
@@ -805,12 +832,12 @@ version = "0.5.11"
 dependencies = [
  "ax-cap-access",
  "ax-driver",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-fs-devfs",
  "ax-fs-ramfs",
  "ax-fs-vfs",
  "ax-hal",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-lazyinit",
  "axfatfs",
  "log",
@@ -833,9 +860,9 @@ version = "0.5.12"
 dependencies = [
  "ax-alloc",
  "ax-driver",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-hal",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-kspin",
  "ax-sync",
  "axfs-ng-vfs",
@@ -867,7 +894,7 @@ dependencies = [
 name = "ax-fs-vfs"
 version = "0.3.8"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "bitflags 2.11.1",
  "log",
 ]
@@ -955,7 +982,19 @@ version = "0.3.6"
 name = "ax-io"
 version = "0.5.4"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
+ "heapless 0.9.3",
+ "memchr",
+]
+
+[[package]]
+name = "ax-io"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7aaf272cee32d63028098e1bca913e357d6d5229b35099d00edecf5f719eb8d"
+dependencies = [
+ "autocfg",
+ "ax-errno 0.4.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "heapless 0.9.3",
  "memchr",
 ]
@@ -997,9 +1036,9 @@ version = "0.4.7"
 name = "ax-libc"
 version = "0.5.11"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-feat",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-posix-api",
  "bindgen",
 ]
@@ -1037,7 +1076,7 @@ version = "0.6.8"
 name = "ax-memory-set"
 version = "0.6.7"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
 ]
 
@@ -1046,7 +1085,7 @@ name = "ax-mm"
 version = "0.5.12"
 dependencies = [
  "ax-alloc",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-hal",
  "ax-kspin",
  "ax-lazyinit",
@@ -1061,9 +1100,9 @@ name = "ax-net"
 version = "0.5.11"
 dependencies = [
  "ax-driver",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-hal",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-lazyinit",
  "ax-sync",
  "ax-task",
@@ -1081,10 +1120,10 @@ dependencies = [
  "async-trait",
  "ax-config",
  "ax-driver",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-fs-ng",
  "ax-hal",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-sync",
  "ax-task",
  "axfs-ng-vfs",
@@ -1116,7 +1155,7 @@ name = "ax-page-table-multiarch"
 version = "0.8.8"
 dependencies = [
  "arrayvec",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "ax-page-table-entry",
  "bitmaps",
@@ -1301,11 +1340,11 @@ version = "0.5.12"
 dependencies = [
  "ax-alloc",
  "ax-config",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-feat",
  "ax-fs",
  "ax-hal",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-log",
  "ax-net",
  "ax-runtime",
@@ -1376,9 +1415,9 @@ name = "ax-std"
 version = "0.5.11"
 dependencies = [
  "ax-api",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-feat",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-kspin",
  "ax-lazyinit",
  "lock_api",
@@ -1404,7 +1443,7 @@ dependencies = [
  "ax-config",
  "ax-cpumask",
  "ax-crate-interface",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-hal",
  "ax-kernel-guard",
  "ax-kspin",
@@ -1441,7 +1480,7 @@ name = "axaddrspace"
 version = "0.5.7"
 dependencies = [
  "assert_matches",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-lazyinit",
  "ax-memory-addr",
  "ax-memory-set",
@@ -1514,7 +1553,7 @@ name = "axdevice"
 version = "0.4.7"
 dependencies = [
  "arm_vgic",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "axaddrspace",
  "axdevice_base",
@@ -1530,7 +1569,7 @@ dependencies = [
 name = "axdevice_base"
 version = "0.4.7"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "axaddrspace",
  "axvmconfig",
  "serde",
@@ -1550,7 +1589,7 @@ dependencies = [
 name = "axfs-ng-vfs"
 version = "0.3.8"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "axpoll",
  "bitflags 2.11.1",
  "cfg-if",
@@ -1565,7 +1604,7 @@ dependencies = [
 name = "axhvc"
 version = "0.4.5"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
 ]
 
 [[package]]
@@ -1584,7 +1623,7 @@ dependencies = [
 name = "axklib"
 version = "0.5.6"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "trait-ffi",
 ]
@@ -1606,7 +1645,7 @@ dependencies = [
  "ax-driver-block",
  "ax-driver-net",
  "ax-driver-virtio",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-kspin",
  "ax-memory-addr",
  "ax-percpu",
@@ -1766,7 +1805,7 @@ dependencies = [
 name = "axvcpu"
 version = "0.5.5"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "ax-percpu",
  "axaddrspace",
@@ -1783,7 +1822,7 @@ dependencies = [
  "ax-config",
  "ax-cpumask",
  "ax-crate-interface",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-hal",
  "ax-kernel-guard",
  "ax-kspin",
@@ -1856,7 +1895,7 @@ dependencies = [
  "arm_vcpu",
  "arm_vgic",
  "ax-cpumask",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "ax-page-table-entry",
  "ax-page-table-multiarch",
@@ -1879,7 +1918,7 @@ dependencies = [
 name = "axvmconfig"
 version = "0.4.8"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "clap",
  "enumerable",
  "env_logger",
@@ -4858,7 +4897,7 @@ dependencies = [
 name = "loongarch_vcpu"
 version = "0.5.0"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-percpu",
  "axaddrspace",
  "axvcpu",
@@ -6474,7 +6513,7 @@ name = "riscv_vcpu"
 version = "0.5.6"
 dependencies = [
  "ax-crate-interface",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "ax-page-table-entry",
  "axaddrspace",
@@ -6498,7 +6537,7 @@ dependencies = [
 name = "riscv_vplic"
 version = "0.4.8"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "axaddrspace",
  "axdevice_base",
  "axvisor_api",
@@ -7477,12 +7516,12 @@ dependencies = [
  "ax-config",
  "ax-display",
  "ax-driver",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-feat",
  "ax-fs-ng",
  "ax-hal",
  "ax-input",
- "ax-io",
+ "ax-io 0.5.4",
  "ax-ipi",
  "ax-kernel-guard",
  "ax-kspin",
@@ -7558,7 +7597,7 @@ name = "starry-signal"
 version = "0.6.0"
 dependencies = [
  "ax-cpu",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-kspin",
  "bitflags 2.11.1",
  "cfg-if",
@@ -7575,7 +7614,7 @@ dependencies = [
 name = "starry-vm"
 version = "0.5.6"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "bytemuck",
  "extern-trait",
 ]
@@ -9502,7 +9541,7 @@ name = "x86_vcpu"
 version = "0.5.6"
 dependencies = [
  "ax-crate-interface",
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "ax-page-table-entry",
  "axaddrspace",
@@ -9528,7 +9567,7 @@ dependencies = [
 name = "x86_vlapic"
 version = "0.4.7"
 dependencies = [
- "ax-errno",
+ "ax-errno 0.4.8",
  "ax-memory-addr",
  "axaddrspace",
  "axdevice_base",
