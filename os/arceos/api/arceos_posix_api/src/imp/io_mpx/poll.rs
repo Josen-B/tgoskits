@@ -41,7 +41,7 @@ pub fn sys_poll(fds: *mut ctypes::pollfd, nfds: ctypes::nfds_t, timeout: c_int) 
 
         loop {
             #[cfg(feature = "net")]
-            axnet::poll_interfaces();
+            ax_net::poll_interfaces();
 
             let mut ready_count: usize = 0;
 

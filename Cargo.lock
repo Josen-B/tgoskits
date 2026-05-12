@@ -336,9 +336,9 @@ dependencies = [
  "ax-errno",
  "ax-feat",
  "ax-io",
+ "ax-kspin",
  "ax-posix-api",
  "ax-runtime",
- "kspin",
  "log",
  "rand 0.9.4",
 ]

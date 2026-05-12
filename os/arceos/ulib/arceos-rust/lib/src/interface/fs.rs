@@ -59,5 +59,5 @@ pub fn sys_mkdir(name: *const c_char, _mode: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> isize {
     info!("called sys_getdents64");
-    unsafe { arceos_posix_api::sys_getdents64(fd, buf, len) as _ }
+    unsafe { ax_posix_api::sys_getdents64(fd, buf, len) as _ }
 }

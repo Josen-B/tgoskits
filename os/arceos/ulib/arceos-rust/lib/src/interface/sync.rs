@@ -1,9 +1,9 @@
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::time::Duration;
 
-use ax_api::modules::{ax_sync::Mutex, ax_task::WaitQueue};
+use ax_api::modules::{ax_hal::time::monotonic_time, ax_sync::Mutex, ax_task::WaitQueue};
 use ax_errno::LinuxError;
-use ax_posix_api::ctypes::timespec;
+use ax_posix_api::ctypes::{FUTEX_RELATIVE_TIMEOUT, timespec};
 use log::{info, trace};
 
 use crate::err;
@@ -24,8 +24,12 @@ pub fn sys_futex_wait(
     address: *mut u32,
     expected: u32,
     timeout: *const timespec,
-    _flags: u32,
+    flags: u32,
 ) -> i32 {
+    if flags & !FUTEX_RELATIVE_TIMEOUT != 0 {
+        // other flags are not supported
+        return err(LinuxError::EINVAL);
+    }
     let Some(value) = (unsafe { address.as_ref() }) else {
         return err(LinuxError::EINVAL);
     };
@@ -45,10 +49,20 @@ pub fn sys_futex_wait(
     );
     if let Some(timeout) = unsafe { timeout.as_ref() } {
         trace!("called sys_futex_wait with timeout: {:?}", timeout);
-        let duration = Duration::new(
+        let timeout = Duration::new(
             timeout.tv_sec.saturating_cast_unsigned(),
             timeout.tv_nsec.saturating_cast_unsigned(),
         );
+        let duration = if flags & FUTEX_RELATIVE_TIMEOUT != 0 {
+            timeout
+        } else {
+            let now = monotonic_time();
+            let Some(duration) = timeout.checked_sub(now) else {
+                return err(LinuxError::ETIMEDOUT);
+            };
+            duration
+        };
+        // relative timeout
         if wait_queue.wait_timeout(duration) {
             // timeout
             return err(LinuxError::ETIMEDOUT);
@@ -79,7 +93,14 @@ pub fn sys_futex_wake(address: *mut u32, count: i32) -> i32 {
             None => return 0,
         }
     };
-    let woken_count = wait_queue.notify_many(count as _, false);
+    let mut woken_count = 0;
+    for _ in 0..count {
+        if wait_queue.notify_one(true) {
+            woken_count += 1;
+        } else {
+            break;
+        }
+    }
     trace!("futex woke {} threads", woken_count);
     woken_count as _
 }

@@ -1,7 +1,6 @@
-use core::{
-    ffi::c_char,
-    sync::atomic::{AtomicI32, Ordering},
-};
+#[cfg(feature = "fs")]
+use core::ffi::c_char;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use ax_posix_api::ctypes::iovec;
 use log::info;

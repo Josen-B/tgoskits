@@ -30,6 +30,7 @@ pub fn sys_getaddrinfo(
         nodename, servname
     );
     let result = unsafe { ax_posix_api::sys_getaddrinfo(nodename, servname, hints, res) };
+    // result is the length of the list
     if result > 0 {
         // hermit expected us to return 0 if success
         0
@@ -86,13 +87,13 @@ pub fn sys_listen(socket_fd: i32, backlog: i32) -> i32 {
         "[sys_listen] socket_fd: {}, backlog: {}",
         socket_fd, backlog
     );
-    arceos_posix_api::sys_listen(socket_fd, backlog)
+    ax_posix_api::sys_listen(socket_fd, backlog)
 }
 
 #[unsafe(no_mangle)]
 pub fn sys_bind(socket_fd: i32, name: *const sockaddr, namelen: socklen_t) -> i32 {
     info!("[sys_bind] socket_fd: {}, namelen: {}", socket_fd, namelen);
-    arceos_posix_api::sys_bind(socket_fd, name, namelen)
+    ax_posix_api::sys_bind(socket_fd, name, namelen)
 }
 
 #[unsafe(no_mangle)]
@@ -101,7 +102,7 @@ pub fn sys_getsockname(socket_fd: i32, name: *mut sockaddr, namelen: *mut sockle
         "[sys_getsockname] socket_fd: {}, namelen: {:p}",
         socket_fd, namelen
     );
-    unsafe { arceos_posix_api::sys_getsockname(socket_fd, name, namelen) }
+    unsafe { ax_posix_api::sys_getsockname(socket_fd, name, namelen) }
 }
 
 #[unsafe(no_mangle)]
@@ -110,7 +111,7 @@ pub fn sys_accept(socket_fd: i32, addr: *mut sockaddr, addrlen: *mut socklen_t) 
         "[sys_accept] socket_fd: {}, addrlen: {:p}",
         socket_fd, addrlen
     );
-    unsafe { arceos_posix_api::sys_accept(socket_fd, addr, addrlen) }
+    unsafe { ax_posix_api::sys_accept(socket_fd, addr, addrlen) }
 }
 
 #[unsafe(no_mangle)]
@@ -125,7 +126,7 @@ pub fn sys_setsockopt(
         "[setsockopt] socket_fd: {}, level: {}, optname: {}, optlen: {}",
         socket_fd, level, optname, optlen
     );
-    unsafe { arceos_posix_api::sys_setsockopt(socket_fd, level, optname, optval, optlen) }
+    unsafe { ax_posix_api::sys_setsockopt(socket_fd, level, optname, optval, optlen) }
 }
 
 #[unsafe(no_mangle)]
@@ -154,16 +155,16 @@ pub fn sys_ioctl(fd: i32, cmd: i32, argp: *mut c_void) -> i32 {
     info!("[sys_ioctl] fd: {}, cmd: {:#x}", fd, cmd);
     if cmd == FIONBIO {
         if argp.is_null() {
-            return -(axerrno::LinuxError::EFAULT.code() as i32);
+            return -(ax_errno::LinuxError::EFAULT.code() as i32);
         }
         let val = unsafe { *(argp as *const c_int) };
         let nonblocking = val != 0;
         info!("[sys_ioctl] FIONBIO: nonblocking={}", nonblocking);
-        match arceos_posix_api::sys_fcntl(
+        match ax_posix_api::sys_fcntl(
             fd,
-            arceos_posix_api::ctypes::F_SETFL as c_int,
+            ax_posix_api::ctypes::F_SETFL as c_int,
             if nonblocking {
-                arceos_posix_api::ctypes::O_NONBLOCK as usize
+                ax_posix_api::ctypes::O_NONBLOCK as usize
             } else {
                 0
             },
@@ -173,7 +174,7 @@ pub fn sys_ioctl(fd: i32, cmd: i32, argp: *mut c_void) -> i32 {
         }
     } else {
         info!("[sys_ioctl] unsupported cmd: {:#x}", cmd);
-        -(axerrno::LinuxError::EINVAL.code() as i32)
+        -(ax_errno::LinuxError::EINVAL.code() as i32)
     }
 }
 
@@ -183,7 +184,7 @@ pub fn sys_ioctl(fd: i32, cmd: i32, argp: *mut c_void) -> i32 {
 /// returns the number of ready fds on success, 0 on timeout, or **-1** on
 /// error (with the actual error code retrievable via `sys_get_errno`).
 ///
-/// The underlying `arceos_posix_api::sys_poll` returns negative errno on
+/// The underlying `ax_posix_api::sys_poll` returns negative errno on
 /// error (via `syscall_body!`), so we translate here.
 #[unsafe(no_mangle)]
 pub fn sys_poll(fds: *mut pollfd, nfds: nfds_t, timeout: i32) -> i32 {
@@ -191,7 +192,7 @@ pub fn sys_poll(fds: *mut pollfd, nfds: nfds_t, timeout: i32) -> i32 {
         "[sys_poll] fds: {:p}, nfds: {}, timeout: {}ms",
         fds, nfds, timeout
     );
-    let ret = arceos_posix_api::sys_poll(fds, nfds, timeout);
+    let ret = ax_posix_api::sys_poll(fds, nfds, timeout);
     if ret < 0 {
         // Convert from -errno to POSIX -1 + set errno
         set_errno(-ret);
@@ -222,7 +223,7 @@ pub fn sys_getsockopt(
     );
 
     if optval.is_null() || optlen.is_null() {
-        return -(axerrno::LinuxError::EFAULT.code() as i32);
+        return -(ax_errno::LinuxError::EFAULT.code() as i32);
     }
 
     // For most options we return sensible defaults since ArceOS's
@@ -243,7 +244,7 @@ pub fn sys_getsockopt(
         };
         write_sockopt(optval, optlen, &tv)
     } else if level == SOL_SOCKET && optname == SO_LINGER {
-        let val = arceos_posix_api::ctypes::linger {
+        let val = ax_posix_api::ctypes::linger {
             l_onoff: 0,
             l_linger: 0,
         };
@@ -264,7 +265,7 @@ pub fn sys_getsockopt(
             "[sys_getsockopt] unsupported: level={}, optname={:#x}",
             level, optname
         );
-        -(axerrno::LinuxError::ENOPROTOOPT.code() as i32)
+        -(ax_errno::LinuxError::ENOPROTOOPT.code() as i32)
     }
 }
 
@@ -273,7 +274,7 @@ fn write_sockopt<T: Copy>(optval: *mut c_void, optlen: *mut socklen_t, val: &T) 
     let len = size_of::<T>();
     unsafe {
         if (*optlen as usize) < len {
-            return -(axerrno::LinuxError::EINVAL.code() as i32);
+            return -(ax_errno::LinuxError::EINVAL.code() as i32);
         }
         core::ptr::copy_nonoverlapping(val as *const T as *const u8, optval as *mut u8, len);
         *optlen = len as socklen_t;

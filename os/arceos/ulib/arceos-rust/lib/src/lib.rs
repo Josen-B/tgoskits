@@ -1,5 +1,7 @@
 #![no_std]
+#![allow(unused_features)]
 #![feature(extern_item_impls)]
+#![feature(integer_cast_extras)]
 
 extern crate alloc;
 
