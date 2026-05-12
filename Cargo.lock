@@ -815,6 +815,7 @@ dependencies = [
  "ax-hal",
  "axplat-dyn",
  "cfg-if",
+ "gpt_disk_io",
  "log",
  "smallvec",
 ]
@@ -831,6 +832,7 @@ dependencies = [
  "bcm2835-sdhci",
  "gpt_disk_io",
  "log",
+ "sg200x-bsp",
  "simple-ahci",
  "simple-sdmmc",
 ]
@@ -1392,6 +1394,22 @@ dependencies = [
  "riscv_goldfish",
  "sbi-rt",
  "some-serial",
+]
+
+[[package]]
+name = "ax-plat-riscv64-sg2002"
+version = "0.3.1"
+dependencies = [
+ "ax-config-macros",
+ "ax-cpu",
+ "ax-kspin",
+ "ax-lazyinit",
+ "ax-plat",
+ "ax-riscv-plic",
+ "dw_uart_rs",
+ "log",
+ "riscv 0.16.0",
+ "sbi-rt",
 ]
 
 [[package]]
@@ -2128,6 +2146,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0700ddab506f33b20a03b13996eccd309a48e5ff77d0d95926aa0210fb4e95f1"
 dependencies = [
  "bit-vec",
+]
+
+[[package]]
+name = "bit-struct"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "270fbbb014407467f7a2c9b1fa0b74057d5cbc452f18bac3bb5aad601e590521"
+dependencies = [
+ "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -3478,6 +3506,15 @@ dependencies = [
  "log",
  "sdmmc-protocol",
  "volatile 0.6.1",
+]
+
+[[package]]
+name = "dw_uart_rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da3751978e2d9bced3cb480631bb2c14098357ae269ac95475720aee545c6dcd"
+dependencies = [
+ "tock-registers 0.8.1",
 ]
 
 [[package]]
@@ -7809,6 +7846,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sg200x-bsp"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "286c45286f82b7c44def11337f86aa34245f9400ed4d5f8bc901a0c3efdb4388"
+dependencies = [
+ "bit-struct",
+ "log",
+ "tock-registers 0.9.0",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8413,6 +8461,7 @@ version = "0.5.9"
 dependencies = [
  "anyhow",
  "ax-feat",
+ "ax-plat-riscv64-sg2002",
  "axbuild",
  "axplat-dyn",
  "axplat-riscv64-visionfive2",

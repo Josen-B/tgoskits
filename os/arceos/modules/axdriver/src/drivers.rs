@@ -97,14 +97,16 @@ cfg_if::cfg_if! {
 
 cfg_if::cfg_if! {
     if #[cfg(block_dev = "cvsd")] {
-        use ax_hal::mem::phys_to_virt;
         use ax_driver_block::cvsd::CvsdDriver;
         use super::mbr::MbrPartitionDev;
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        use ax_hal::mem::phys_to_virt;
 
         pub struct CvsdMmc;
         register_block_driver!(CvsdMmc, MbrPartitionDev<CvsdDriver>);
 
         impl DriverProbe for CvsdMmc {
+            #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
             fn probe_global() -> Option<AxDeviceEnum> {
                 info!("Probe CV SD Bootable Part @ {:#x}", ax_config::devices::CVSD_PADDR);
 

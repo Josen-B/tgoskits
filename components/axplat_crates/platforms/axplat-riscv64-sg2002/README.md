@@ -53,4 +53,3 @@ extern crate axplat_riscv64_sg2002;
 Some sections are required to be defined in the linker script, listed as below:
 - `.text.boot`: Kernel boot code.
 - `.bss.stack`: Stack for kernel booting.
-

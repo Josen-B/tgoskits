@@ -21,6 +21,13 @@ impl CvsdDriver {
         sdmmc.clk_en(true);
         Ok(Self(sdmmc))
     }
+
+    fn checked_u32_lba(block_id: u64, offset: usize) -> DevResult<u32> {
+        let lba = block_id
+            .checked_add(u64::try_from(offset).map_err(|_| DevError::InvalidParam)?)
+            .ok_or(DevError::InvalidParam)?;
+        u32::try_from(lba).map_err(|_| DevError::InvalidParam)
+    }
 }
 
 impl BaseDriverOps for CvsdDriver {
@@ -51,7 +58,7 @@ impl BlockDriverOps for CvsdDriver {
 
         for (i, block) in blocks.iter_mut().enumerate() {
             self.0
-                .read_block(block_id as u32 + i as u32, block)
+                .read_block(Self::checked_u32_lba(block_id, i)?, block)
                 .map_err(|_| DevError::Io)?;
         }
 
@@ -67,7 +74,7 @@ impl BlockDriverOps for CvsdDriver {
 
         for (i, block) in blocks.iter().enumerate() {
             self.0
-                .write_block(block_id as u32 + i as u32, block)
+                .write_block(Self::checked_u32_lba(block_id, i)?, block)
                 .map_err(|_| DevError::Io)?;
         }
 
