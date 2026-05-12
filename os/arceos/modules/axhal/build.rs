@@ -106,7 +106,6 @@ fn invalid_data(error: impl std::fmt::Display) -> Error {
 }
 
 fn gen_linker_script(arch: &str, config: &LinkerConfig) -> Result<()> {
-    let legacy_fname = format!("linker_{}.lds", config.platform);
     let output_arch = if arch == "x86_64" {
         "i386:x86-64"
     } else if arch.contains("riscv") {
@@ -154,7 +153,6 @@ fn gen_linker_script(arch: &str, config: &LinkerConfig) -> Result<()> {
     // that still link outside Cargo build-script search paths.
     let target_dir = out_dir.join("../../..");
     fs::write(target_dir.join(LINKER_SCRIPT_NAME), &ld_content)?;
-    fs::write(target_dir.join(legacy_fname), ld_content)?;
 
     Ok(())
 }
