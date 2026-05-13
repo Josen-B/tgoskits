@@ -815,7 +815,6 @@ dependencies = [
  "ax-hal",
  "axplat-dyn",
  "cfg-if",
- "gpt_disk_io",
  "log",
  "smallvec",
 ]
