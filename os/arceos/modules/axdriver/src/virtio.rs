@@ -7,10 +7,8 @@ use ax_alloc::{UsageKind, global_allocator};
 use ax_driver_base::{BaseDriverOps, DevResult, DeviceType};
 #[cfg(virtio_dev)]
 use ax_driver_virtio::{BufferDirection, PhysAddr, VirtIoHal};
-#[cfg(any(bus = "mmio", all(bus = "pci", target_arch = "x86_64")))]
-use ax_hal::mem::phys_to_virt;
 #[cfg(virtio_dev)]
-use ax_hal::mem::virt_to_phys;
+use ax_hal::mem::{phys_to_virt, virt_to_phys};
 use cfg_if::cfg_if;
 
 use crate::{AxDeviceEnum, drivers::DriverProbe};
