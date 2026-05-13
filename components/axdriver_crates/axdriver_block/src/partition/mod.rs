@@ -40,6 +40,7 @@ pub struct PartitionInfo {
     pub region: PartitionRegion,
     pub name: Option<String>,
     pub part_uuid: Option<String>,
+    pub bootable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

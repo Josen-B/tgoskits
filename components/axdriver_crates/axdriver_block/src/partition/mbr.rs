@@ -46,6 +46,7 @@ pub(super) fn scan_mbr_partitions<T: BlockDriverOps + ?Sized>(
     for index in 0..MBR_PARTITION_COUNT {
         let entry_offset = MBR_PARTITION_TABLE_OFFSET + index * MBR_PARTITION_ENTRY_SIZE;
         let entry = &mbr[entry_offset..entry_offset + MBR_PARTITION_ENTRY_SIZE];
+        let boot_indicator = entry[0];
         let partition_type = entry[4];
         let start_lba =
             u32::from_le_bytes(entry[8..12].try_into().map_err(|_| DevError::BadState)?) as u64;
@@ -86,6 +87,7 @@ pub(super) fn scan_mbr_partitions<T: BlockDriverOps + ?Sized>(
             name: None,
             part_uuid: (disk_signature != 0)
                 .then(|| format!("{disk_signature:08X}-{:02X}", index + 1)),
+            bootable: boot_indicator == 0x80,
         });
     }
 
@@ -213,6 +215,7 @@ mod tests {
         assert_eq!(table.kind, PartitionTableKind::Mbr);
         assert_eq!(table.partitions.len(), 2);
         assert_eq!(table.partitions[0].index, 0);
+        assert!(!table.partitions[0].bootable);
         assert_eq!(
             table.partitions[0].region,
             PartitionRegion {
@@ -225,6 +228,7 @@ mod tests {
             Some("1234ABCD-01")
         );
         assert_eq!(table.partitions[1].index, 1);
+        assert!(table.partitions[1].bootable);
         assert_eq!(
             table.partitions[1].region,
             PartitionRegion {
