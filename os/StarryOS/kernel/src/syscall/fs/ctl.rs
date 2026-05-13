@@ -19,7 +19,6 @@ use starry_vm::{VmPtr, vm_write_slice};
 use crate::{
     file::{Directory, FileLike, get_file_like, resolve_at, with_fs},
     mm::vm_load_string,
-    pseudofs::Device,
     task::AsThread,
     time::TimeValueLike,
 };
@@ -72,6 +71,11 @@ pub fn sys_mkdir(path: *const c_char, mode: u32) -> AxResult<isize> {
     sys_mkdirat(AT_FDCWD, path, mode)
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn sys_mknod(path: *const c_char, mode: u32, dev: u64) -> AxResult<isize> {
+    sys_mknodat(AT_FDCWD, path, mode, dev)
+}
+
 pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_chroot <= path: {path}");
@@ -117,6 +121,7 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> Resu
     // apply umask like mkdir
     perm &= !current().as_thread().proc_data.umask();
 
+    // Linux mknod semantics: S_IFDIR → EPERM, unknown type bits → EINVAL.
     let node_type = match ftype {
         0 | S_IFREG => NodeType::RegularFile,
         S_IFCHR => NodeType::CharacterDevice,
@@ -135,13 +140,12 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> Resu
             NodePermission::from_bits_truncate(perm as u16),
         )?;
 
-        // If device node, set rdev
+        // If device node, set rdev via update_metadata
         if matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice) {
-            if let Ok(dev_node) = loc.entry().downcast::<Device>() {
-                dev_node.set_device_id(DeviceId(dev));
-            } else {
-                warn!("not a device node, cannot set rdev");
-            }
+            loc.update_metadata(MetadataUpdate {
+                rdev: Some(DeviceId(dev)),
+                ..Default::default()
+            })?;
         }
 
         Ok(0)
@@ -432,11 +436,22 @@ pub fn sys_fchownat(
     }
 
     let mut mode = meta.mode;
-    // chown always clears the setuid bits
-    mode.remove(NodePermission::SET_UID);
-    // chown also removes the setgid bits if group-executable
-    if mode.contains(NodePermission::GROUP_EXEC) {
-        mode.remove(NodePermission::SET_GID);
+    // Linux chown_common() semantics for clearing setuid/setgid on
+    // non-directory files:
+    //   - ATTR_KILL_SUID is set unconditionally for all non-dir chown,
+    //     regardless of whether uid/gid participates (i.e. even chown
+    //     with -1/-1 clears SUID).
+    //   - After SUID clearing adds ATTR_MODE to ia_valid, notify_change()
+    //     calls should_remove_sgid() which strips SGID on non-directory
+    //     files only when GROUP_EXEC (S_IXGRP) is set.
+    // Directories preserve SETGID (used for new-file group inheritance).
+    let is_dir = meta.node_type == NodeType::Directory;
+
+    if !is_dir {
+        mode.remove(NodePermission::SET_UID);
+        if mode.contains(NodePermission::GROUP_EXEC) {
+            mode.remove(NodePermission::SET_GID);
+        }
     }
 
     let uid = if uid == -1 { meta.uid } else { uid as _ };
