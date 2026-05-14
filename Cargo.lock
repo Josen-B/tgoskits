@@ -3504,6 +3504,7 @@ dependencies = [
  "dma-api 0.7.2",
  "embedded-hal",
  "log",
+ "mmio-api",
  "sdmmc-protocol",
  "volatile 0.6.1",
 ]
@@ -7647,6 +7648,7 @@ dependencies = [
  "dma-api 0.7.2",
  "embedded-hal",
  "log",
+ "mmio-api",
  "sdmmc-protocol",
 ]
 
