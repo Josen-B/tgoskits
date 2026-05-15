@@ -3497,6 +3497,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dw_uart_rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da3751978e2d9bced3cb480631bb2c14098357ae269ac95475720aee545c6dcd"
+dependencies = [
+ "tock-registers 0.8.1",
+]
+
+[[package]]
 name = "dwmmc-host"
 version = "0.1.0"
 dependencies = [
