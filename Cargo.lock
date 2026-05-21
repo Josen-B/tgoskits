@@ -1732,6 +1732,7 @@ dependencies = [
  "log",
  "range-alloc-arceos",
  "riscv_vplic",
+ "x86_vlapic",
 ]
 
 [[package]]
@@ -10129,6 +10130,7 @@ dependencies = [
  "bit",
  "log",
  "paste",
+ "spin 0.10.0",
  "tock-registers 0.10.1",
 ]
 
