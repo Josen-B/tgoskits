@@ -1940,7 +1940,7 @@ dependencies = [
  "ax-percpu",
  "axaddrspace",
  "axvisor_api",
- "spin 0.10.0",
+ "spin",
 ]
 
 [[package]]
@@ -10131,7 +10131,7 @@ dependencies = [
  "bit",
  "log",
  "paste",
- "spin 0.10.0",
+ "spin",
  "tock-registers 0.10.1",
 ]
 
