@@ -1940,6 +1940,7 @@ dependencies = [
  "ax-percpu",
  "axaddrspace",
  "axvisor_api",
+ "spin 0.10.0",
 ]
 
 [[package]]
