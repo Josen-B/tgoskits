@@ -45,6 +45,9 @@ pub struct VmxPerCpuState {
     /// This region typically contains the VMCS and other state information
     /// required for managing virtual machines on this particular CPU.
     vmx_region: VmxRegion,
+
+    /// Original host CR0/CR4 values before entering VMX operation.
+    host_cr0_cr4: Option<(u64, u64)>,
 }
 
 impl VmArchPerCpuOps for VmxPerCpuState {
@@ -52,6 +55,7 @@ impl VmArchPerCpuOps for VmxPerCpuState {
         Ok(Self {
             vmcs_revision_id: 0,
             vmx_region: unsafe { VmxRegion::uninit() },
+            host_cr0_cr4: None,
         })
     }
 
@@ -131,13 +135,16 @@ impl VmArchPerCpuOps for VmxPerCpuState {
             Cr0::write_raw(cr0_vmx);
             Cr4::write_raw(cr4_vmx);
             // Execute VMXON.
-            vmx::vmxon(self.vmx_region.phys_addr().as_usize() as _).map_err(|err| {
-                ax_err_type!(
+            if let Err(err) = vmx::vmxon(self.vmx_region.phys_addr().as_usize() as _) {
+                Cr4::write_raw(cr4);
+                Cr0::write_raw(cr0);
+                return Err(ax_err_type!(
                     BadState,
                     format_args!("VMX instruction vmxon failed: {:?}", err)
-                )
-            })?;
+                ));
+            }
         }
+        self.host_cr0_cr4 = Some((cr0, cr4));
         info!("[AxVM] succeeded to turn on VMX.");
 
         Ok(())
@@ -156,8 +163,14 @@ impl VmArchPerCpuOps for VmxPerCpuState {
                     format_args!("VMX instruction vmxoff failed: {:?}", err)
                 )
             })?;
-            // Remove VMXE bit in CR4.
-            Cr4::update(|cr4| cr4.remove(Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS));
+            if let Some((cr0, cr4)) = self.host_cr0_cr4.take() {
+                Cr4::write_raw(cr4);
+                Cr0::write_raw(cr0);
+            } else {
+                // Fall back to the previous behavior for a partially initialized
+                // state where the original control registers were not recorded.
+                Cr4::update(|cr4| cr4.remove(Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS));
+            }
         };
         info!("[AxVM] succeeded to turn off VMX.");
 
