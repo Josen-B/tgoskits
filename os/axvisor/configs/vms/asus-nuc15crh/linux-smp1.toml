@@ -20,12 +20,9 @@ phys_cpu_sets = [1]
 # Linux direct boot uses the Linux-specific boot stub at this GPA.
 entry_point = 0x8000
 # The location of image: "memory" | "fs".
-# The ASUS NUC15CRH HTTP Boot flow embeds the Linux guest image into AxVisor.
-image_location = "memory"
+image_location = "fs"
 # The file path of the Linux kernel image.
-# This final rootfs boot path requires a kernel with NVMe built in:
-# CONFIG_BLK_DEV_NVME=y and CONFIG_NVME_CORE=y.
-kernel_path = "../../tmp/asus-nuc15crh-linux/linux-nvme-minimal"
+kernel_path = "/guest/linux/asus-linux"
 # The load address of the kernel image.
 kernel_load_addr = 0x20_0000
 # Whether to enable BIOS boot flow.
@@ -33,9 +30,10 @@ enable_bios = false
 # Linux kernel command line.
 # No ramdisk_path is used here. The guest mounts the prepared NVMe partition
 # directly as its root filesystem.
-# Do not add console=ttyS0 here. Linux currently detects ttyS0 with irq=0
-# unless userspace can reopen it and set IRQ4 before starting the shell.
-cmdline = "earlycon=uart8250,io,0x3f8,115200 keep_bootcon root=/dev/nvme0n1p3 rootfstype=ext4 rootwait rw devtmpfs.mount=1 init=/sbin/axinit acpi=off pci=conf1 nvme_core.io_timeout=1 nvme_core.admin_timeout=1"
+# Boot directly into the rootfs shell. The arguments after `--` are passed to
+# `/bin/sh`, so it starts as an interactive shell without the temporary
+# `/sbin/axinit` helper.
+cmdline = "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8 root=/dev/nvme0n1p3 rootfstype=ext4 rootwait rw devtmpfs.mount=1 init=/bin/sh pci=conf1 pci=noacpi nvme_core.io_timeout=1 nvme_core.admin_timeout=1 -- -i"
 
 # Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
 # For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.

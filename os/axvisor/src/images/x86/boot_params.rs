@@ -23,6 +23,7 @@ use super::linux::{
 const SETUP_HEADER_START: usize = 0x1f1;
 const SETUP_HEADER_END: usize = 0x290;
 
+const ACPI_RSDP_ADDR_OFFSET: usize = 0x070;
 const EXT_RAMDISK_IMAGE_OFFSET: usize = 0x0c0;
 const EXT_RAMDISK_SIZE_OFFSET: usize = 0x0c4;
 const EXT_CMD_LINE_PTR_OFFSET: usize = 0x0c8;
@@ -59,6 +60,7 @@ pub struct BootParamsBuilder<'a> {
     ram_ranges: Vec<X86LinuxRange>,
     reserved_ranges: Vec<X86LinuxRange>,
     command_line: Option<&'a str>,
+    acpi_rsdp_addr: Option<u64>,
 }
 
 impl<'a> BootParamsBuilder<'a> {
@@ -79,6 +81,7 @@ impl<'a> BootParamsBuilder<'a> {
                 X86LinuxRange::new(LEGACY_RESERVED_START, LEGACY_RESERVED_SIZE),
             ],
             command_line: None,
+            acpi_rsdp_addr: None,
         }
     }
 
@@ -98,6 +101,10 @@ impl<'a> BootParamsBuilder<'a> {
         if range.size != 0 {
             self.reserved_ranges.push(range);
         }
+    }
+
+    pub fn set_acpi_rsdp_addr(&mut self, addr: u64) {
+        self.acpi_rsdp_addr = Some(addr);
     }
 
     pub fn build(mut self) -> Result<[u8; BOOT_PARAMS_SIZE], BootParamsError> {
@@ -133,6 +140,9 @@ impl<'a> BootParamsBuilder<'a> {
             self.header.loadflags | LOADFLAG_CAN_USE_HEAP,
         );
         write_u16(boot_params, HEAP_END_PTR_OFFSET, self.header.heap_end_ptr);
+        if let Some(addr) = self.acpi_rsdp_addr {
+            write_u64(boot_params, ACPI_RSDP_ADDR_OFFSET, addr);
+        }
         write_u32(
             boot_params,
             CODE32_START_OFFSET,

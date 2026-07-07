@@ -36,6 +36,8 @@ mod linux;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 #[cfg(target_arch = "x86_64")]
+use x86::acpi as x86_acpi;
+#[cfg(target_arch = "x86_64")]
 use x86::boot_params as x86_boot_params;
 #[cfg(target_arch = "x86_64")]
 use x86::linux as x86_linux;
@@ -534,6 +536,7 @@ impl ImageLoader {
         let boot_stub = self.build_x86_linux_boot_stub(&layout)?;
         let pci_intx_overrides = x86_mptable_pci_intx_overrides(&self.config);
         let mp_table = x86_mptable::build(&pci_intx_overrides);
+        let acpi = x86_acpi::build();
         load_vm_image_from_memory(
             &boot_params,
             layout.boot_params.start.into(),
@@ -541,6 +544,12 @@ impl ImageLoader {
         )?;
         load_vm_image_from_memory(&boot_stub, layout.boot_stub.start.into(), self.vm.clone())?;
         load_vm_image_from_memory(&mp_table, x86_mptable::MP_TABLE_GPA.into(), self.vm.clone())?;
+        load_vm_image_from_memory(&acpi.rsdp, x86_acpi::ACPI_RSDP_GPA.into(), self.vm.clone())?;
+        load_vm_image_from_memory(
+            &acpi.tables,
+            x86_acpi::ACPI_TABLES_GPA.into(),
+            self.vm.clone(),
+        )?;
         self.install_x86_linux_boot_entry(&layout);
         Ok(())
     }
@@ -601,6 +610,7 @@ impl ImageLoader {
                 format!("invalid x86 Linux command line: {err:?}")
             )
         })?;
+        builder.set_acpi_rsdp_addr(x86_acpi::ACPI_RSDP_GPA as u64);
 
         for memory in &self.config.kernel.memory_regions {
             if memory.map_type == VmMemMappingType::MapAlloc {
@@ -629,6 +639,7 @@ impl ImageLoader {
             }
         }
         builder.add_reserved_range(x86_mptable::reserved_range());
+        builder.add_reserved_range(x86_acpi::reserved_range());
 
         builder.build().map_err(|err| {
             ax_errno::ax_err_type!(
