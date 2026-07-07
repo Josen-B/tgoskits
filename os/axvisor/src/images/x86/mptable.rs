@@ -36,10 +36,17 @@ pub const fn reserved_range() -> X86LinuxRange {
     X86LinuxRange::new(MP_TABLE_GPA, MP_TABLE_SIZE)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciIntxOverride {
+    pub device: u8,
+    pub pin: u8,
+    pub gsi: u8,
+}
+
 /// Builds a minimal MP floating pointer and MP config table.
-pub fn build() -> [u8; MP_TABLE_SIZE] {
+pub fn build(pci_intx_overrides: &[PciIntxOverride]) -> [u8; MP_TABLE_SIZE] {
     let mut image = [0u8; MP_TABLE_SIZE];
-    let config = build_config_table();
+    let config = build_config_table(pci_intx_overrides);
     image[..config.len()].copy_from_slice(&config);
 
     let floating = build_floating_pointer();
@@ -59,8 +66,8 @@ fn build_floating_pointer() -> [u8; 16] {
     data
 }
 
-fn build_config_table() -> Vec<u8> {
-    let entries = config_entries();
+fn build_config_table(pci_intx_overrides: &[PciIntxOverride]) -> Vec<u8> {
+    let entries = config_entries(pci_intx_overrides);
     let entries_len: usize = entries.iter().map(Vec::len).sum();
 
     let mut table = Vec::with_capacity(44 + entries_len);
@@ -87,7 +94,7 @@ fn build_config_table() -> Vec<u8> {
     table
 }
 
-fn config_entries() -> Vec<Vec<u8>> {
+fn config_entries(pci_intx_overrides: &[PciIntxOverride]) -> Vec<Vec<u8>> {
     let mut entries = vec![
         processor_entry(),
         bus_entry(BUS_ID_PCI, b"PCI   "),
@@ -95,7 +102,7 @@ fn config_entries() -> Vec<Vec<u8>> {
         io_apic_entry(),
     ];
     push_isa_interrupt_entries(&mut entries);
-    push_pci_interrupt_entries(&mut entries);
+    push_pci_interrupt_entries(&mut entries, pci_intx_overrides);
     entries
 }
 
@@ -143,14 +150,18 @@ fn push_isa_interrupt_entries(entries: &mut Vec<Vec<u8>>) {
     }
 }
 
-fn push_pci_interrupt_entries(entries: &mut Vec<Vec<u8>>) {
+fn push_pci_interrupt_entries(entries: &mut Vec<Vec<u8>>, pci_intx_overrides: &[PciIntxOverride]) {
     // QEMU q35 exposes the host rootfs virtio-blk as 00:03.0 in the current
     // smoke setup. Add enough INTx routing for Linux to build the PCI IRQ
-    // table before a fuller virtual PCI IRQ router exists.
+    // table before a fuller virtual PCI IRQ router exists. Board-specific
+    // passthrough routes can override the default q35 swizzle for a root port.
     for dev in 0u8..4 {
         for pin in 0u8..4 {
             let source_irq = (dev << 2) | pin;
-            let intin = pci_intx_gsi(dev, pin);
+            let intx_override = pci_intx_overrides
+                .iter()
+                .find(|route| route.device == dev && route.pin == pin);
+            let intin = intx_override.map_or_else(|| pci_intx_gsi(dev, pin), |route| route.gsi);
             entries.push(interrupt_entry(
                 0,
                 PCI_INTX_IRQ_FLAGS,
@@ -204,7 +215,7 @@ mod tests {
 
     #[test]
     fn builds_valid_mp_table_checksums() {
-        let image = build();
+        let image = build(&[]);
         let config_len = u16::from_le_bytes([image[4], image[5]]) as usize;
         assert_eq!(&image[..4], b"PCMP");
         assert_eq!(
@@ -243,5 +254,34 @@ mod tests {
     #[test]
     fn q35_dev3_inta_uses_swizzled_gsi19() {
         assert_eq!(pci_intx_gsi(3, 0), 19);
+    }
+
+    #[test]
+    fn pci_intx_override_replaces_default_gsi() {
+        let image = build(&[PciIntxOverride {
+            device: 1,
+            pin: 0,
+            gsi: 16,
+        }]);
+        let source_irq = (1 << 2) | 0;
+        let config_len = u16::from_le_bytes([image[4], image[5]]) as usize;
+
+        let mut offset = 44;
+        while offset < config_len {
+            let entry_type = image[offset];
+            let entry_len = match entry_type {
+                0 => 20,
+                1 | 2 | 3 | 4 => 8,
+                _ => panic!("unknown MP entry type {entry_type}"),
+            };
+            if entry_type == 3 && image[offset + 4] == BUS_ID_PCI && image[offset + 5] == source_irq
+            {
+                assert_eq!(image[offset + 7], 16);
+                return;
+            }
+            offset += entry_len;
+        }
+
+        panic!("PCI INTx entry for dev1 INTA not found");
     }
 }

@@ -139,6 +139,7 @@ mod tests {
     use core::cell::{Cell, RefCell};
 
     use super::*;
+    use crate::vm::VMMemoryRegionBacking;
 
     #[derive(Default)]
     struct FakeMemoryMapper {
@@ -161,7 +162,7 @@ mod tests {
                 gpa,
                 hva: gpa.as_usize().into(),
                 layout,
-                needs_dealloc: true,
+                backing: VMMemoryRegionBacking::Heap,
             });
             Ok(())
         }
@@ -178,7 +179,7 @@ mod tests {
                 gpa,
                 hva: gpa.as_usize().into(),
                 layout,
-                needs_dealloc: false,
+                backing: VMMemoryRegionBacking::Reserved,
             });
             Ok(())
         }

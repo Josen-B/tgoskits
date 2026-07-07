@@ -26,6 +26,8 @@ use byte_unit::Byte;
 
 use axvm::{AxVMRef, GuestPhysAddr, VMMemoryRegion};
 
+#[cfg(target_arch = "x86_64")]
+use crate::config::parse_x86_pci_intx_spec;
 use crate::config::vmcfg;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::fdt::GuestDtbImage;
@@ -530,7 +532,8 @@ impl ImageLoader {
 
         let boot_params = self.build_x86_boot_params(header, layout, kernel)?;
         let boot_stub = self.build_x86_linux_boot_stub(&layout)?;
-        let mp_table = x86_mptable::build();
+        let pci_intx_overrides = x86_mptable_pci_intx_overrides(&self.config);
+        let mp_table = x86_mptable::build(&pci_intx_overrides);
         load_vm_image_from_memory(
             &boot_params,
             layout.boot_params.start.into(),
@@ -655,6 +658,30 @@ impl ImageLoader {
         );
         fs::load_vm_image(ramdisk_path, load_gpa, self.vm.clone())
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_mptable_pci_intx_overrides(
+    config: &AxVMCrateConfig,
+) -> alloc::vec::Vec<x86_mptable::PciIntxOverride> {
+    config
+        .devices
+        .passthrough_devices
+        .iter()
+        .filter_map(|device| {
+            let spec = parse_x86_pci_intx_spec(&device.name)?;
+            let root_pin = spec.root_pin;
+            if !(1..=4).contains(&root_pin) || device.irq_id > u8::MAX as usize {
+                return None;
+            }
+
+            Some(x86_mptable::PciIntxOverride {
+                device: spec.root_dev,
+                pin: root_pin - 1,
+                gsi: device.irq_id as u8,
+            })
+        })
+        .collect()
 }
 
 pub fn load_vm_image_from_memory(

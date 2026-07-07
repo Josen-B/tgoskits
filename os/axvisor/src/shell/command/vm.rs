@@ -986,10 +986,10 @@ fn show_vm_full_details(vm_id: usize) {
             format_memory_size(total_memory)
         );
         for (i, region) in vm.memory_regions().iter().enumerate() {
-            let region_type = if region.needs_dealloc {
-                "Allocated"
-            } else {
-                "Reserved"
+            let region_type = match region.backing {
+                axvm::VMMemoryRegionBacking::Heap => "Allocated",
+                axvm::VMMemoryRegionBacking::ContiguousFrames { .. } => "Contiguous",
+                axvm::VMMemoryRegionBacking::Reserved => "Reserved",
             };
             let identical = if region.is_identical() {
                 " [identical]"

@@ -117,6 +117,10 @@ mod x86_64 {
             manager::inject_interrupt(vm_id, vcpu_id, vector as usize)
         }
     }
+
+    pub(crate) fn register_platform_irq_injector() {
+        crate::runtime::register_x86_unrouted_vector_forwarder();
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -255,12 +259,21 @@ pub(crate) fn register_platform_irq_injector() {
     riscv64::register_platform_irq_injector();
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn register_platform_irq_injector() {
+    x86_64::register_platform_irq_injector();
+}
+
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn register_platform_irq_injector() {
     loongarch64::register_platform_irq_injector();
 }
 
-#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "x86_64"
+)))]
 pub(crate) fn register_platform_irq_injector() {}
 
 #[cfg(target_arch = "aarch64")]

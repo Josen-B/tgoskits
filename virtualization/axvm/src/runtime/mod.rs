@@ -152,6 +152,23 @@ pub(crate) fn register_x86_ioapic_irq_forwarding_route_with_trigger(
     x86_irq::register_ioapic_irq_forwarding_route_with_trigger(guest_gsi, host_irq, trigger);
 }
 
+/// Register a guest MSI/MSI-X vector range that may be forwarded from unrouted
+/// host LAPIC vectors.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn register_x86_msi_vector_forwarding_range(start: usize, end: usize) {
+    x86_irq::register_msi_vector_forwarding_range(start, end);
+}
+
+/// Register AxVM's x86 unrouted-vector forwarder with the dynamic platform.
+#[cfg(all(target_arch = "x86_64", feature = "plat-dyn"))]
+pub(crate) fn register_x86_unrouted_vector_forwarder() {
+    axplat_dyn::register_x86_unrouted_vector_forwarder(x86_irq::queue_unrouted_msi_vector);
+}
+
+/// No dynamic platform hook is available outside `plat-dyn` builds.
+#[cfg(all(target_arch = "x86_64", not(feature = "plat-dyn")))]
+pub(crate) fn register_x86_unrouted_vector_forwarder() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

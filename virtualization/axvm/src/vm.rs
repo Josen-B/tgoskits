@@ -21,7 +21,7 @@ use core::{
 use ax_cpumask::CpuMask;
 use ax_errno::{AxError, AxResult, ax_err, ax_err_type};
 use ax_kspin::SpinNoIrq as Mutex;
-use ax_memory_addr::align_up_4k;
+use ax_memory_addr::{PAGE_SIZE_4K, align_up_4k};
 use axaddrspace::{AddrSpace, MappingFlags};
 use axdevice::{AxVmDevices, FwCfg, FwCfgPlatformConfig};
 use axdevice_base::AccessWidth;
@@ -30,7 +30,10 @@ use axvm_types::{AxVCpuExitReason, GuestPhysAddr, HostPhysAddr, HostVirtAddr, Vm
 use crate::{
     boot::{GuestBootDescription, GuestFdtBuilder},
     config::{AxVMConfig, PhysCpuList, VMInterruptMode},
-    host::paging::{HostPagingHandler, virt_to_phys},
+    host::{
+        HostMemory, default_host,
+        paging::{HostPagingHandler, virt_to_phys},
+    },
     irq::InterruptFabric,
     layout::VmAddressLayout,
     lifecycle::{Machine, StopReason, VmLifecycleError, VmStatus},
@@ -156,6 +159,16 @@ impl VmRuntimeHandle {
             .entry(vcpu_id)
             .or_default()
             .push(PendingInterrupt::Normal(vector));
+        Ok(task.cpu_id() as usize)
+    }
+
+    pub(crate) fn vcpu_cpu_id(&self, vcpu_id: usize) -> AxResult<usize> {
+        let task = self
+            .vcpu_task_list
+            .lock()
+            .get(&vcpu_id)
+            .cloned()
+            .ok_or_else(|| ax_err_type!(NotFound, format!("vCPU {vcpu_id} task not found")))?;
         Ok(task.cpu_id() as usize)
     }
 
@@ -333,8 +346,19 @@ pub struct VMMemoryRegion {
     pub hva: HostVirtAddr,
     /// Memory layout of the region.
     pub layout: Layout,
-    /// Whether this region was allocated by the allocator and needs to be deallocated
-    pub needs_dealloc: bool,
+    /// How this memory region is backed and should be released.
+    pub backing: VMMemoryRegionBacking,
+}
+
+/// Backing storage for a VM memory region.
+#[derive(Debug, Clone)]
+pub enum VMMemoryRegionBacking {
+    /// Allocated by the Rust heap allocator.
+    Heap,
+    /// Allocated as contiguous host frames.
+    ContiguousFrames { num_frames: usize },
+    /// Not owned by the VM memory allocator.
+    Reserved,
 }
 
 impl VMMemoryRegion {
@@ -1278,16 +1302,31 @@ impl AxVM {
             "Cannot allocate zero-sized memory region"
         );
 
-        let hva = unsafe { alloc::alloc::alloc_zeroed(layout) };
-        if hva.is_null() {
-            return Err(AxError::NoMemory);
-        }
-        let s = unsafe { core::slice::from_raw_parts_mut(hva, layout.size()) };
-        let hva = HostVirtAddr::from_mut_ptr_of(hva);
-
-        let hpa = virt_to_phys(hva);
-
-        let gpa = gpa.unwrap_or_else(|| hpa.as_usize().into());
+        let (gpa, hpa, hva, backing) = if let Some(gpa) = gpa {
+            let hva = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if hva.is_null() {
+                return Err(AxError::NoMemory);
+            }
+            let hva = HostVirtAddr::from_mut_ptr_of(hva);
+            let hpa = virt_to_phys(hva);
+            (gpa, hpa, hva, VMMemoryRegionBacking::Heap)
+        } else {
+            let num_frames = layout.size().div_ceil(PAGE_SIZE_4K);
+            let hpa = default_host()
+                .alloc_dma32_contiguous_frames(num_frames, layout.align())
+                .ok_or(AxError::NoMemory)?;
+            let hva = default_host().phys_to_virt(hpa);
+            unsafe {
+                core::ptr::write_bytes(hva.as_mut_ptr(), 0, num_frames * PAGE_SIZE_4K);
+            }
+            (
+                hpa.as_usize().into(),
+                hpa,
+                hva,
+                VMMemoryRegionBacking::ContiguousFrames { num_frames },
+            )
+        };
+        let s = unsafe { core::slice::from_raw_parts_mut(hva.as_mut_ptr(), layout.size()) };
 
         if let Err(err) = self.with_resources_mut(|resources| {
             resources.address_space.map_linear(
@@ -1303,12 +1342,18 @@ impl AxVM {
                 gpa,
                 hva,
                 layout,
-                needs_dealloc: true, // This region was allocated and needs to be freed
+                backing: backing.clone(),
             });
             Ok(())
         }) {
-            unsafe {
-                alloc::alloc::dealloc(hva.as_mut_ptr(), layout);
+            match backing {
+                VMMemoryRegionBacking::Heap => unsafe {
+                    alloc::alloc::dealloc(hva.as_mut_ptr(), layout);
+                },
+                VMMemoryRegionBacking::ContiguousFrames { num_frames } => {
+                    default_host().dealloc_contiguous_frames(hpa, num_frames);
+                }
+                VMMemoryRegionBacking::Reserved => {}
             }
             return Err(err);
         }
@@ -1360,7 +1405,7 @@ impl AxVM {
                 gpa,
                 hva,
                 layout,
-                needs_dealloc: false, // This is a reserved region, not allocated
+                backing: VMMemoryRegionBacking::Reserved,
             });
             Ok(())
         })
@@ -1413,23 +1458,37 @@ impl AxVM {
         }
 
         for region in &regions_to_cleanup {
-            if region.needs_dealloc {
-                debug!(
-                    "VM[{vm_id}] deallocating memory region: HVA={:#x}, size={:#x}",
-                    region.hva.as_usize(),
-                    region.size()
-                );
-                unsafe {
-                    alloc::alloc::dealloc(region.hva.as_mut_ptr(), region.layout);
+            match region.backing {
+                VMMemoryRegionBacking::Heap => {
+                    debug!(
+                        "VM[{vm_id}] deallocating heap memory region: HVA={:#x}, size={:#x}",
+                        region.hva.as_usize(),
+                        region.size()
+                    );
+                    unsafe {
+                        alloc::alloc::dealloc(region.hva.as_mut_ptr(), region.layout);
+                    }
                 }
-            } else {
-                debug!(
-                    "VM[{vm_id}] skipping reserved memory region dealloc: GPA={:#x}, HVA={:#x}, \
-                     size={:#x}",
-                    region.gpa.as_usize(),
-                    region.hva.as_usize(),
-                    region.size()
-                );
+                VMMemoryRegionBacking::ContiguousFrames { num_frames } => {
+                    debug!(
+                        "VM[{vm_id}] deallocating contiguous memory region: HVA={:#x}, HPA={:#x}, \
+                         size={:#x}, frames={}",
+                        region.hva.as_usize(),
+                        region.host_paddr().as_usize(),
+                        region.size(),
+                        num_frames
+                    );
+                    default_host().dealloc_contiguous_frames(region.host_paddr(), num_frames);
+                }
+                VMMemoryRegionBacking::Reserved => {
+                    debug!(
+                        "VM[{vm_id}] skipping reserved memory region dealloc: GPA={:#x}, \
+                         HVA={:#x}, size={:#x}",
+                        region.gpa.as_usize(),
+                        region.hva.as_usize(),
+                        region.size()
+                    );
+                }
             }
         }
         resources.memory_regions.clear();

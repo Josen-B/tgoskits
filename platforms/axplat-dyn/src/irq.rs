@@ -1,4 +1,7 @@
-#[cfg(all(target_arch = "riscv64", feature = "hv"))]
+#[cfg(any(
+    all(target_arch = "riscv64", feature = "hv"),
+    all(target_arch = "x86_64", feature = "irq")
+))]
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use ax_plat::irq::{IrqAffinity, IrqError, IrqId, IrqIf, IrqSource, TrapVector, dispatch_irq};
@@ -8,10 +11,18 @@ mod loongarch64_hv;
 
 #[cfg(all(target_arch = "riscv64", feature = "hv"))]
 static VIRTUAL_IRQ_INJECTOR: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+#[cfg(all(target_arch = "x86_64", feature = "irq"))]
+static X86_UNROUTED_VECTOR_FORWARDER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 #[cfg(all(target_arch = "riscv64", feature = "hv"))]
 pub fn register_virtual_irq_injector(injector: fn(usize) -> bool) {
     VIRTUAL_IRQ_INJECTOR.store(injector as *mut (), Ordering::Release);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "irq"))]
+pub fn register_x86_unrouted_vector_forwarder(forwarder: fn(usize) -> bool) {
+    X86_UNROUTED_VECTOR_FORWARDER.store(forwarder as *mut (), Ordering::Release);
+    somehal::arch::register_unrouted_vector_handler(forward_x86_unrouted_vector);
 }
 
 struct IrqIfImpl;
@@ -118,6 +129,15 @@ fn inject_virtual_irq(irq: usize) -> bool {
         return false;
     }
     unsafe { core::mem::transmute::<*mut (), fn(usize) -> bool>(injector)(irq) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "irq"))]
+fn forward_x86_unrouted_vector(vector: usize) -> bool {
+    let forwarder = X86_UNROUTED_VECTOR_FORWARDER.load(Ordering::Acquire);
+    if forwarder.is_null() {
+        return false;
+    }
+    unsafe { core::mem::transmute::<*mut (), fn(usize) -> bool>(forwarder)(vector) }
 }
 
 #[cfg(test)]

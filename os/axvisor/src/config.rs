@@ -20,7 +20,7 @@ use alloc::format;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use ax_errno::{AxResult, ax_err_type};
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use axvm::InterruptTriggerMode;
 #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
 use axvm::config::VMBootProtocol;
@@ -170,6 +170,9 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
     // Load corresponding images for VM.
     info!("VM[{}] created success, loading images...", vm.id());
 
+    #[cfg(target_arch = "x86_64")]
+    register_x86_passthrough_irq_routes(&vm_create_config);
+
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let mut loader = ImageLoader::new(main_mem, vm_create_config, vm.clone(), guest_dtb);
     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
@@ -185,6 +188,7 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
             format!("VM[{vm_id}] already exists")
         ));
     }
+
     #[cfg(target_arch = "loongarch64")]
     crate::manager::register_loongarch_passthrough_irq_routes(vm_id);
 
@@ -199,6 +203,179 @@ pub fn init_guest_vm(raw_cfg: &str) -> AxResult<usize> {
     }
 
     Ok(vm_id)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn register_x86_passthrough_irq_routes(config: &AxVMCrateConfig) {
+    for device in &config.devices.passthrough_devices {
+        if let Some(info) = parse_x86_passthrough_intx_route(device) {
+            match register_x86_passthrough_intx_route(info, device.irq_id) {
+                Ok(()) => {}
+                Err(err) => warn!(
+                    "failed to register x86 passthrough INTx route for {}: {err:?}",
+                    device.name
+                ),
+            }
+        }
+
+        if let Some((start, end)) = parse_x86_passthrough_msi_vector_range(device) {
+            axvm::register_x86_msi_vector_forwarding_range(start as usize, end as usize);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_x86_passthrough_intx_route(
+    device: &axvmconfig::PassThroughDeviceConfig,
+) -> Option<ax_driver::probe::pci::PciInfo> {
+    use ax_driver::probe::pci::{PciAddress, PciInfo, PciIntxRoute};
+
+    let spec = parse_x86_pci_intx_spec(&device.name)?;
+    Some(PciInfo {
+        address: PciAddress::new(0, spec.bus, spec.dev, spec.func),
+        interrupt_pin: spec.pin,
+        interrupt_line: 0,
+        intx_route: Some(PciIntxRoute {
+            root_device: spec.root_dev,
+            root_function: spec.root_func,
+            root_pin: spec.root_pin,
+        }),
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct X86PciIntxSpec {
+    pub(crate) bus: u8,
+    pub(crate) dev: u8,
+    pub(crate) func: u8,
+    pub(crate) pin: u8,
+    pub(crate) root_dev: u8,
+    pub(crate) root_func: u8,
+    pub(crate) root_pin: u8,
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn parse_x86_pci_intx_spec(name: &str) -> Option<X86PciIntxSpec> {
+    let spec = name.strip_prefix("pci-intx:")?;
+    let mut bus = None;
+    let mut dev = None;
+    let mut func = None;
+    let mut pin = None;
+    let mut root_dev = None;
+    let mut root_func = None;
+    let mut root_pin = None;
+
+    for field in spec.split(',') {
+        let Some((key, value)) = field.split_once('=') else {
+            warn!("ignore malformed x86 passthrough INTx field `{field}`");
+            continue;
+        };
+        let value = match parse_u8_config_value(value) {
+            Some(value) => value,
+            None => {
+                warn!("ignore invalid x86 passthrough INTx value `{key}={value}`");
+                continue;
+            }
+        };
+        match key.trim() {
+            "bus" => bus = Some(value),
+            "dev" | "device" => dev = Some(value),
+            "func" | "function" => func = Some(value),
+            "pin" => pin = Some(value),
+            "root_dev" | "root_device" => root_dev = Some(value),
+            "root_func" | "root_function" => root_func = Some(value),
+            "root_pin" => root_pin = Some(value),
+            "msi_start" | "msi_end" | "vector_start" | "vector_end" => {}
+            unknown => warn!("ignore unknown x86 passthrough INTx key `{unknown}`"),
+        }
+    }
+
+    Some(X86PciIntxSpec {
+        bus: bus?,
+        dev: dev?,
+        func: func?,
+        pin: pin?,
+        root_dev: root_dev?,
+        root_func: root_func?,
+        root_pin: root_pin?,
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_u8_config_value(value: &str) -> Option<u8> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u8::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u8>().ok()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_x86_passthrough_msi_vector_range(
+    device: &axvmconfig::PassThroughDeviceConfig,
+) -> Option<(u8, u8)> {
+    let spec = device
+        .name
+        .strip_prefix("pci-msi:")
+        .or_else(|| device.name.strip_prefix("pci-intx:"))?;
+    let mut start = None;
+    let mut end = None;
+
+    for field in spec.split(',') {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        let value = parse_u8_config_value(value)?;
+        match key.trim() {
+            "msi_start" | "vector_start" => start = Some(value),
+            "msi_end" | "vector_end" => end = Some(value),
+            _ => {}
+        }
+    }
+
+    match (start, end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        (Some(vector), None) | (None, Some(vector)) => Some((vector, vector)),
+        (None, None) => None,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn register_x86_passthrough_intx_route(
+    info: ax_driver::probe::pci::PciInfo,
+    guest_gsi: usize,
+) -> Result<(), ax_hal::irq::IrqError> {
+    let Some(result) = ax_driver::probe::acpi::with_acpi(|acpi| acpi.pci_irq_for_endpoint(info))
+    else {
+        warn!("x86 passthrough PCI INTx route requires ACPI routing for {info:?}");
+        return Ok(());
+    };
+    let route = match result {
+        Ok(Some(route)) => route,
+        Ok(None) => {
+            warn!("x86 passthrough PCI INTx ACPI route was not found for {info:?}");
+            return Ok(());
+        }
+        Err(err) => {
+            warn!("failed to resolve x86 passthrough PCI INTx ACPI route for {info:?}: {err}");
+            return Ok(());
+        }
+    };
+
+    let binding = ax_driver::BindingIrq::from(route.gsi);
+    let trigger = x86_intx_forwarding_trigger(&binding);
+    let host_irq = resolve_binding_irq(binding)?;
+    axvm::register_x86_ioapic_irq_forwarding_route_with_trigger(guest_gsi, host_irq, trigger);
+    info!(
+        "Registered x86 passthrough PCI INTx forwarding route: endpoint {} guest GSI \
+         {guest_gsi} <- host IRQ {host_irq:?}, trigger {trigger:?}",
+        info.address
+    );
+    Ok(())
 }
 
 pub(crate) fn build_axvm_config(cfg: &AxVMCrateConfig) -> AxVMConfig {
@@ -385,7 +562,7 @@ fn x86_host_fs_passthrough_pci_info() -> ax_driver::probe::pci::PciInfo {
     }
 }
 
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn resolve_binding_irq(
     binding: ax_driver::BindingIrq,
 ) -> Result<ax_hal::irq::IrqId, ax_hal::irq::IrqError> {
@@ -405,7 +582,7 @@ fn resolve_binding_irq(
     }
 }
 
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn x86_intx_forwarding_trigger(binding: &ax_driver::BindingIrq) -> InterruptTriggerMode {
     match binding {
         ax_driver::BindingIrq::Source(ax_driver::BindingIrqSource::AcpiGsiRoute(route)) => {

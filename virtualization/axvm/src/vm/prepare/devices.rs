@@ -36,6 +36,25 @@ impl PreparedDevices {
 
         #[cfg(target_arch = "x86_64")]
         for port in resources.config.pass_through_ports() {
+            if crate::host::x86_port::is_pci_config_port_range(port.base, port.length) {
+                let passthrough =
+                    Arc::new(crate::host::x86_port::HostPciConfigPortPassthrough::new(
+                        resources.config.pass_through_devices(),
+                    )?);
+                let range = passthrough.address_range();
+                debug!(
+                    "Filtered PCI config port region: [{:#x}~{:#x}]",
+                    range.start.number(),
+                    range.end.number(),
+                );
+                devices
+                    .register(PortDeviceAdapter::from_arc(passthrough))
+                    .map_err(|err| {
+                        ax_err_type!(InvalidInput, format!("register PCI config port: {err:?}"))
+                    })?;
+                continue;
+            }
+
             let passthrough = Arc::new(crate::host::x86_port::HostPortPassthrough::new(
                 port.base,
                 port.length,

@@ -61,6 +61,21 @@ impl HostMemory for ArceOsHost {
             .ok()
     }
 
+    fn alloc_dma32_contiguous_frames(
+        &self,
+        num_frames: usize,
+        frame_align: usize,
+    ) -> Option<HostPhysAddr> {
+        modules::ax_alloc::global_allocator()
+            .alloc_dma32_pages(
+                num_frames,
+                frame_align.max(PAGE_SIZE_4K),
+                modules::ax_alloc::UsageKind::Dma,
+            )
+            .map(|vaddr| self.virt_to_phys(vaddr.into()))
+            .ok()
+    }
+
     fn dealloc_contiguous_frames(&self, paddr: HostPhysAddr, num_frames: usize) {
         modules::ax_alloc::global_allocator().dealloc_pages(
             self.phys_to_virt(paddr).as_usize(),

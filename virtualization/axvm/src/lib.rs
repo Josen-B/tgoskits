@@ -63,7 +63,10 @@ pub use runtime::loongarch_irq::{
 };
 pub use task::{AsVCpuTask, VCpuTask};
 pub use vcpu::VCpuState;
-pub use vm::{AxVCpuRef, AxVM, AxVMRef, FwCfgDeviceConfig, PreparedMemoryLayout, VMMemoryRegion};
+pub use vm::{
+    AxVCpuRef, AxVM, AxVMRef, FwCfgDeviceConfig, PreparedMemoryLayout, VMMemoryRegion,
+    VMMemoryRegionBacking,
+};
 
 /// The architecture-independent per-CPU type.
 pub type AxVMPerCpu = vcpu::AxPerCpu<vcpu::AxVMArchPerCpuImpl>;
@@ -122,6 +125,13 @@ pub fn register_x86_ioapic_irq_forwarding_route_with_trigger(
     trigger: InterruptTriggerMode,
 ) {
     runtime::register_x86_ioapic_irq_forwarding_route_with_trigger(guest_gsi, host_irq, trigger);
+}
+
+/// Register a guest MSI/MSI-X vector range that may be forwarded from unrouted
+/// host LAPIC vectors.
+#[cfg(target_arch = "x86_64")]
+pub fn register_x86_msi_vector_forwarding_range(start: usize, end: usize) {
+    runtime::register_x86_msi_vector_forwarding_range(start, end);
 }
 
 /// Register a callback to activate one x86 guest IOAPIC GSI after the guest has

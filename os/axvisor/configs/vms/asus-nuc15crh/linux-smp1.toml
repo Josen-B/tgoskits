@@ -20,25 +20,28 @@ phys_cpu_sets = [1]
 # Linux direct boot uses the Linux-specific boot stub at this GPA.
 entry_point = 0x8000
 # The location of image: "memory" | "fs".
-# The ASUS NUC15CRH HTTP Boot flow embeds the Linux guest images into AxVisor.
+# The ASUS NUC15CRH HTTP Boot flow embeds the Linux guest image into AxVisor.
 image_location = "memory"
-# The file path of the kernel image.
-kernel_path = "../../tmp/qemu_x86_64_linux/linux/linux-qemu"
+# The file path of the Linux kernel image.
+# This final rootfs boot path requires a kernel with NVMe built in:
+# CONFIG_BLK_DEV_NVME=y and CONFIG_NVME_CORE=y.
+kernel_path = "../../tmp/asus-nuc15crh-linux/linux-nvme-minimal"
 # The load address of the kernel image.
 kernel_load_addr = 0x20_0000
 # Whether to enable BIOS boot flow.
 enable_bios = false
-# The file path of the initramfs image.
-ramdisk_path = "../../tmp/asus-nuc15crh-linux-minimal/initramfs.cpio"
-# The load address of the initramfs image.
-ramdisk_load_addr = 0x0600_0000
 # Linux kernel command line.
-cmdline = "console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200 ignore_loglevel loglevel=8 rdinit=/init devtmpfs.mount=1 acpi=off pci=off nox2apic tsc=unstable no_timer_check initcall_blacklist=ahci_pci_driver_init,i8042_init"
+# No ramdisk_path is used here. The guest mounts the prepared NVMe partition
+# directly as its root filesystem.
+# Do not add console=ttyS0 here. Linux currently detects ttyS0 with irq=0
+# unless userspace can reopen it and set IRQ4 before starting the shell.
+cmdline = "earlycon=uart8250,io,0x3f8,115200 keep_bootcon root=/dev/nvme0n1p3 rootfstype=ext4 rootwait rw devtmpfs.mount=1 init=/sbin/axinit acpi=off pci=conf1 nvme_core.io_timeout=1 nvme_core.admin_timeout=1"
 
 # Memory regions with format (`base_paddr`, `size`, `flags`, `map_type`).
 # For `map_type`, 0 means `MAP_ALLOC`, 1 means `MAP_IDENTICAL`, 2 means `MAP_RESERVED`.
 memory_regions = [
-  [0x0000_0000, 0x0800_0000, 0x7, 0], # System RAM 128M
+  [0x0000_0000, 0x1800_0000, 0x7, 1], # Identity main RAM 384M; actual GPA follows allocated HPA
+  [0x0000_0000, 0x0010_0000, 0x7, 0], # Low x86 boot scratch for fixed boot_params/stub GPA
 ]
 
 #
@@ -66,12 +69,25 @@ passthrough_devices = [
     0x1000,
     0x1,
   ],
+  [
+    "pci-intx:bus=1,dev=0,func=0,pin=1,root_dev=1,root_func=0,root_pin=1,msi_start=0x20,msi_end=0xfe",
+    0x8000_0000,
+    0x8000_0000,
+    0x4000_0000,
+    16,
+  ],
 ]
 
 # Passthrough addresses.
 # Base-GPA  Length.
 passthrough_addresses = [
   [0xfe00_0000, 0x00c0_0000],
+]
+
+# Passthrough x86 I/O ports.
+# Base-port Length.
+passthrough_ports = [
+  [0xcf8, 0x8],
 ]
 
 # Devices that are not desired to be passed through to the guest

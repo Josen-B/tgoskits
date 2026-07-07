@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use rdif_intc::{AcpiGsiRoute, AcpiIrqPolarity, AcpiIrqTrigger};
 use rdrive::{
@@ -26,6 +27,7 @@ use vector::{
 };
 
 const MASKED_IOAPIC_PLACEHOLDER_VECTOR: u8 = 0x21;
+static UNROUTED_VECTOR_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 pub struct Plat;
 
@@ -430,6 +432,10 @@ impl PlatOp for Plat {
         match ioapic_irq_for_vector(raw) {
             Ok(Some(irq)) => Some(ActiveIrq::new(irq)),
             Ok(None) => {
+                if handle_unrouted_vector(raw) {
+                    lapic::eoi();
+                    return None;
+                }
                 warn!("unrouted x86 interrupt vector {raw:#x}");
                 lapic::eoi();
                 None
@@ -576,6 +582,18 @@ fn set_ioapic_gsi_destination(
         .typed_mut::<X86IoApicIntc>()
         .ok_or(IrqError::Unsupported)?;
     Ok(ioapic.set_gsi_destination(gsi, dest))
+}
+
+pub fn register_unrouted_vector_handler(handler: fn(usize) -> bool) {
+    UNROUTED_VECTOR_HANDLER.store(handler as *mut (), Ordering::Release);
+}
+
+fn handle_unrouted_vector(vector: usize) -> bool {
+    let handler = UNROUTED_VECTOR_HANDLER.load(Ordering::Acquire);
+    if handler.is_null() {
+        return false;
+    }
+    unsafe { core::mem::transmute::<*mut (), fn(usize) -> bool>(handler)(vector) }
 }
 
 fn ioapic_irq_for_vector(vector: usize) -> Result<Option<IrqId>, IrqError> {

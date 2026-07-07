@@ -32,6 +32,8 @@ static IOAPIC_HOST_IRQS: [AtomicUsize; IOAPIC_GSI_COUNT] =
     [const { AtomicUsize::new(INVALID_RAW_IRQ) }; IOAPIC_GSI_COUNT];
 static IOAPIC_IRQ_ACTIVATORS: [IoApicForwardingActivatorSlot; IOAPIC_GSI_COUNT] =
     [const { Mutex::new(None) }; IOAPIC_GSI_COUNT];
+static MSI_VECTOR_ALLOWED: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static MSI_VECTOR_PENDING: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
 fn should_register_ioapic_gsi_hook(gsi: usize) -> bool {
     gsi < IOAPIC_GSI_COUNT && gsi != PIT_TIMER_GSI
@@ -88,6 +90,44 @@ pub fn register_ioapic_irq_forwarding_activator(
     *IOAPIC_IRQ_ACTIVATORS[guest_gsi].lock() = Some(activator);
 }
 
+pub fn register_msi_vector_forwarding_range(start: usize, end: usize) {
+    if start > end || start < 0x20 || end > 0xfe {
+        warn!("skip invalid x86 MSI vector forwarding range {start:#x}..={end:#x}");
+        return;
+    }
+
+    for vector in start..=end {
+        let (slot, bit) = vector_bit(vector);
+        MSI_VECTOR_ALLOWED[slot].fetch_or(bit, Ordering::AcqRel);
+    }
+    info!("Registered x86 MSI vector forwarding range {start:#x}..={end:#x}");
+}
+
+pub fn drain_pending_msi_vectors(vm: &VMRef, vcpu: &VCpuRef) {
+    if vm.interrupt_mode() != VMInterruptMode::Passthrough {
+        return;
+    }
+    if IOAPIC_IRQ_FORWARD_VM_ID.load(Ordering::Acquire) != vm.id()
+        || IOAPIC_IRQ_FORWARD_VCPU_ID.load(Ordering::Acquire) != vcpu.id()
+    {
+        return;
+    }
+
+    for slot in 0..MSI_VECTOR_PENDING.len() {
+        let pending = MSI_VECTOR_PENDING[slot].swap(0, Ordering::AcqRel);
+        for bit_idx in 0..usize::BITS as usize {
+            let bit = 1usize << bit_idx;
+            if pending & bit == 0 {
+                continue;
+            }
+            let vector = slot * usize::BITS as usize + bit_idx;
+            if let Err(err) = vcpu.inject_interrupt(vector) {
+                warn!("failed to inject pending x86 MSI vector {vector:#x}: {err:?}");
+            }
+        }
+    }
+}
+
 pub fn inject_due_pit_irq0(vm: &VMRef, vcpu: &VCpuRef) {
     if vm.interrupt_mode() != VMInterruptMode::Passthrough {
         return;
@@ -117,7 +157,7 @@ pub fn inject_due_pit_irq0(vm: &VMRef, vcpu: &VCpuRef) {
     .unwrap();
 }
 
-pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) {
+fn inject_serial_irq(vm: &VMRef, vcpu: &VCpuRef, allow_empty_rx: bool) {
     if vm.interrupt_mode() != VMInterruptMode::Passthrough {
         return;
     }
@@ -125,7 +165,7 @@ pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) {
     let Ok(devices) = vm.get_devices() else {
         return;
     };
-    if !devices.x86_serial_poll_irq() {
+    if !devices.x86_serial_poll_irq() && !allow_empty_rx {
         return;
     }
 
@@ -144,6 +184,17 @@ pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) {
         },
     )
     .unwrap();
+}
+
+pub fn inject_pending_serial_irq(vm: &VMRef, vcpu: &VCpuRef) {
+    inject_serial_irq(vm, vcpu, false);
+}
+
+pub fn wake_serial_irq_after_host_irq(vm: &VMRef, vcpu: &VCpuRef) {
+    // The host UART byte may become visible only when the guest 8250 handler
+    // performs its port reads. Send an edge after a host IRQ so the guest does
+    // not wait for the next keypress before polling COM1.
+    inject_serial_irq(vm, vcpu, true);
 }
 
 pub fn inject_pending_ioapic_irq_after_eoi(vm: &VMRef, vcpu: &VCpuRef, vector: u8) {
@@ -452,6 +503,30 @@ fn gsi_bit(gsi: usize) -> usize {
     1usize << gsi
 }
 
+fn vector_bit(vector: usize) -> (usize, usize) {
+    let bits = usize::BITS as usize;
+    (vector / bits, 1usize << (vector % bits))
+}
+
+#[cfg_attr(not(feature = "plat-dyn"), allow(dead_code))]
+pub(super) fn queue_unrouted_msi_vector(vector: usize) -> bool {
+    if IOAPIC_IRQ_FORWARD_VM_ID.load(Ordering::Acquire) == usize::MAX
+        || IOAPIC_IRQ_FORWARD_VCPU_ID.load(Ordering::Acquire) == usize::MAX
+        || vector >= 256
+    {
+        return false;
+    }
+
+    let (slot, bit) = vector_bit(vector);
+    if MSI_VECTOR_ALLOWED[slot].load(Ordering::Acquire) & bit == 0 {
+        return false;
+    }
+
+    MSI_VECTOR_PENDING[slot].fetch_or(bit, Ordering::AcqRel);
+    notify_forward_vcpu();
+    true
+}
+
 fn host_irq_to_raw(irq: irq::IrqId) -> usize {
     (usize::from(irq.domain.0) << 32) | irq.hwirq.0 as usize
 }
@@ -565,6 +640,7 @@ fn ioapic_irq_forwarding_handler(ctx: irq::IrqContext) -> irq::IrqReturn {
         IOAPIC_IRQ_PENDING_LEVEL.fetch_or(bit, Ordering::AcqRel);
     }
     IOAPIC_IRQ_PENDING.fetch_or(bit, Ordering::AcqRel);
+    notify_forward_vcpu();
     irq::IrqReturn::Handled
 }
 
@@ -586,6 +662,15 @@ fn guest_gsi_for_host_irq(host_irq: irq::IrqId) -> Option<usize> {
     IOAPIC_HOST_IRQS
         .iter()
         .position(|irq| irq.load(Ordering::Acquire) == raw)
+}
+
+fn notify_forward_vcpu() {
+    let vm_id = IOAPIC_IRQ_FORWARD_VM_ID.load(Ordering::Acquire);
+    let vcpu_id = IOAPIC_IRQ_FORWARD_VCPU_ID.load(Ordering::Acquire);
+    if vm_id == usize::MAX || vcpu_id == usize::MAX {
+        return;
+    }
+    super::vcpus::notify_vcpu(vm_id, vcpu_id);
 }
 
 #[cfg(test)]

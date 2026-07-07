@@ -28,6 +28,13 @@ pub trait HostMemory {
         frame_align: usize,
     ) -> Option<HostPhysAddr>;
 
+    /// Allocate contiguous host frames whose physical address is below 4 GiB.
+    fn alloc_dma32_contiguous_frames(
+        &self,
+        num_frames: usize,
+        frame_align: usize,
+    ) -> Option<HostPhysAddr>;
+
     /// Free contiguous host frames.
     fn dealloc_contiguous_frames(&self, paddr: HostPhysAddr, num_frames: usize);
 

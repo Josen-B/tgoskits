@@ -86,6 +86,22 @@ pub(crate) fn notify_all_vcpus(vm_id: usize) {
     }
 }
 
+pub(crate) fn notify_vcpu(vm_id: usize, vcpu_id: usize) {
+    let Some(vm) = crate::get_vm_by_id(vm_id) else {
+        warn!("VM[{vm_id}] not found while notifying VCpu[{vcpu_id}]");
+        return;
+    };
+    let Ok(cpu_id) = vm.with_runtime(|runtime| runtime.vcpu_cpu_id(vcpu_id)) else {
+        warn!("VM[{vm_id}] VCpu[{vcpu_id}] runtime task not found while notifying");
+        return;
+    };
+    let _ = vm.with_runtime(|runtime| {
+        runtime.notify_all();
+        Ok(())
+    });
+    crate::host::task::send_ipi(cpu_id);
+}
+
 pub(crate) fn queue_interrupt(vm_id: usize, vcpu_id: usize, vector: usize) -> AxResult {
     let vm = crate::get_vm_by_id(vm_id)
         .ok_or_else(|| ax_err_type!(NotFound, format!("VM[{vm_id}] not found")))?;
@@ -392,6 +408,8 @@ fn vcpu_run() {
         #[cfg(target_arch = "x86_64")]
         super::x86_irq::drain_pending_ioapic_irqs(&vm, &vcpu);
         #[cfg(target_arch = "x86_64")]
+        super::x86_irq::drain_pending_msi_vectors(&vm, &vcpu);
+        #[cfg(target_arch = "x86_64")]
         super::x86_irq::activate_ready_ioapic_forwarding_routes(&vm);
 
         match vm.run_vcpu(vcpu_id) {
@@ -437,7 +455,7 @@ fn vcpu_run() {
                     });
                     crate::check_timer_events();
                     #[cfg(target_arch = "x86_64")]
-                    super::x86_irq::inject_pending_serial_irq(&vm, &vcpu);
+                    super::x86_irq::wake_serial_irq_after_host_irq(&vm, &vcpu);
                 }
                 AxVCpuExitReason::PreemptionTimer => {
                     crate::timer::check_events();

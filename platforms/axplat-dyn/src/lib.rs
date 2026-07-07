@@ -34,3 +34,5 @@ pub fn ipi_irq() -> ax_plat::irq::IrqId {
 }
 #[cfg(all(feature = "irq", target_arch = "riscv64", feature = "hv"))]
 pub use irq::register_virtual_irq_injector;
+#[cfg(all(feature = "irq", target_arch = "x86_64"))]
+pub use irq::register_x86_unrouted_vector_forwarder;
