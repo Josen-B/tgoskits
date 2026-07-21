@@ -177,10 +177,11 @@ rbpf = { version = "0.4", default-features = false }
 axtest.workspace = true
 ax-hal.workspace = true
 ax-std = { workspace = true, features = ["ext-ld", "fs", "multitask", "irq", "std-compat"] }
+rsext4.workspace = true
 
 [[test]]
-name = "axtest_kernel"
-path = "tests/axtest_kernel.rs"
+name = "coverage"
+path = "tests/coverage.rs"
 harness = false
 required-features = ["axtest"]
 
