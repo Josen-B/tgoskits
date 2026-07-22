@@ -7651,6 +7651,7 @@ version = "0.7.4"
 dependencies = [
  "ax-alloc",
  "ax-cpu",
+ "ax-cpumask",
  "ax-crate-interface",
  "ax-display",
  "ax-dma",
@@ -7702,6 +7703,7 @@ dependencies = [
  "k230-kpu",
  "kbpf-basic",
  "kernel-elf-parser",
+ "kernutil",
  "kmod-loader",
  "kmod-tools",
  "kprobe",
@@ -7713,6 +7715,7 @@ dependencies = [
  "num_enum",
  "ouroboros",
  "rand 0.10.1",
+ "ranges-ext",
  "rbpf",
  "rdif-block",
  "rdif-pinctrl",
