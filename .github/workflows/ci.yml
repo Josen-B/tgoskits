@@ -619,7 +619,7 @@ jobs:
           #   timeout_minutes: 20
           #   command: |
           #     sudo apt-get update
-          #     sudo apt-get install -y --no-install-recommends ovmf
+          #     sudo apt-get install -y ovmf
           #     UEFI_FIRMWARE=""
           #     for candidate in \
           #       /usr/share/OVMF/OVMF_CODE_4M.fd \
@@ -654,7 +654,7 @@ jobs:
             command: |
               rustup target add x86_64-unknown-uefi
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends ovmf
+              sudo apt-get install -y ovmf
               UEFI_FIRMWARE=""
               for candidate in \
                 /usr/share/OVMF/OVMF_CODE_4M.fd \
@@ -761,8 +761,6 @@ jobs:
             self_hosted_owner: rcore-os
             require_kvm: true
             command: |
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
               rustup component add llvm-tools
               cargo xtask ktest qemu -p axvisor --test axtest --arch x86_64 --coverage --out-fmt html
               cargo xtask ktest qemu -p axvisor --test axtest --arch aarch64 --coverage --out-fmt html
