@@ -653,21 +653,19 @@ jobs:
             timeout_minutes: 20
             command: |
               rustup target add x86_64-unknown-uefi
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends ovmf
               UEFI_FIRMWARE=""
               for candidate in \
                 /usr/share/OVMF/OVMF_CODE_4M.fd \
                 /usr/share/OVMF/OVMF_CODE.fd \
                 /usr/share/ovmf/OVMF.fd \
                 /usr/share/qemu/OVMF.fd; do
-                if [ -f "${candidate}" ]; then
+                if [ -r "${candidate}" ]; then
                   UEFI_FIRMWARE="${candidate}"
                   break
                 fi
               done
               if [ -z "${UEFI_FIRMWARE}" ]; then
-                echo "ERROR: installed OVMF firmware image was not found under /usr/share." >&2
+                echo "ERROR: OVMF firmware is missing on this runner. Provision it with: sudo apt-get update && sudo apt-get install -y --no-install-recommends ovmf" >&2
                 exit 1
               fi
               export AXLOADER_X86_64_UEFI_FIRMWARE="${UEFI_FIRMWARE}"
