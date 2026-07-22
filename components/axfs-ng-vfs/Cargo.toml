@@ -9,15 +9,20 @@ repository = "https://github.com/Starry-OS/axfs-ng-vfs"
 license = "Apache-2.0"
 
 [features]
+axtest = ["dep:axtest"]
 default = []
 lockdep = ["ax-kspin/lockdep"]
 
 [dependencies]
 ax-errno = { workspace = true }
 ax-kspin = { workspace = true }
+axtest = { workspace = true, optional = true }
 bitflags = "2.10"
 cfg-if = "1"
 hashbrown = "0.16"
 inherit-methods-macro = "0.1"
 log = "0.4"
 smallvec = "1.15"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }

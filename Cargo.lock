@@ -605,6 +605,7 @@ dependencies = [
 name = "ax-cpumask"
 version = "0.3.5"
 dependencies = [
+ "axtest",
  "bitmaps",
 ]
 
@@ -730,6 +731,7 @@ dependencies = [
 name = "ax-errno"
 version = "0.6.1"
 dependencies = [
+ "axtest",
  "log",
  "quote",
  "strum 0.27.2",
@@ -809,6 +811,7 @@ name = "ax-io"
 version = "0.6.1"
 dependencies = [
  "ax-errno 0.6.1",
+ "axtest",
  "heapless",
  "memchr",
 ]
@@ -830,6 +833,7 @@ name = "ax-kernel-guard"
 version = "0.3.11"
 dependencies = [
  "ax-crate-interface",
+ "axtest",
  "cfg-if",
 ]
 
@@ -846,6 +850,9 @@ dependencies = [
 [[package]]
 name = "ax-lazyinit"
 version = "0.4.8"
+dependencies = [
+ "axtest",
+]
 
 [[package]]
 name = "ax-libc"
@@ -1282,6 +1289,7 @@ version = "0.5.5"
 dependencies = [
  "ax-errno 0.6.1",
  "ax-kspin",
+ "axtest",
  "bitflags 2.13.0",
  "cfg-if",
  "hashbrown 0.16.1",
@@ -1363,6 +1371,7 @@ name = "axpoll"
 version = "0.5.1"
 dependencies = [
  "ax-kspin",
+ "axtest",
  "bitflags 2.13.0",
  "futures",
  "linux-raw-sys 0.12.1",
@@ -4519,6 +4528,7 @@ dependencies = [
 name = "kernutil"
 version = "0.2.2"
 dependencies = [
+ "axtest",
  "heapless",
  "num-align",
  "ranges-ext",
@@ -6778,6 +6788,7 @@ name = "rsext4"
 version = "0.7.5"
 dependencies = [
  "ax-kspin",
+ "axtest",
  "bitflags 2.13.0",
  "log",
 ]
@@ -7051,6 +7062,7 @@ name = "scope-local"
 version = "0.4.2"
 dependencies = [
  "ax-percpu",
+ "axtest",
  "ctor 0.6.3",
  "spin",
 ]
