@@ -88,6 +88,7 @@ ax-task = { workspace = true, features = [
     "task-ext",
     "tracepoint-hooks",
     "sched-rr",
+    "axtest",
 ] }
 ax-dma = { workspace = true, optional = true }
 rockchip-rga = { workspace = true, optional = true }

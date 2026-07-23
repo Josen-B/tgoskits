@@ -84,3 +84,6 @@ fn secondary_entry() -> ! {
     }
     unsafe { __somehal_secondary(meta) };
 }
+
+#[cfg(all(axtest, feature = "axtest"))]
+pub mod axtest;
