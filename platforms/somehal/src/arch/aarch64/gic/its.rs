@@ -10,8 +10,8 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use arm_gic_driver::v3::{GITS_TRANSLATER_OFFSET, Its, ItsCommand, ItsTableType};
-use ax_kspin::SpinRaw as Mutex;
+use arm_gic_driver::v3::{Affinity, GITS_TRANSLATER_OFFSET, Its, ItsCommand, ItsTableType};
+use ax_sync::{RawSpinLockGuard, SpinLock};
 use irq_framework::{HwIrq, IrqError, IrqId};
 use rdif_msi::{
     Interface, Msi, MsiAllocation, MsiDeviceId, MsiEventId, MsiMessage, MsiProviderId, MsiRequest,
@@ -31,16 +31,22 @@ const LPI_DEFAULT_PRIORITY: u8 = 0xa0;
 const COMMAND_QUEUE_ENTRIES: usize = 256;
 const MIN_DEVICE_EVENTS: u32 = 32;
 const MAX_DEVICE_ID_BITS: u8 = 16;
-const COLLECTION_ID: u16 = 0;
+const DEFAULT_COLLECTION_ID: u16 = 0;
 const INVALID_DEVICE_ID: u64 = u64::MAX;
 
-static LPI_OWNER: Mutex<BTreeMap<u32, DeviceId>> = Mutex::new(BTreeMap::new());
+static LPI_OWNER: SpinLock<BTreeMap<u32, DeviceId>> = SpinLock::new(BTreeMap::new());
 static PRIMARY_ITS: AtomicU64 = AtomicU64::new(INVALID_DEVICE_ID);
+
+fn lpi_owners() -> RawSpinLockGuard<'static, BTreeMap<u32, DeviceId>> {
+    // SAFETY: ITS management preserves the legacy raw-lock contract and is
+    // serialized against same-CPU re-entry by the interrupt-controller path.
+    unsafe { LPI_OWNER.lock_raw() }
+}
 
 module_driver!(
     name: "GICv3 ITS",
-    level: ProbeLevel::PostKernel,
-    priority: ProbePriority::DEFAULT,
+    level: ProbeLevel::PreKernel,
+    priority: ProbePriority::MSI,
     probe_kinds: &[
         ProbeKind::Fdt {
             compatibles: &["arm,gic-v3-its"],
@@ -57,7 +63,7 @@ fn probe_its(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         .into_iter()
         .next()
         .ok_or_else(|| OnProbeError::other(format!("[{}] has no reg", info.node.name())))?;
-    let size = reg.size.unwrap_or((GITS_TRANSLATER_OFFSET + 8) as u64) as usize;
+    let size = reg.size.unwrap_or(GITS_TRANSLATER_OFFSET + 8) as usize;
     let mmio = ioremap(reg.address, size)
         .map_err(|err| OnProbeError::other(format!("failed to map ITS: {err:?}")))?;
     let its = unsafe { Its::new(mmio.as_ptr().into(), reg.address) };
@@ -92,8 +98,7 @@ fn with_gic<R>(
 }
 
 pub(super) fn set_lpi_enabled(irq: IrqId, enabled: bool) -> Result<(), IrqError> {
-    let owner = LPI_OWNER
-        .lock()
+    let owner = lpi_owners()
         .get(&irq.hwirq.0)
         .copied()
         .or_else(|| match PRIMARY_ITS.load(Ordering::Acquire) {
@@ -109,6 +114,30 @@ pub(super) fn set_lpi_enabled(irq: IrqId, enabled: bool) -> Result<(), IrqError>
     provider.set_lpi_enabled_by_intid(irq.hwirq.0, enabled)
 }
 
+pub(super) fn set_lpi_affinity(
+    irq: IrqId,
+    affinity: crate::irq::IrqAffinity,
+) -> Result<(), IrqError> {
+    let owner = lpi_owners()
+        .get(&irq.hwirq.0)
+        .copied()
+        .or_else(|| match PRIMARY_ITS.load(Ordering::Acquire) {
+            INVALID_DEVICE_ID => None,
+            raw => Some(DeviceId::from(raw)),
+        })
+        .ok_or(IrqError::Unsupported)?;
+    let msi = rdrive::get::<Msi>(owner).map_err(|_| IrqError::Unsupported)?;
+    let mut msi = msi.try_lock().map_err(|_| IrqError::Busy)?;
+    let provider = msi
+        .typed_mut::<GicItsProvider>()
+        .ok_or(IrqError::Unsupported)?;
+    let collection = match affinity {
+        crate::irq::IrqAffinity::Any => DEFAULT_COLLECTION_ID,
+        crate::irq::IrqAffinity::Fixed { cpu_id } => provider.collection_id_for_cpu(cpu_id)?,
+    };
+    provider.move_lpi_to_collection(irq.hwirq.0, collection)
+}
+
 struct GicItsProvider {
     owner: DeviceId,
     its: Its,
@@ -119,8 +148,10 @@ struct GicItsProvider {
     next_lpi: u32,
     devices: BTreeMap<u32, ItsDevice>,
     lpis: BTreeMap<u32, LpiRoute>,
-    collection_target: u64,
+    collection_targets: Vec<u64>,
     gic_domain: irq_framework::IrqDomainId,
+    _msi_domain: irq_framework::IrqDomainId,
+    msix_domain: irq_framework::IrqDomainId,
     itt_entry_size: usize,
 }
 
@@ -133,38 +164,75 @@ impl GicItsProvider {
     ) -> Result<Self, OnProbeError> {
         let gic_domain = crate::irq::domain_by_kind_fast(crate::irq::IrqDomainKind::AArch64Gic)
             .ok_or_else(|| OnProbeError::other("AArch64 GIC IRQ domain is not registered"))?;
+        let msi_domain = crate::irq::alloc_child_irq_domain(
+            owner,
+            gic_domain,
+            crate::irq::IrqDomainKind::MsiParent,
+        )
+        .map_err(|err| {
+            OnProbeError::other(format!("failed to allocate ITS MSI IRQ domain: {err:?}"))
+        })?;
+        let msix_domain = crate::irq::alloc_child_irq_domain(
+            owner,
+            msi_domain,
+            crate::irq::IrqDomainKind::PciMsix,
+        )
+        .map_err(|err| {
+            OnProbeError::other(format!("failed to allocate PCI MSI-X IRQ domain: {err:?}"))
+        })?;
         let property_table = AlignedMemory::new(LPI_PROPERTY_BYTES, 4096)
             .ok_or_else(|| OnProbeError::other("failed to allocate LPI property table"))?;
         property_table.fill(LPI_DEFAULT_PRIORITY);
         property_table.clean();
 
-        let rd_count = with_gic(|gic| Ok(gic.redistributor_count().max(1)))?;
+        let use_physical_collection_target = its.uses_physical_collection_target();
         let pending_stride = align_up(LPI_PENDING_BYTES_PER_RD, 4096);
+        let rd_count = with_gic(|gic| Ok(gic.redistributor_count().max(1)))?;
         let pending_tables = AlignedMemory::new(pending_stride * rd_count, 65536)
             .ok_or_else(|| OnProbeError::other("failed to allocate LPI pending tables"))?;
         pending_tables.clean();
 
-        let collection_target =
-            with_gic(|gic| {
-                if !gic.supports_lpis() {
-                    return Err(OnProbeError::Unsupported(
-                        "GICv3 distributor does not support LPIs",
-                    ));
-                }
-                gic.init_lpi_tables(
-                    property_table.phys(),
-                    LPI_ID_BITS,
-                    pending_tables.phys(),
-                    pending_stride,
-                )
-                .map_err(|err| {
-                    OnProbeError::other(format!("failed to initialize GICR LPI tables: {err}"))
-                })?;
-                Ok(gic.current_collection_target(
-                    gicr_phys_base,
-                    its.uses_physical_collection_target(),
-                ))
+        let collection_targets = with_gic(|gic| {
+            if !gic.supports_lpis() {
+                return Err(OnProbeError::Unsupported(
+                    "GICv3 distributor does not support LPIs",
+                ));
+            }
+            gic.init_lpi_tables(
+                property_table.phys(),
+                LPI_ID_BITS,
+                pending_tables.phys(),
+                pending_stride,
+            )
+            .map_err(|err| {
+                OnProbeError::other(format!("failed to initialize GICR LPI tables: {err}"))
             })?;
+
+            let cpu_count = someboot::smp::cpu_count().max(1);
+            let mut targets = Vec::with_capacity(cpu_count);
+            for cpu_id in 0..cpu_count {
+                let hardware_id = super::hardware_cpu_id(cpu_id).map_err(|error| {
+                    OnProbeError::other(format!(
+                        "failed to resolve hardware ID for logical CPU {cpu_id}: {error:?}"
+                    ))
+                })?;
+                let affinity = Affinity::from_mpidr(hardware_id as u64);
+                let target = gic
+                    .collection_target_for_affinity(
+                        gicr_phys_base,
+                        use_physical_collection_target,
+                        affinity,
+                    )
+                    .ok_or_else(|| {
+                        OnProbeError::other(format!(
+                            "GICv3 redistributor for logical CPU {cpu_id} (MPIDR \
+                             {hardware_id:#x}) is not available"
+                        ))
+                    })?;
+                targets.push(target);
+            }
+            Ok(targets)
+        })?;
 
         its.disable();
         let command_queue = CommandQueue::new(COMMAND_QUEUE_ENTRIES)
@@ -172,7 +240,8 @@ impl GicItsProvider {
         its.init_command_queue(command_queue.phys(), command_queue.bytes());
 
         program_baser_table(&its, ItsTableType::Device, MAX_DEVICE_ID_BITS)?;
-        program_baser_table(&its, ItsTableType::Collection, 1)?;
+        let collection_id_bits = collection_targets.len().next_power_of_two().ilog2() as u8;
+        program_baser_table(&its, ItsTableType::Collection, collection_id_bits.max(1))?;
         its.enable();
 
         let mut provider = Self {
@@ -185,17 +254,25 @@ impl GicItsProvider {
             next_lpi: LPI_INTID_BASE,
             devices: BTreeMap::new(),
             lpis: BTreeMap::new(),
-            collection_target,
+            collection_targets,
             gic_domain,
+            _msi_domain: msi_domain,
+            msix_domain,
             itt_entry_size: 16,
         };
         provider.itt_entry_size = provider.its.itt_entry_size().max(8);
-        provider
-            .send_command(ItsCommand::mapc(COLLECTION_ID, collection_target, true))
-            .map_err(|err| OnProbeError::other(format!("failed to send ITS MAPC: {err:?}")))?;
-        provider
-            .send_command(ItsCommand::sync(collection_target))
-            .map_err(|err| OnProbeError::other(format!("failed to send ITS SYNC: {err:?}")))?;
+        for collection_index in 0..provider.collection_targets.len() {
+            let collection = u16::try_from(collection_index).map_err(|_| {
+                OnProbeError::other("logical CPU count exceeds the ITS collection ID space")
+            })?;
+            let target = provider.collection_targets[collection_index];
+            provider
+                .send_command(ItsCommand::mapc(collection, target, true))
+                .map_err(|err| OnProbeError::other(format!("failed to send ITS MAPC: {err:?}")))?;
+            provider
+                .send_command(ItsCommand::sync(target))
+                .map_err(|err| OnProbeError::other(format!("failed to send ITS SYNC: {err:?}")))?;
+        }
         Ok(provider)
     }
 
@@ -212,7 +289,7 @@ impl GicItsProvider {
         let itt = AlignedMemory::new(itt_bytes, 256).ok_or(IrqError::NoMemory)?;
         itt.clean();
         self.send_command(ItsCommand::mapd(device.0, itt.phys(), event_capacity, true))?;
-        self.send_command(ItsCommand::sync(self.collection_target))?;
+        self.send_command(ItsCommand::sync(self.default_collection_target()?))?;
         self.devices.insert(
             device.0,
             ItsDevice {
@@ -232,7 +309,39 @@ impl GicItsProvider {
         let route = *self.lpis.get(&intid).ok_or(IrqError::InvalidIrq)?;
         self.set_property_enabled(intid, enabled)?;
         self.send_command(ItsCommand::inv(route.device.0, route.event.0))?;
-        self.send_command(ItsCommand::sync(self.collection_target))
+        self.send_command(ItsCommand::sync(self.collection_target(route.collection)?))
+    }
+
+    fn move_lpi_to_collection(&mut self, intid: u32, collection: u16) -> Result<(), IrqError> {
+        let target = self.collection_target(collection)?;
+        let route = *self.lpis.get(&intid).ok_or(IrqError::InvalidIrq)?;
+        if route.collection == collection {
+            return Ok(());
+        }
+        self.send_command(ItsCommand::movi(route.device.0, route.event.0, collection))?;
+        self.send_command(ItsCommand::sync(target))?;
+        self.lpis
+            .get_mut(&intid)
+            .ok_or(IrqError::InvalidIrq)?
+            .collection = collection;
+        Ok(())
+    }
+
+    fn collection_id_for_cpu(&self, cpu_id: usize) -> Result<u16, IrqError> {
+        let collection = u16::try_from(cpu_id).map_err(|_| IrqError::InvalidCpu)?;
+        self.collection_target(collection)?;
+        Ok(collection)
+    }
+
+    fn default_collection_target(&self) -> Result<u64, IrqError> {
+        self.collection_target(DEFAULT_COLLECTION_ID)
+    }
+
+    fn collection_target(&self, collection: u16) -> Result<u64, IrqError> {
+        self.collection_targets
+            .get(usize::from(collection))
+            .copied()
+            .ok_or(IrqError::InvalidCpu)
     }
 
     fn set_property_enabled(&self, intid: u32, enabled: bool) -> Result<(), IrqError> {
@@ -289,16 +398,33 @@ impl Interface for GicItsProvider {
             let lpi = self.next_lpi;
             self.next_lpi = self.next_lpi.checked_add(1).ok_or(IrqError::NoMemory)?;
             self.set_property_enabled(lpi, false)?;
-            self.send_command(ItsCommand::mapti(device.0, event.0, lpi, COLLECTION_ID))?;
-            self.lpis.insert(lpi, LpiRoute { device, event });
-            LPI_OWNER.lock().insert(lpi, self.owner);
-            vectors.push(MsiVector::new(
+            self.send_command(ItsCommand::mapti(
+                device.0,
+                event.0,
+                lpi,
+                DEFAULT_COLLECTION_ID,
+            ))?;
+            let parent_irq = IrqId::new(self.gic_domain, HwIrq(lpi));
+            let leaf_irq = IrqId::new(self.msix_domain, HwIrq(lpi - LPI_INTID_BASE));
+            crate::irq::map_irq_route(parent_irq, leaf_irq)?;
+            self.lpis.insert(
+                lpi,
+                LpiRoute {
+                    device,
+                    event,
+                    leaf_irq,
+                    collection: DEFAULT_COLLECTION_ID,
+                },
+            );
+            lpi_owners().insert(lpi, self.owner);
+            vectors.push(MsiVector::with_parent(
                 MsiVectorIndex(index),
                 event,
-                IrqId::new(self.gic_domain, HwIrq(lpi)),
+                leaf_irq,
+                parent_irq,
             ));
         }
-        self.send_command(ItsCommand::sync(self.collection_target))?;
+        self.send_command(ItsCommand::sync(self.default_collection_target()?))?;
         Ok(vectors)
     }
 
@@ -310,26 +436,32 @@ impl Interface for GicItsProvider {
     }
 
     fn set_vector_enabled(&mut self, vector: &MsiVector, enabled: bool) -> Result<(), IrqError> {
-        self.set_lpi_enabled_by_intid(vector.irq.hwirq.0, enabled)
+        self.set_lpi_enabled_by_intid(vector.parent_irq.hwirq.0, enabled)
     }
 
     fn set_vector_affinity(
         &mut self,
-        _vector: &MsiVector,
+        vector: &MsiVector,
         affinity: irq_framework::IrqAffinity,
     ) -> Result<(), IrqError> {
-        match affinity {
-            irq_framework::IrqAffinity::Any => Ok(()),
-            irq_framework::IrqAffinity::Fixed { .. } => Err(IrqError::Unsupported),
-        }
+        let collection = match affinity {
+            irq_framework::IrqAffinity::Any => DEFAULT_COLLECTION_ID,
+            irq_framework::IrqAffinity::Fixed(cpu_id) => self.collection_id_for_cpu(cpu_id.0)?,
+        };
+        self.move_lpi_to_collection(vector.parent_irq.hwirq.0, collection)
     }
 
     fn free_vectors(&mut self, allocation: MsiAllocation) -> Result<(), IrqError> {
         for vector in allocation.vectors() {
-            let intid = vector.irq.hwirq.0;
+            let intid = vector.parent_irq.hwirq.0;
+            let route = *self.lpis.get(&intid).ok_or(IrqError::InvalidIrq)?;
+            if route.leaf_irq != vector.irq {
+                return Err(IrqError::InvalidIrq);
+            }
             self.set_lpi_enabled_by_intid(intid, false)?;
+            crate::irq::unmap_irq_route(vector.parent_irq, vector.irq)?;
             self.lpis.remove(&intid);
-            LPI_OWNER.lock().remove(&intid);
+            lpi_owners().remove(&intid);
         }
         Ok(())
     }
@@ -345,6 +477,8 @@ struct ItsDevice {
 struct LpiRoute {
     device: MsiDeviceId,
     event: MsiEventId,
+    leaf_irq: IrqId,
+    collection: u16,
 }
 
 struct CommandQueue {

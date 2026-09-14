@@ -1,8 +1,7 @@
-use ax_errno::{AxResult, ax_err};
-use ax_kspin::SpinNoIrq as Mutex;
-use ax_memory_addr::AddrRange;
-use axdevice_base::{AccessWidth, BaseDeviceOps, EmuDeviceType};
-use axvm_types::{GuestPhysAddr, GuestPhysAddrRange};
+use crate::{
+    X86AccessWidth, X86GuestPhysAddr, X86GuestPhysAddrRange, X86VlapicError, X86VlapicResult,
+    lock::SpinMutex as Mutex,
+};
 
 const IOAPIC_BASE: usize = 0xfec0_0000;
 const IOAPIC_SIZE: usize = 0x1000;
@@ -29,6 +28,7 @@ struct IoApicState {
     selector: u32,
     redirection_table: [u64; REDIRECTION_ENTRY_COUNT],
     pending_level: [bool; REDIRECTION_ENTRY_COUNT],
+    input_level: [bool; REDIRECTION_ENTRY_COUNT],
 }
 
 impl IoApicState {
@@ -37,6 +37,7 @@ impl IoApicState {
             selector: 0,
             redirection_table: [REDIRECTION_ENTRY_MASKED; REDIRECTION_ENTRY_COUNT],
             pending_level: [false; REDIRECTION_ENTRY_COUNT],
+            input_level: [false; REDIRECTION_ENTRY_COUNT],
         }
     }
 
@@ -89,7 +90,7 @@ impl IoApicState {
                 continue;
             }
 
-            let pending = core::mem::take(&mut self.pending_level[gsi])
+            let pending = (self.input_level[gsi] || core::mem::take(&mut self.pending_level[gsi]))
                 .then(|| self.interrupt_for_entry(gsi))
                 .flatten();
             return Some(IoApicEoi { gsi, pending });
@@ -119,14 +120,14 @@ pub struct IoApicEoi {
 
 /// A minimal emulated x86 IO APIC.
 pub struct EmulatedIoApic {
-    base: GuestPhysAddr,
+    base: X86GuestPhysAddr,
     size: usize,
     state: Mutex<IoApicState>,
 }
 
 impl EmulatedIoApic {
     /// Create a new `EmulatedIoApic`.
-    pub fn new(base: GuestPhysAddr, size: Option<usize>) -> Self {
+    pub fn new(base: X86GuestPhysAddr, size: Option<usize>) -> Self {
         Self {
             base,
             size: size.unwrap_or(IOAPIC_SIZE),
@@ -136,7 +137,7 @@ impl EmulatedIoApic {
 
     /// Create an IO APIC at the default PC-compatible GPA.
     pub fn new_default() -> Self {
-        Self::new(GuestPhysAddr::from_usize(IOAPIC_BASE), Some(IOAPIC_SIZE))
+        Self::new(X86GuestPhysAddr::from_usize(IOAPIC_BASE), Some(IOAPIC_SIZE))
     }
 
     /// Return the guest interrupt vector programmed for a GSI.
@@ -166,17 +167,39 @@ impl EmulatedIoApic {
         state.interrupt_for_entry(gsi)
     }
 
+    /// Updates one IO APIC input line and returns a newly routable interrupt.
+    ///
+    /// Level-triggered inputs remain asserted across guest EOI. Deasserting a
+    /// line before EOI cancels any deferred redelivery.
+    pub fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        let mut state = self.state.lock();
+        let input = state.input_level.get_mut(gsi)?;
+        let was_asserted = core::mem::replace(input, asserted);
+        if !asserted {
+            state.pending_level[gsi] = false;
+            return None;
+        }
+        if was_asserted {
+            if state.redirection_table[gsi] & REDIRECTION_ENTRY_REMOTE_IRR != 0 {
+                state.pending_level[gsi] = true;
+                return None;
+            }
+            return state.interrupt_for_entry(gsi);
+        }
+        state.interrupt_for_entry(gsi)
+    }
+
     /// Process an EOI broadcast from the local APIC.
     pub fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi> {
         let mut state = self.state.lock();
         state.end_of_interrupt(vector)
     }
 
-    fn offset(&self, addr: GuestPhysAddr) -> usize {
+    fn offset(&self, addr: X86GuestPhysAddr) -> usize {
         addr.as_usize() - self.base.as_usize()
     }
 
-    fn read_selected_register(state: &IoApicState) -> AxResult<u32> {
+    fn read_selected_register(state: &IoApicState) -> X86VlapicResult<u32> {
         match state.selector {
             IOAPIC_ID => Ok(IOAPIC_ID_VALUE),
             IOAPIC_VER => Ok(IOAPIC_VERSION_VALUE),
@@ -184,7 +207,7 @@ impl EmulatedIoApic {
             reg @ IOREDTBL_BASE..=0x3f => {
                 let index = ((reg - IOREDTBL_BASE) / 2) as usize;
                 if index >= REDIRECTION_ENTRY_COUNT {
-                    return ax_err!(InvalidInput, "IOAPIC redirection index out of range");
+                    return Err(X86VlapicError::InvalidInput);
                 }
                 let entry = state.redirection_table[index];
                 if (reg - IOREDTBL_BASE) & 1 == 0 {
@@ -200,13 +223,13 @@ impl EmulatedIoApic {
         }
     }
 
-    fn write_selected_register(state: &mut IoApicState, value: u32) -> AxResult {
+    fn write_selected_register(state: &mut IoApicState, value: u32) -> X86VlapicResult {
         match state.selector {
             IOAPIC_ID | IOAPIC_VER | IOAPIC_ARB => Ok(()),
             reg @ IOREDTBL_BASE..=0x3f => {
                 let index = ((reg - IOREDTBL_BASE) / 2) as usize;
                 if index >= REDIRECTION_ENTRY_COUNT {
-                    return ax_err!(InvalidInput, "IOAPIC redirection index out of range");
+                    return Err(X86VlapicError::InvalidInput);
                 }
                 let entry = &mut state.redirection_table[index];
                 if (reg - IOREDTBL_BASE) & 1 == 0 {
@@ -229,6 +252,70 @@ impl EmulatedIoApic {
             }
             reg => {
                 debug!("vIOAPIC write to unsupported register {reg:#x} = {value:#x}");
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Default for EmulatedIoApic {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+impl EmulatedIoApic {
+    /// Returns the IO APIC MMIO range.
+    pub fn address_range(&self) -> X86GuestPhysAddrRange {
+        X86GuestPhysAddrRange::new(
+            self.base,
+            X86GuestPhysAddr::from_usize(self.base.as_usize() + self.size),
+        )
+    }
+
+    /// Handles an IO APIC MMIO read.
+    pub fn handle_read(
+        &self,
+        addr: X86GuestPhysAddr,
+        width: X86AccessWidth,
+    ) -> X86VlapicResult<usize> {
+        if !matches!(width, X86AccessWidth::Dword | X86AccessWidth::Qword) {
+            return Err(X86VlapicError::Unsupported);
+        }
+
+        let offset = self.offset(addr);
+        let state = self.state.lock();
+        match offset {
+            IOREGSEL => Ok(state.selector as usize),
+            IOWIN => Ok(Self::read_selected_register(&state)? as usize),
+            _ => {
+                debug!("vIOAPIC read from unsupported offset {offset:#x}");
+                Ok(0)
+            }
+        }
+    }
+
+    /// Handles an IO APIC MMIO write.
+    pub fn handle_write(
+        &self,
+        addr: X86GuestPhysAddr,
+        width: X86AccessWidth,
+        val: usize,
+    ) -> X86VlapicResult {
+        if !matches!(width, X86AccessWidth::Dword | X86AccessWidth::Qword) {
+            return Err(X86VlapicError::Unsupported);
+        }
+
+        let offset = self.offset(addr);
+        let mut state = self.state.lock();
+        match offset {
+            IOREGSEL => {
+                state.selector = val as u32;
+                Ok(())
+            }
+            IOWIN => Self::write_selected_register(&mut state, val as u32),
+            _ => {
+                debug!("vIOAPIC write to unsupported offset {offset:#x} = {val:#x}");
                 Ok(())
             }
         }
@@ -279,60 +366,34 @@ mod tests {
             })
         );
     }
-}
 
-impl Default for EmulatedIoApic {
-    fn default() -> Self {
-        Self::new_default()
-    }
-}
-
-impl BaseDeviceOps<GuestPhysAddrRange> for EmulatedIoApic {
-    fn emu_type(&self) -> EmuDeviceType {
-        EmuDeviceType::X86IoApic
-    }
-
-    fn address_range(&self) -> GuestPhysAddrRange {
-        AddrRange::new(
-            self.base,
-            GuestPhysAddr::from_usize(self.base.as_usize() + self.size),
-        )
-    }
-
-    fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
-        if !matches!(width, AccessWidth::Dword | AccessWidth::Qword) {
-            return ax_err!(Unsupported, "unsupported IOAPIC read width");
+    #[test]
+    fn asserted_level_is_redelivered_after_eoi_until_lowered() {
+        let ioapic = EmulatedIoApic::default();
+        {
+            let mut state = ioapic.state.lock();
+            program_level_gsi(&mut state, 4, 0x34);
         }
 
-        let offset = self.offset(addr);
-        let state = self.state.lock();
-        match offset {
-            IOREGSEL => Ok(state.selector as usize),
-            IOWIN => Ok(Self::read_selected_register(&state)? as usize),
-            _ => {
-                debug!("vIOAPIC read from unsupported offset {offset:#x}");
-                Ok(0)
-            }
-        }
-    }
+        assert_eq!(
+            ioapic.set_gsi_level(4, true),
+            Some(IoApicInterrupt {
+                vector: 0x34,
+                level_triggered: true,
+            })
+        );
+        assert_eq!(
+            ioapic.end_of_interrupt(0x34).and_then(|eoi| eoi.pending),
+            Some(IoApicInterrupt {
+                vector: 0x34,
+                level_triggered: true,
+            })
+        );
 
-    fn handle_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
-        if !matches!(width, AccessWidth::Dword | AccessWidth::Qword) {
-            return ax_err!(Unsupported, "unsupported IOAPIC write width");
-        }
-
-        let offset = self.offset(addr);
-        let mut state = self.state.lock();
-        match offset {
-            IOREGSEL => {
-                state.selector = val as u32;
-                Ok(())
-            }
-            IOWIN => Self::write_selected_register(&mut state, val as u32),
-            _ => {
-                debug!("vIOAPIC write to unsupported offset {offset:#x} = {val:#x}");
-                Ok(())
-            }
-        }
+        ioapic.set_gsi_level(4, false);
+        assert_eq!(
+            ioapic.end_of_interrupt(0x34).and_then(|eoi| eoi.pending),
+            None
+        );
     }
 }

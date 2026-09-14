@@ -1,6 +1,9 @@
 #![cfg_attr(not(test), no_std)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(test)]
+extern crate alloc;
+
 use core::{
     hash::{Hash, Hasher},
     ops::*,

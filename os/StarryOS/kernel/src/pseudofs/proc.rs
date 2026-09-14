@@ -7,49 +7,65 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{
-    ffi::CStr,
-    fmt::Write,
-    iter,
-    mem::size_of,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{ffi::CStr, fmt::Write, iter, mem::size_of, sync::atomic::Ordering};
 
-use ax_fs_ng::vfs::FS_CONTEXT;
+use ax_fs_ng::vfs::{FS_CONTEXT, current_fs_context};
 use ax_lazyinit::LazyInit;
 use ax_memory_addr::{MemoryAddr, VirtAddr};
-#[cfg(target_arch = "aarch64")]
-use ax_runtime::hal::pmu;
 use ax_runtime::hal::{
     paging::MappingFlags,
     time::{monotonic_time, wall_time},
 };
-use ax_task::{AxCpuMask, AxTaskRef, TaskState, WeakAxTaskRef, current};
+use ax_std::os::arceos::task::{
+    sched::{CpuId, CpuSet},
+    thread::ThreadState,
+};
 use axfs_ng_vfs::{DeviceId, Filesystem, NodePermission, NodeType, VfsError, VfsResult};
 use kernel_elf_parser::{AuxEntry, AuxType};
 use ksym::KallsymsMapped;
-use starry_process::{Pid, Process};
 use zerocopy::IntoBytes;
 
 use crate::{
-    file::FD_TABLE,
-    mm::{BackendFileInfo, ProcessMemStats},
+    file::{FD_TABLE, PidFd},
+    mm::{MappingFileInfo, ProcessMemStats},
     pseudofs::{
         DirMaker, DirMapping, DirectRwFsFileOps, NodeOpsMux, RwFile, SeqObject, SimpleDir,
         SimpleDirOps, SimpleFile, SimpleFileOperation, SimpleFs, SpecialFsFile,
     },
     task::{
-        AsThread, Cred, ProcessData, TaskStat, Thread, get_process_data, get_task, processes,
-        tasks, tick_cpu_time,
+        Cred, PidNamespaceRef, PidNumber, PidView, Process, ProcessData, ROOT_PID_NS, TaskStat,
+        TgidNumber, Thread, TidNumber, UserTaskRef, WeakUserTaskRef, current_user_task, processes,
+        tasks,
     },
 };
 
-/// Global IRQ counter incremented on every timer tick.
-/// Module-level so both `/proc/interrupts` and `/proc/stat` can read it.
-static IRQ_CNT: AtomicUsize = AtomicUsize::new(0);
-const PROCFS_INIT_PID: Pid = 1;
+/// Linux `new_idmap_permitted`: without the capability in the initial user
+/// namespace, a writer may map only its own id.
+fn may_map_id(
+    outside: u32,
+    count: u32,
+    own_id: impl Fn(&Cred) -> u32,
+    privileged: impl Fn(&Cred) -> bool,
+) -> bool {
+    let writer = current_user_task();
+    let thread = writer.as_thread();
+    let cred = thread.cred();
+    let cred: &Cred = &cred;
+    (count == 1 && outside == own_id(cred))
+        || (privileged(cred) && thread.proc_data.namespace_snapshot().in_initial_user_ns())
+}
+
+fn upgrade_proc_task(task: &WeakUserTaskRef) -> VfsResult<Option<UserTaskRef>> {
+    (*task).upgrade().map_err(|_| VfsError::BadState)
+}
+
+fn require_proc_task(task: &WeakUserTaskRef) -> VfsResult<UserTaskRef> {
+    upgrade_proc_task(task)?.ok_or(VfsError::NotFound)
+}
 
 pub static KALLSYMS: LazyInit<KallsymsMapped<'static>> = LazyInit::new();
+
+static BOOT_ID: LazyInit<String> = LazyInit::new();
 
 fn read_kallsyms() -> KallsymsMapped<'static> {
     unsafe extern "C" {
@@ -79,23 +95,58 @@ fn read_kallsyms() -> KallsymsMapped<'static> {
     .expect("Failed to create KallsymsMapped")
 }
 
-fn procfs_visible_pid(proc: &Arc<Process>) -> Pid {
-    if proc.is_init() {
-        PROCFS_INIT_PID
-    } else {
-        proc.pid()
-    }
+fn procfs_visible_pid(view: &PidView, proc: &Process) -> Option<u32> {
+    view.visible_number(&proc.identity()).map(PidNumber::get)
 }
 
-fn procfs_lookup_process(pid: Pid) -> VfsResult<Arc<ProcessData>> {
-    if pid == PROCFS_INIT_PID {
-        processes()
-            .into_iter()
-            .find(|proc_data| proc_data.proc.is_init())
-            .ok_or(VfsError::NotFound)
-    } else {
-        get_process_data(pid).map_err(|_| VfsError::NotFound)
-    }
+fn boot_id_proc_file(fs: Arc<SimpleFs>) -> Option<Arc<SimpleFile>> {
+    let generated_boot_id = boot_id_from_entropy(ax_runtime::hal::boot::boot_entropy())?;
+    let boot_id = BOOT_ID.get_or_init(|| generated_boot_id).clone();
+    let file = SimpleFile::new_regular(fs, move || Ok(boot_id.clone()));
+    let now = wall_time();
+    file.set_attrs(
+        NodePermission::from_bits_truncate(0o444),
+        0,
+        0,
+        now,
+        now,
+        now,
+    );
+    Some(file)
+}
+
+fn boot_id_from_entropy(boot_entropy: Option<[u8; 32]>) -> Option<String> {
+    let boot_entropy = boot_entropy?;
+    let random_bytes = boot_entropy[..16]
+        .try_into()
+        .expect("boot entropy contains 16 UUID bytes");
+    Some(format_boot_id(random_bytes))
+}
+
+fn format_boot_id(mut random_bytes: [u8; 16]) -> String {
+    random_bytes[6] = (random_bytes[6] & 0x0f) | 0x40;
+    random_bytes[8] = (random_bytes[8] & 0x3f) | 0x80;
+
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:\
+         02x}{:02x}{:02x}\n",
+        random_bytes[0],
+        random_bytes[1],
+        random_bytes[2],
+        random_bytes[3],
+        random_bytes[4],
+        random_bytes[5],
+        random_bytes[6],
+        random_bytes[7],
+        random_bytes[8],
+        random_bytes[9],
+        random_bytes[10],
+        random_bytes[11],
+        random_bytes[12],
+        random_bytes[13],
+        random_bytes[14],
+        random_bytes[15],
+    )
 }
 
 fn render_meminfo() -> String {
@@ -106,6 +157,7 @@ fn render_meminfo() -> String {
         + usages.get(ax_alloc::UsageKind::VirtMem)
         + usages.get(ax_alloc::UsageKind::PageCache)
         + usages.get(ax_alloc::UsageKind::PageTable)
+        + usages.get(ax_alloc::UsageKind::TaskStack)
         + usages.get(ax_alloc::UsageKind::Dma)
         + usages.get(ax_alloc::UsageKind::Global);
     let cached = usages.get(ax_alloc::UsageKind::PageCache);
@@ -169,6 +221,7 @@ fn render_vmstat() -> String {
         + usages.get(ax_alloc::UsageKind::VirtMem)
         + usages.get(ax_alloc::UsageKind::PageCache)
         + usages.get(ax_alloc::UsageKind::PageTable)
+        + usages.get(ax_alloc::UsageKind::TaskStack)
         + usages.get(ax_alloc::UsageKind::Dma)
         + usages.get(ax_alloc::UsageKind::Global);
     let free_pages = total.saturating_sub(used) / 4096;
@@ -223,7 +276,11 @@ fn render_cpu_entry(buf: &mut String, idx: usize) {
     // tools key off implementer/part to identify the microarchitecture). On
     // RK3588 this yields A76 (0x41/0xd0b) and A55 (0x41/0xd05); under QEMU
     // cortex-a53 it reads 0x41/0xd03.
-    let midr = pmu::cpu_id_raw().unwrap_or(0);
+    // `render_cpuinfo()` walks logical CPUs from one caller. Reading MIDR_EL1
+    // here would therefore repeat that caller's core type for every stanza on
+    // a heterogeneous machine. Perf initializes and caches MIDR on each CPU;
+    // use the indexed snapshot just like Linux's per-CPU cpuinfo path.
+    let midr = crate::perf::cpu_midr(idx);
     let implementer = (midr >> 24) & 0xff;
     let variant = (midr >> 20) & 0xf;
     let part = (midr >> 4) & 0xfff;
@@ -280,7 +337,7 @@ fn render_cpu_entry(buf: &mut String, idx: usize) {
     let _ = writeln!(buf);
 }
 
-fn render_stat() -> String {
+fn render_stat() -> VfsResult<String> {
     let up = monotonic_time();
     let cpu_count = ax_runtime::hal::cpu_num() as u64;
     // Total CPU-time budget in jiffies across all CPUs (USER_HZ = 100).
@@ -299,9 +356,9 @@ fn render_stat() -> String {
         user_ms += u.as_millis();
         sys_ms += s.as_millis();
         match task.state() {
-            TaskState::Running | TaskState::Ready => procs_running += 1,
-            TaskState::Blocked => procs_blocked += 1,
-            TaskState::Exited => {}
+            ThreadState::New | ThreadState::Running | ThreadState::Waking => procs_running += 1,
+            ThreadState::Parking | ThreadState::Blocked => procs_blocked += 1,
+            ThreadState::Exited => {}
         }
     }
     let task_count = all_tasks.len() as u64;
@@ -321,7 +378,7 @@ fn render_stat() -> String {
     let per_cpu_sys = sys_jiffies / cpu_count;
     let per_cpu_idle = idle_jiffies / cpu_count;
 
-    let irq_total = IRQ_CNT.load(Ordering::Relaxed) as u64;
+    let irq_total = ax_runtime::diagnostics::timer_irq_count();
 
     let mut buf = format!("cpu  {user_jiffies} 0 {sys_jiffies} {idle_jiffies} 0 0 0 0 0 0\n");
     for i in 0..cpu_count {
@@ -337,7 +394,7 @@ fn render_stat() -> String {
     let _ = writeln!(buf, "procs_running {procs_running}");
     let _ = writeln!(buf, "procs_blocked {procs_blocked}");
     let _ = writeln!(buf, "softirq 0 0 0 0 0 0 0 0 0 0 0");
-    buf
+    Ok(buf)
 }
 
 fn render_proc_net_arp() -> String {
@@ -374,92 +431,279 @@ fn render_proc_net_arp() -> String {
 }
 
 fn render_proc_net_dev() -> String {
-    let mut buf = "Inter-|   Receive                                                |  \
-                   Transmit\nface |bytes    packets errs drop fifo frame compressed \
-                   multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+    let stats = ax_net::net_dev_stats();
+    render_proc_net_dev_from_stats(&stats)
+}
+
+fn render_proc_net_dev_from_stats(stats: &[ax_net::NetDevStats]) -> String {
+    // Header matches Linux dev_seq_show() in net/core/net-procfs.c exactly.
+    let mut buf = "Inter-|   Receive                                                |  Transmit\n \
+                   face |bytes    packets errs drop fifo frame compressed multicast|bytes    \
+                   packets errs drop fifo colls carrier compressed\n"
         .to_string();
-    // Per interface: 8 receive columns (bytes packets errs drop fifo frame
-    // compressed multicast) then 8 transmit columns (bytes packets errs drop
-    // fifo colls carrier compressed). Only bytes/packets have a source; the
-    // error/drop/fifo columns have no accounting yet and stay zero.
-    for st in ax_net::net_dev_stats() {
-        let _ = writeln!(
+    for st in stats {
+        // Format matches Linux dev_seq_printf_stats(): 17 fixed-width columns.
+        // Hardware-only fields (fifo, frame, compressed, multicast, colls,
+        // carrier) stay at 0 — QEMU virtio has no hardware event source for them.
+        writeln!(
             buf,
-            "{:>8}: {} {} 0 0 0 0 0 0 {} {} 0 0 0 0 0 0",
-            st.name, st.rx_bytes, st.rx_packets, st.tx_bytes, st.tx_packets
-        );
+            "{:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} \
+             {:>4} {:>5} {:>7} {:>10}",
+            st.name,
+            st.rx_bytes,
+            st.rx_packets,
+            st.rx_errors,
+            st.rx_dropped,
+            0u64, // fifo — hardware only
+            0u64, // frame — rx_length+over+crc+frame aggregate, hardware only
+            0u64, // compressed — hardware only
+            0u64, // multicast — hardware only
+            st.tx_bytes,
+            st.tx_packets,
+            st.tx_errors,
+            st.tx_dropped,
+            0u64, // fifo — hardware only
+            0u64, // colls — hardware only
+            0u64, // carrier — aborted+carrier+window+heartbeat aggregate, hw only
+            0u64, // compressed — hardware only
+        )
+        .expect("write to String cannot fail");
     }
     buf
 }
 
-/// Block-device major reported for the root virtio-blk disk (`vda`) in
-/// `/proc/diskstats`. Linux assigns virtio-blk a dynamic major through
-/// `register_blkdev(0, "virtblk")`; 254 is the value the single-disk guest
-/// consistently observes.
-const VIRTBLK_MAJOR: u32 = 254;
+fn render_proc_net_snmp() -> String {
+    // Smoltcp 0.13.1 does not expose per-protocol cumulative counters
+    // (retransmits, out-of-order, etc.) through its public socket API.
+    // This file exists for Linux compatibility and reports zero counters;
+    // real values will be populated when the necessary infrastructure is
+    // added to the network stack.
+    //
+    // TCP header/data layout matches Linux snmp4_tcp_list (net/ipv4/proc.c).
+    // UDP header/data layout matches Linux snmp4_udp_list including the
+    // MemErrors field added in Linux 4.2.
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails \
+         EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors"
+    )
+    .expect("write to String cannot fail");
+    writeln!(buf, "Tcp: 1 200 120000 -1 0 0 0 0 0 0 0 0 0 0 0")
+        .expect("write to String cannot fail");
+    writeln!(
+        buf,
+        "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors \
+         IgnoredMulti MemErrors"
+    )
+    .expect("write to String cannot fail");
+    writeln!(buf, "Udp: 0 0 0 0 0 0 0 0 0").expect("write to String cannot fail");
+    buf
+}
 
 fn render_diskstats() -> String {
     // 14-field Linux /proc/diskstats layout, one line per block device. Only the
-    // root virtio-blk device ("vda", minor 0) is backed by the block runtime, so
-    // only its request/sector counters are real; the timing and in-flight fields
-    // have no source and stay zero.
+    // selected root device is backed by the block runtime, so only its
+    // request/sector counters are real; timing and in-flight fields have no
+    // source and stay zero.
+    let identity = ax_fs_ng::root::root_block_identity();
     let (reads, sectors_read, writes, sectors_written) = ax_fs_ng::block_io_stats();
     format!(
-        "{VIRTBLK_MAJOR}       0 vda {reads} 0 {sectors_read} 0 {writes} 0 {sectors_written} 0 0 \
-         0 0\n"
+        "{}       {} {} {reads} 0 {sectors_read} 0 {writes} 0 {sectors_written} 0 0 0 0\n",
+        identity.major, identity.minor, identity.name
     )
 }
 
-fn render_mounts() -> String {
-    // Root filesystem plus the pseudo-filesystems mounted unconditionally by
-    // `pseudofs::mount_all()` at boot. The root fs type is read live from the
-    // mount table; the pseudo mounts are fixed. Dynamic user mounts are not
-    // enumerated here because the VFS does not expose a public mount-tree
-    // walker, so third-party mounts made via mount(2) are absent.
-    let root_fstype = {
-        let ctx = FS_CONTEXT.lock();
-        ctx.root_dir().filesystem().name().to_string()
-    };
-    let mut buf = format!("/dev/vda / {root_fstype} rw,relatime 0 0\n");
-    buf.push_str("devtmpfs /dev devtmpfs rw,nosuid,relatime 0 0\n");
-    buf.push_str("tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
-    buf.push_str("tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n");
-    buf.push_str("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
-    buf.push_str("sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n");
-    buf.push_str("debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0\n");
-    buf
+fn render_proc_bus_usb_devices() -> String {
+    let mut snapshots = crate::pseudofs::usbfs::usb_device_snapshots();
+    snapshots.sort_by_key(|snapshot| (snapshot.bus_num, snapshot.device_num));
+    render_proc_bus_usb_devices_from_snapshots(&snapshots)
 }
 
-fn render_mountinfo() -> String {
-    // /proc/<pid>/mountinfo (Linux fs/proc_namespace.c show_mountinfo layout):
-    //   id parent major:minor root mount_point options [optional-fields] - fstype source super_opts
-    // Same mount set as render_mounts(): the root fs type is read live; the pseudo mounts are the
-    // fixed boot set. No optional propagation fields are emitted, so the "-" separator immediately
-    // precedes the fs type. Tools such as node_exporter's filesystem collector and findmnt read
-    // this file (in preference to /proc/mounts) to discover mount points before statfs().
-    let root_fstype = {
-        let ctx = FS_CONTEXT.lock();
-        ctx.root_dir().filesystem().name().to_string()
-    };
-    let mut buf = format!("21 20 {VIRTBLK_MAJOR}:0 / / rw,relatime - {root_fstype} /dev/vda rw\n");
-    buf.push_str("22 21 0:5 / /dev rw,nosuid,relatime - devtmpfs devtmpfs rw\n");
-    buf.push_str("23 22 0:16 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n");
-    buf.push_str("24 21 0:17 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n");
-    buf.push_str("25 21 0:18 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n");
-    buf.push_str("26 21 0:19 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n");
-    buf.push_str(
-        "27 26 0:20 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime - debugfs debugfs rw\n",
+fn render_proc_bus_usb_devices_from_snapshots(
+    snapshots: &[crate::pseudofs::usbfs::UsbDeviceSnapshotInfo],
+) -> String {
+    let mut out = String::new();
+    for snapshot in snapshots {
+        render_proc_bus_usb_device(snapshot, &mut out);
+    }
+    out
+}
+
+fn render_proc_bus_usb_device(
+    snapshot: &crate::pseudofs::usbfs::UsbDeviceSnapshotInfo,
+    out: &mut String,
+) {
+    let blob = &snapshot.descriptor_blob;
+    if blob.len() < 18 || descriptor_u8(blob, 0) < 18 || descriptor_u8(blob, 1) != 0x01 {
+        return;
+    }
+
+    let device_class = descriptor_u8(blob, 4);
+    let device_subclass = descriptor_u8(blob, 5);
+    let device_protocol = descriptor_u8(blob, 6);
+    let max_packet_size = descriptor_u8(blob, 7);
+    let vendor_id = descriptor_u16(blob, 8);
+    let product_id = descriptor_u16(blob, 10);
+    let device_version = descriptor_u16(blob, 12);
+    let config_count = descriptor_u8(blob, 17);
+    let max_child_count = if device_class == 0x09 { 1 } else { 0 };
+
+    let _ = writeln!(
+        out,
+        "T:  Bus={:02} Lev=00 Prnt=00 Port=00 Cnt=00 Dev#={:3} Spd=480  MxCh={:2}",
+        snapshot.bus_num, snapshot.device_num, max_child_count
     );
-    buf
+    let _ = writeln!(
+        out,
+        "D:  Ver={} Cls={:02x}({:<5}) Sub={:02x} Prot={:02x} MxPS={:2} #Cfgs={:3}",
+        usb_bcd(descriptor_u16(blob, 2)),
+        device_class,
+        usb_class_label(device_class),
+        device_subclass,
+        device_protocol,
+        max_packet_size,
+        config_count
+    );
+    let _ = writeln!(
+        out,
+        "P:  Vendor={:04x} ProdID={:04x} Rev={}",
+        vendor_id,
+        product_id,
+        usb_bcd(device_version)
+    );
+    let _ = writeln!(out);
+
+    let mut offset = 18usize;
+    while offset + 2 <= blob.len() {
+        let len = descriptor_u8(blob, offset) as usize;
+        let ty = descriptor_u8(blob, offset + 1);
+        if len == 0 {
+            break;
+        }
+        if ty != 0x02 || len < 9 || offset + len > blob.len() {
+            offset = offset.saturating_add(len);
+            continue;
+        }
+
+        let total = descriptor_u16(blob, offset + 2) as usize;
+        let config_end = offset.saturating_add(total).min(blob.len());
+        let active = descriptor_u8(blob, offset + 5);
+        let _ = writeln!(
+            out,
+            "C:* #Ifs={:2} Cfg#={:2} Atr={:02x} MxPwr={:3}mA",
+            descriptor_u8(blob, offset + 4),
+            active,
+            descriptor_u8(blob, offset + 7),
+            u16::from(descriptor_u8(blob, offset + 8)) * 2
+        );
+
+        let mut desc = offset + len;
+        while desc + 2 <= config_end {
+            let desc_len = descriptor_u8(blob, desc) as usize;
+            let desc_ty = descriptor_u8(blob, desc + 1);
+            if desc_len == 0 || desc + desc_len > config_end {
+                break;
+            }
+            match desc_ty {
+                0x04 if desc_len >= 9 => {
+                    render_proc_bus_usb_interface(&blob[desc..desc + desc_len], out);
+                }
+                0x05 if desc_len >= 7 => {
+                    render_proc_bus_usb_endpoint(&blob[desc..desc + desc_len], out);
+                }
+                _ => {}
+            }
+            desc += desc_len;
+        }
+
+        let _ = writeln!(out);
+        offset = config_end.max(offset + len);
+    }
 }
 
-pub fn new_procfs() -> Filesystem {
-    SimpleFs::new_with("proc".into(), 0x9fa0, builder)
+fn render_proc_bus_usb_interface(desc: &[u8], out: &mut String) {
+    let class = descriptor_u8(desc, 5);
+    let _ = writeln!(
+        out,
+        "I:* If#={:2} Alt={:2} #EPs={:2} Cls={:02x}({:<5}) Sub={:02x} Prot={:02x} Driver={}",
+        descriptor_u8(desc, 2),
+        descriptor_u8(desc, 3),
+        descriptor_u8(desc, 4),
+        class,
+        usb_class_label(class),
+        descriptor_u8(desc, 6),
+        descriptor_u8(desc, 7),
+        if class == 0x09 { "hub" } else { "(none)" }
+    );
+}
+
+fn render_proc_bus_usb_endpoint(desc: &[u8], out: &mut String) {
+    let address = descriptor_u8(desc, 2);
+    let attributes = descriptor_u8(desc, 3);
+    let max_packet_size = descriptor_u16(desc, 4) & 0x07ff;
+    let _ = writeln!(
+        out,
+        "E:  Ad={:02x}({}) Atr={:02x}({:<5}) MxPS={:4} Ivl={}ms",
+        address,
+        if address & 0x80 != 0 { "I" } else { "O" },
+        attributes,
+        usb_endpoint_type_label(attributes & 0x03),
+        max_packet_size,
+        descriptor_u8(desc, 6)
+    );
+}
+
+fn descriptor_u8(blob: &[u8], offset: usize) -> u8 {
+    blob.get(offset).copied().unwrap_or_default()
+}
+
+fn descriptor_u16(blob: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([descriptor_u8(blob, offset), descriptor_u8(blob, offset + 1)])
+}
+
+fn usb_bcd(value: u16) -> String {
+    format!(
+        "{:2x}.{:x}{:x}",
+        (value >> 8) & 0xff,
+        (value >> 4) & 0x0f,
+        value & 0x0f
+    )
+}
+
+fn usb_class_label(class: u8) -> &'static str {
+    match class {
+        0x00 => ">ifc",
+        0x03 => "HID",
+        0x08 => "stor.",
+        0x09 => "hub",
+        0x0e => "video",
+        0xe0 => "wlcon",
+        0xef => "misc",
+        0xff => "vend.",
+        _ => "unk.",
+    }
+}
+
+fn usb_endpoint_type_label(ty: u8) -> &'static str {
+    match ty {
+        0 => "Ctrl",
+        1 => "Isoc",
+        2 => "Bulk",
+        3 => "Int.",
+        _ => "Unk.",
+    }
+}
+
+pub fn new_procfs(observer: PidNamespaceRef) -> Filesystem {
+    let view = PidView::new(observer);
+    SimpleFs::new_with("proc".into(), 0x9fa0, move |fs| builder(fs, view))
 }
 
 struct ProcessTaskDir {
     fs: Arc<SimpleFs>,
     process: Weak<Process>,
+    view: PidView,
 }
 
 impl SimpleDirOps for ProcessTaskDir {
@@ -467,32 +711,37 @@ impl SimpleDirOps for ProcessTaskDir {
         let Some(process) = self.process.upgrade() else {
             return Box::new(iter::empty());
         };
-        Box::new(
-            process
-                .threads()
-                .into_iter()
-                .map(|tid| tid.to_string().into()),
-        )
+        let view = self.view.clone();
+        Box::new(process.threads().into_iter().filter_map(move |tid| {
+            let identity = ROOT_PID_NS.lookup(tid.into())?;
+            view.visible_number(&identity)
+                .map(|number| number.get().to_string().into())
+        }))
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
         let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let task = get_task(tid).map_err(|_| VfsError::NotFound)?;
+        let identity = self
+            .view
+            .resolve_thread(TidNumber::try_from(tid).map_err(|_| VfsError::NotFound)?)
+            .map_err(|_| VfsError::NotFound)?;
+        let task = identity.live_task().ok_or(VfsError::NotFound)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
         }
 
-        let proc_data = get_process_data(process.pid()).map_err(|_| VfsError::NotFound)?;
+        let proc_data = process.identity().live_data().ok_or(VfsError::NotFound)?;
 
         Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
             self.fs.clone(),
             Arc::new(ThreadDir {
                 fs: self.fs.clone(),
-                task: Arc::downgrade(&task),
+                task: task.downgrade(),
                 proc_data,
-                path_pid: process.pid(),
+                path_pid: process.pid().get(),
                 procfs_pid: None,
+                view: self.view.clone(),
             }),
         )))
     }
@@ -508,25 +757,37 @@ impl SimpleDirOps for ProcessTaskDir {
 /// memory counters so cross-process reads do not depend on a possibly stale task
 /// weak reference after pid reuse.
 fn render_thread_status(
-    task: &WeakAxTaskRef,
+    task: &WeakUserTaskRef,
     proc_data: &Arc<ProcessData>,
-    path_pid: Pid,
-    procfs_pid: Option<Pid>,
+    _path_pid: u32,
+    _procfs_pid: Option<u32>,
+    view: &PidView,
 ) -> VfsResult<String> {
-    let task = task.upgrade().ok_or(VfsError::NotFound)?;
+    let task = require_proc_task(task)?;
     let thread = task.as_thread();
-    let aspace_arc = proc_data.aspace();
-    let mem = ProcessMemStats::collect(&aspace_arc.lock());
+    let aspace = proc_data.pin_aspace().map_err(VfsError::from)?;
+    let aspace = aspace.lock();
+    let mem = ProcessMemStats::collect(&aspace).map_err(VfsError::from)?;
     let cred = thread.cred();
     let name = task.name();
     let num_threads = proc_data.proc.threads().len() as u32;
-    let tracer_pid = proc_data.ptrace_tracer_pid().unwrap_or(0);
-    let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
-    let (tgid, pid) = if let Some(pid) = procfs_pid {
-        (pid, pid as u64)
-    } else {
-        (path_pid, thread.tid() as u64)
-    };
+    let tracer_pid = proc_data
+        .ptrace_tracer_identity()
+        .and_then(|identity| view.visible_number(&identity))
+        .map(TidNumber::from);
+    let ppid = proc_data
+        .proc
+        .parent()
+        .and_then(|parent| view.visible_number(&parent.identity()))
+        .map(TgidNumber::from);
+    let tgid = view
+        .visible_number(&proc_data.identity())
+        .map(TgidNumber::from)
+        .ok_or(VfsError::NotFound)?;
+    let pid = view
+        .visible_number(&thread.pid_identity())
+        .map(TidNumber::from)
+        .ok_or(VfsError::NotFound)?;
     Ok(render_task_status(
         TaskStatusBase {
             name: &name,
@@ -538,27 +799,27 @@ fn render_thread_status(
             cred: &cred,
             num_threads,
         },
-        task.cpumask(),
+        task.affinity(),
         ax_runtime::hal::cpu_num(),
         &mem,
     ))
 }
 
-fn task_status_state(task: &AxTaskRef) -> &'static str {
+fn task_status_state(task: &UserTaskRef) -> &'static str {
     match task.state() {
-        TaskState::Running | TaskState::Ready => "R (running)",
-        TaskState::Blocked => "S (sleeping)",
-        TaskState::Exited => "Z (zombie)",
+        ThreadState::New | ThreadState::Running | ThreadState::Waking => "R (running)",
+        ThreadState::Parking | ThreadState::Blocked => "S (sleeping)",
+        ThreadState::Exited => "Z (zombie)",
     }
 }
 
 struct TaskStatusBase<'a> {
     name: &'a str,
     state: &'a str,
-    tgid: u32,
-    pid: u64,
-    ppid: u32,
-    tracer_pid: u32,
+    tgid: TgidNumber,
+    pid: TidNumber,
+    ppid: Option<TgidNumber>,
+    tracer_pid: Option<TidNumber>,
     cred: &'a crate::task::Cred,
     num_threads: u32,
 }
@@ -572,12 +833,12 @@ struct TaskStatusFields<'a> {
 
 fn render_task_status(
     base: TaskStatusBase<'_>,
-    cpumask: AxCpuMask,
+    cpumask: CpuSet,
     cpu_num: usize,
     mem: &ProcessMemStats,
 ) -> String {
-    let cpus_allowed = format_cpumask_hex(cpumask, cpu_num);
-    let cpus_allowed_list = format_cpumask_list(cpumask, cpu_num);
+    let cpus_allowed = format_cpumask_hex(&cpumask, cpu_num);
+    let cpus_allowed_list = format_cpumask_list(&cpumask, cpu_num);
 
     render_task_status_fields(&TaskStatusFields {
         base,
@@ -590,6 +851,7 @@ fn render_task_status(
 #[rustfmt::skip]
 fn render_task_status_fields(status: &TaskStatusFields<'_>) -> String {
     let base = &status.base;
+    let groups = SupplementaryGroups(&base.cred.groups);
     // NOTE: `Threads:\t<n>` is REQUIRED by psutil. `Process.num_threads()`
     // does `int(re.compile(br'Threads:\t(\d+)').findall(data)[0])`, which
     // raises an *uncaught* IndexError (not NoSuchProcess/AccessDenied/
@@ -606,6 +868,7 @@ fn render_task_status_fields(status: &TaskStatusFields<'_>) -> String {
         TracerPid:\t{}\n\
         Uid:\t{}\t{}\t{}\t{}\n\
         Gid:\t{}\t{}\t{}\t{}\n\
+        Groups:\t{}\n\
         CapInh:\t{:016x}\n\
         CapPrm:\t{:016x}\n\
         CapEff:\t{:016x}\n\
@@ -621,12 +884,13 @@ fn render_task_status_fields(status: &TaskStatusFields<'_>) -> String {
         nonvoluntary_ctxt_switches:\t0",
         base.name,
         base.state,
-        base.tgid,
-        base.pid,
-        base.ppid,
-        base.tracer_pid,
+        base.tgid.get(),
+        base.pid.get(),
+        base.ppid.map_or(0, TgidNumber::get),
+        base.tracer_pid.map_or(0, TidNumber::get),
         base.cred.uid, base.cred.euid, base.cred.suid, base.cred.fsuid,
         base.cred.gid, base.cred.egid, base.cred.sgid, base.cred.fsgid,
+        groups,
         base.cred.cap_inheritable,
         base.cred.cap_permitted,
         base.cred.cap_effective,
@@ -639,8 +903,24 @@ fn render_task_status_fields(status: &TaskStatusFields<'_>) -> String {
     )
 }
 
-fn format_cpumask_hex(cpumask: AxCpuMask, cpu_num: usize) -> String {
-    format_cpu_presence_hex(&collect_cpu_presence(&cpumask, cpu_num))
+/// A `/proc/<pid>/status` supplementary-group list, written directly into the
+/// status buffer to avoid an additional allocation for large valid group sets.
+struct SupplementaryGroups<'a>(&'a [u32]);
+
+impl core::fmt::Display for SupplementaryGroups<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, group) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(" ")?;
+            }
+            write!(formatter, "{group}")?;
+        }
+        Ok(())
+    }
+}
+
+fn format_cpumask_hex(cpumask: &CpuSet, cpu_num: usize) -> String {
+    format_cpu_presence_hex(&collect_cpu_presence(cpumask, cpu_num))
 }
 
 fn format_cpu_presence_hex(cpu_presence: &[bool]) -> String {
@@ -661,8 +941,8 @@ fn format_cpu_presence_hex(cpu_presence: &[bool]) -> String {
         .join(",")
 }
 
-fn format_cpumask_list(cpumask: AxCpuMask, cpu_num: usize) -> String {
-    format_cpu_presence_list(&collect_cpu_presence(&cpumask, cpu_num))
+fn format_cpumask_list(cpumask: &CpuSet, cpu_num: usize) -> String {
+    format_cpu_presence_list(&collect_cpu_presence(cpumask, cpu_num))
 }
 
 fn format_cpu_presence_list(cpu_presence: &[bool]) -> String {
@@ -692,16 +972,11 @@ fn format_cpu_presence_list(cpu_presence: &[bool]) -> String {
     ranges.join(",")
 }
 
-fn collect_cpu_presence<I>(cpus: I, cpu_num: usize) -> Vec<bool>
-where
-    I: IntoIterator<Item = usize>,
-{
+fn collect_cpu_presence(cpus: &CpuSet, cpu_num: usize) -> Vec<bool> {
     let mut cpu_presence = vec![false; cpu_num];
 
-    for cpu in cpus {
-        if cpu < cpu_num {
-            cpu_presence[cpu] = true;
-        }
+    for (cpu, allowed) in cpu_presence.iter_mut().enumerate() {
+        *allowed = cpus.contains(CpuId::new(cpu as u32));
     }
 
     cpu_presence
@@ -710,16 +985,18 @@ where
 /// The /proc/[pid]/fd directory
 struct ThreadFdDir {
     fs: Arc<SimpleFs>,
-    task: WeakAxTaskRef,
+    task: WeakUserTaskRef,
 }
 
 impl SimpleDirOps for ThreadFdDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        let Some(task) = self.task.upgrade() else {
-            return Box::new(iter::empty());
+        let task = match upgrade_proc_task(&self.task) {
+            Ok(Some(task)) => task,
+            Ok(None) => return Box::new(iter::empty()),
+            Err(error) => panic!("procfs fd directory has an invalid user extension: {error}"),
         };
-        let ids = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
+        let ids = fd_table
             .read()
             .ids()
             .map(|id| Cow::Owned(id.to_string()))
@@ -729,10 +1006,10 @@ impl SimpleDirOps for ThreadFdDir {
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
-        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let task = require_proc_task(&self.task)?;
         let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let path = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
+        let path = fd_table
             .read()
             .get(fd as _)
             .ok_or(VfsError::NotFound)?
@@ -747,6 +1024,75 @@ impl SimpleDirOps for ThreadFdDir {
     }
 }
 
+/// The /proc/[pid]/fdinfo directory.
+struct ThreadFdInfoDir {
+    fs: Arc<SimpleFs>,
+    task: WeakUserTaskRef,
+}
+
+impl SimpleDirOps for ThreadFdInfoDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        let task = match upgrade_proc_task(&self.task) {
+            Ok(Some(task)) => task,
+            Ok(None) => return Box::new(iter::empty()),
+            Err(error) => panic!("procfs fdinfo directory has an invalid user extension: {error}"),
+        };
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
+        let ids = fd_table
+            .read()
+            .ids()
+            .map(|id| Cow::Owned(id.to_string()))
+            .collect::<Vec<_>>();
+        Box::new(ids.into_iter())
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let fs = self.fs.clone();
+        let task = require_proc_task(&self.task)?;
+        let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+        let fd_table = task.as_thread().clone_scope_item(&FD_TABLE);
+        let pidfd = fd_table
+            .read()
+            .get(fd as _)
+            .ok_or(VfsError::NotFound)?
+            .inner
+            .downcast_ref::<PidFd>()
+            .map(PidFd::identity);
+
+        // Linux exposes these fields for pidfds. systemd uses `Pid:` to recover
+        // the child PID after pidfd_spawn(), with `NSpid:` as a namespace-aware
+        // fallback. Other descriptor kinds still have an fdinfo entry, even
+        // though StarryOS does not yet expose their type-specific fields.
+        let Some(identity) = pidfd else {
+            return Ok(SimpleFile::new_regular(fs, || Ok(Vec::new())).into());
+        };
+
+        Ok(SimpleFile::new_regular(fs, move || {
+            let pids: Vec<i32> = if identity.is_exited() {
+                vec![-1]
+            } else {
+                let observer_pid_ns = task.as_thread().active_pid_namespace();
+                PidView::new(observer_pid_ns)
+                    .nspid_chain(&identity)
+                    .map(|pids| pids.into_iter().map(|pid| pid.get() as i32).collect())
+                    .unwrap_or_else(|| vec![0])
+            };
+            let pid = pids[0];
+            let nspid = pids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(format!("Pid:\t{pid}\nNSpid:\t{nspid}\n").into_bytes())
+        })
+        .into())
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
 /// The /proc/[pid]/ns directory — namespace entries.
 ///
 /// Each entry is a regular file displaying the namespace identifier.
@@ -754,13 +1100,13 @@ impl SimpleDirOps for ThreadFdDir {
 /// [`NsFd`](crate::file::NsFd) instead of a regular file descriptor.
 struct NsDir {
     fs: Arc<SimpleFs>,
-    task: WeakAxTaskRef,
+    task: WeakUserTaskRef,
 }
 
 impl SimpleDirOps for NsDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
-            ["uts", "ipc", "mnt", "pid", "net", "user"]
+            ["uts", "ipc", "mnt", "pid", "net", "user", "cgroup"]
                 .into_iter()
                 .map(Cow::Borrowed),
         )
@@ -768,42 +1114,46 @@ impl SimpleDirOps for NsDir {
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
-        let task_ref = self.task.clone();
-        let Some(task) = task_ref.upgrade() else {
+        let task_ref = self.task;
+        let Some(task) = upgrade_proc_task(&task_ref)? else {
             return Err(VfsError::NotFound);
         };
         let proc_data = &task.as_thread().proc_data;
 
         let content: String = match name {
             "uts" => {
-                let nsproxy = proc_data.nsproxy.lock();
+                let nsproxy = proc_data.namespace_snapshot();
                 let ns_id = nsproxy.uts_ns.lock().id;
                 format!("uts:[{}]\n", ns_id)
             }
             "ipc" => {
-                let nsproxy = proc_data.nsproxy.lock();
+                let nsproxy = proc_data.namespace_snapshot();
                 let ns_id = nsproxy.ipc_ns.lock().ns_id;
                 format!("ipc:[{}]\n", ns_id)
             }
             "mnt" => {
-                let nsproxy = proc_data.nsproxy.lock();
+                let nsproxy = proc_data.namespace_snapshot();
                 let ns_id = nsproxy.mnt_ns.lock().id();
                 format!("mnt:[{}]\n", ns_id)
             }
             "pid" => {
-                let nsproxy = proc_data.nsproxy.lock();
-                let ns_id = nsproxy.pid_ns.lock().id;
+                let ns_id = proc_data.identity().active_namespace().id().get();
                 format!("pid:[{}]\n", ns_id)
             }
             "net" => {
-                let nsproxy = proc_data.nsproxy.lock();
+                let nsproxy = proc_data.namespace_snapshot();
                 let ns_id = nsproxy.net_ns.lock().ns_id;
                 format!("net:[{}]\n", ns_id)
             }
             "user" => {
-                let nsproxy = proc_data.nsproxy.lock();
+                let nsproxy = proc_data.namespace_snapshot();
                 let ns_id = nsproxy.user_ns.lock().id;
                 format!("user:[{}]\n", ns_id)
+            }
+            "cgroup" => {
+                let nsproxy = proc_data.namespace_snapshot();
+                let ns_id = nsproxy.cgroup_ns.lock().id();
+                format!("cgroup:[{}]\n", ns_id)
             }
             _ => return Err(VfsError::NotFound),
         };
@@ -820,37 +1170,36 @@ impl SimpleDirOps for NsDir {
 /// The /proc/[pid] directory
 struct ThreadDir {
     fs: Arc<SimpleFs>,
-    task: WeakAxTaskRef,
+    task: WeakUserTaskRef,
     /// Authoritative process state for memory counters (`path_pid` lookup).
     proc_data: Arc<ProcessData>,
     /// Numeric `/proc/<pid>` component used for live [`ProcessData`] lookup.
-    path_pid: Pid,
-    procfs_pid: Option<Pid>,
+    path_pid: u32,
+    procfs_pid: Option<u32>,
+    view: PidView,
 }
 
-fn render_thread_maps(task: &WeakAxTaskRef) -> VfsResult<String> {
+fn render_thread_maps(task: &WeakUserTaskRef) -> VfsResult<String> {
     let mut output = String::new();
 
-    let task = match task.upgrade() {
-        Some(t) => t,
-        None => return Ok(output),
+    let task = match upgrade_proc_task(task) {
+        Ok(Some(task)) => task,
+        Ok(None) => return Ok(output),
+        Err(error) => return Err(error),
     };
 
-    let aspace_arc = task.as_thread().proc_data.aspace();
-    let mm = aspace_arc.lock();
+    let aspace = task
+        .as_thread()
+        .proc_data
+        .pin_aspace()
+        .map_err(VfsError::from)?;
+    let mm = aspace.lock();
 
-    for area in mm.areas() {
+    for area in mm.vma_inspection_records().map_err(VfsError::from)? {
         let start = area.start();
         let end = area.end();
-        let backend = area.backend();
-        let bi = backend.file_info().unwrap_or_else(|_| BackendFileInfo {
-            path: String::new(),
-            offset: None,
-            inode: None,
-            dev: None,
-            shared: false,
-        });
-        let BackendFileInfo {
+        let bi = area.file_info().clone();
+        let MappingFileInfo {
             path,
             offset: file_offset,
             inode,
@@ -922,43 +1271,67 @@ fn render_thread_maps(task: &WeakAxTaskRef) -> VfsResult<String> {
 /// `dirty` are 0 (Linux also reports 0 for `lib`/`dirty` since 2.6); `text` and
 /// `data` are derived from the areas' executable / writable flags.
 fn render_thread_statm(
-    task: &WeakAxTaskRef,
+    task: &WeakUserTaskRef,
     proc_data: &Arc<ProcessData>,
-    _path_pid: Pid,
+    _path_pid: u32,
 ) -> VfsResult<String> {
-    let _task = match task.upgrade() {
-        Some(t) => t,
-        None => return Ok("0 0 0 0 0 0 0\n".into()),
+    let _task = match upgrade_proc_task(task) {
+        Ok(Some(task)) => task,
+        Ok(None) => return Ok("0 0 0 0 0 0 0\n".into()),
+        Err(error) => return Err(error),
     };
-    let aspace_arc = proc_data.aspace();
-    let mm = aspace_arc.lock();
-    Ok(ProcessMemStats::collect(&mm).format_statm())
+    let aspace = proc_data.pin_aspace().map_err(VfsError::from)?;
+    let mm = aspace.lock();
+    Ok(ProcessMemStats::collect(&mm)
+        .map_err(VfsError::from)?
+        .format_statm())
 }
 
 fn render_thread_stat(
-    task: &WeakAxTaskRef,
+    task: &WeakUserTaskRef,
     proc_data: &Arc<ProcessData>,
-    _path_pid: Pid,
-    procfs_pid: Option<Pid>,
+    _path_pid: u32,
+    _procfs_pid: Option<u32>,
+    view: &PidView,
 ) -> VfsResult<Vec<u8>> {
-    let task = task.upgrade().ok_or(VfsError::NotFound)?;
+    let task = require_proc_task(task)?;
     let mut stat = TaskStat::from_thread(&task)?;
-    let aspace_arc = proc_data.aspace();
-    let mem = ProcessMemStats::collect(&aspace_arc.lock());
+    let aspace = proc_data.pin_aspace().map_err(VfsError::from)?;
+    let mm = aspace.lock();
+    let mem = ProcessMemStats::collect(&mm).map_err(VfsError::from)?;
     stat.vsize = mem.vsize_bytes();
     stat.rss = mem.rss_pages();
     stat.start_code = mem.start_code;
     stat.end_code = mem.end_code;
     stat.start_stack = mem.start_stack;
-    stat.start_brk = proc_data.get_heap_top() as u64;
-    if let Some(pid) = procfs_pid {
-        stat.pid = pid;
-    }
+    let (start_data, end_data) = mm.executable_data_bounds();
+    stat.start_data = start_data as u64;
+    stat.end_data = end_data as u64;
+    stat.start_brk = mm.heap_start() as u64;
+    let thread = task.as_thread();
+    stat.pid = view
+        .visible_number(&thread.pid_identity())
+        .ok_or(VfsError::NotFound)?
+        .get();
+    stat.ppid = proc_data
+        .proc
+        .parent()
+        .and_then(|parent| view.visible_number(&parent.identity()))
+        .map_or(0, PidNumber::get);
+    let group = proc_data.proc.group();
+    stat.pgrp = view
+        .visible_number(&group.identity())
+        .ok_or(VfsError::NotFound)?
+        .get();
+    stat.session = view
+        .visible_number(&group.session().identity())
+        .ok_or(VfsError::NotFound)?
+        .get();
     Ok(format!("{stat}").into_bytes())
 }
 
-fn render_thread_auxv(task: &AxTaskRef) -> Vec<u8> {
-    let mut entries = task.as_thread().proc_data.auxv.read().clone();
+fn render_thread_auxv(task: &UserTaskRef) -> Vec<u8> {
+    let mut entries = task.as_thread().proc_data.auxv().to_vec();
     entries.push(AuxEntry::new(AuxType::NULL, 0));
     let mut bytes = Vec::with_capacity(entries.len() * size_of::<AuxEntry>());
     for entry in entries {
@@ -973,7 +1346,7 @@ struct ProcMemFile {
 
 impl ProcMemFile {
     fn check_access(&self) -> VfsResult<()> {
-        let current_task = current();
+        let current_task = current_user_task();
         let current_proc = &current_task.as_thread().proc_data;
         if current_proc.proc.pid() == self.proc_data.proc.pid() {
             return Ok(());
@@ -982,8 +1355,8 @@ impl ProcMemFile {
         let is_tracer = (self.proc_data.is_ptrace_traceme() || self.proc_data.is_ptrace_attached())
             && self
                 .proc_data
-                .ptrace_tracer_pid()
-                .is_some_and(|pid| pid == current_proc.proc.pid())
+                .ptrace_tracer_identity()
+                .is_some_and(|tracer| Arc::ptr_eq(&tracer, &current_proc.identity()))
             && self.proc_data.ptrace_stop_signo().is_some();
         if is_tracer {
             Ok(())
@@ -1000,9 +1373,9 @@ impl ProcMemFile {
         let end = VirtAddr::from_usize(addr.checked_add(len).ok_or(VfsError::BadAddress)?);
         let page_start = start.align_down_4k();
         let page_end = end.align_up_4k();
-        let aspace = self.proc_data.aspace();
+        let aspace = self.proc_data.pin_aspace().map_err(VfsError::from)?;
         let mut aspace = aspace.lock();
-        aspace.populate_area(page_start, page_end - page_start, flags)
+        Ok(aspace.populate_area(page_start, page_end - page_start, flags)?)
     }
 }
 
@@ -1014,7 +1387,7 @@ impl DirectRwFsFileOps for ProcMemFile {
         }
         let addr = usize::try_from(offset).map_err(|_| VfsError::BadAddress)?;
         self.populate_remote_range(addr, buf.len(), MappingFlags::READ)?;
-        let aspace = self.proc_data.aspace();
+        let aspace = self.proc_data.pin_aspace().map_err(VfsError::from)?;
         let aspace = aspace.lock();
         aspace.read(VirtAddr::from_usize(addr), buf)?;
         Ok(buf.len())
@@ -1027,10 +1400,11 @@ impl DirectRwFsFileOps for ProcMemFile {
         }
         let addr = usize::try_from(offset).map_err(|_| VfsError::BadAddress)?;
         self.populate_remote_range(addr, buf.len(), MappingFlags::WRITE)?;
-        let aspace = self.proc_data.aspace();
+        let aspace = self.proc_data.pin_aspace().map_err(VfsError::from)?;
         let aspace = aspace.lock();
         aspace.write(VirtAddr::from_usize(addr), buf)?;
-        ax_runtime::hal::cache::flush_icache_all();
+        drop(aspace);
+        ax_cpu::cache::flush_icache_all();
         Ok(buf.len())
     }
 }
@@ -1052,7 +1426,11 @@ impl SimpleDirOps for ThreadDir {
                 "cmdline",
                 "comm",
                 "exe",
+                "environ",
+                "root",
+                "cwd",
                 "fd",
+                "fdinfo",
                 "uid_map",
                 "gid_map",
                 "setgroups",
@@ -1066,20 +1444,21 @@ impl SimpleDirOps for ThreadDir {
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
-        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let task = require_proc_task(&self.task)?;
         Ok(match name {
             "stat" => {
-                let task = self.task.clone();
+                let task = self.task;
                 let proc_data = self.proc_data.clone();
                 let path_pid = self.path_pid;
                 let procfs_pid = self.procfs_pid;
+                let view = self.view.clone();
                 SimpleFile::new_regular(fs, move || {
-                    render_thread_stat(&task, &proc_data, path_pid, procfs_pid)
+                    render_thread_stat(&task, &proc_data, path_pid, procfs_pid, &view)
                 })
                 .into()
             }
             "statm" => {
-                let task = self.task.clone();
+                let task = self.task;
                 let proc_data = self.proc_data.clone();
                 let path_pid = self.path_pid;
                 SimpleFile::new_regular(fs, move || {
@@ -1088,12 +1467,13 @@ impl SimpleDirOps for ThreadDir {
                 .into()
             }
             "status" => {
-                let task = self.task.clone();
+                let task = self.task;
                 let proc_data = self.proc_data.clone();
                 let path_pid = self.path_pid;
                 let procfs_pid = self.procfs_pid;
+                let view = self.view.clone();
                 SimpleFile::new_regular(fs, move || {
-                    render_thread_status(&task, &proc_data, path_pid, procfs_pid)
+                    render_thread_status(&task, &proc_data, path_pid, procfs_pid, &view)
                 })
                 .into()
             }
@@ -1107,7 +1487,8 @@ impl SimpleDirOps for ThreadDir {
                         if !data.is_empty() {
                             let value = str::from_utf8(data)
                                 .ok()
-                                .and_then(|it| it.parse::<i32>().ok())
+                                .and_then(|it| it.trim_ascii_end().parse::<i32>().ok())
+                                .filter(|value| (-1000..=1000).contains(value))
                                 .ok_or(VfsError::InvalidInput)?;
                             task.as_thread().set_oom_score_adj(value);
                         }
@@ -1121,11 +1502,12 @@ impl SimpleDirOps for ThreadDir {
                 Arc::new(ProcessTaskDir {
                     fs,
                     process: Arc::downgrade(&task.as_thread().proc_data.proc),
+                    view: self.view.clone(),
                 }),
             )
             .into(),
             "maps" => {
-                let task = self.task.clone();
+                let task = self.task;
                 let seq = SeqObject::new(move || render_thread_maps(&task));
                 SpecialFsFile::new_regular_with_perm(
                     fs.clone(),
@@ -1143,10 +1525,34 @@ impl SimpleDirOps for ThreadDir {
             )
             .into(),
             "auxv" => SimpleFile::new_regular(fs, move || Ok(render_thread_auxv(&task))).into(),
-            "mounts" => SimpleFile::new_regular(fs, move || Ok(render_mounts())).into(),
-            "mountinfo" => SimpleFile::new_regular(fs, move || Ok(render_mountinfo())).into(),
+            "mounts" => {
+                let task = self.task;
+                SimpleFile::new_regular(fs, move || {
+                    let task = require_proc_task(&task)?;
+                    let ctx_arc = task
+                        .as_thread()
+                        .clone_scope_item(&FS_CONTEXT)
+                        .ok_or(VfsError::NotFound)?;
+                    let ctx = ctx_arc.lock();
+                    Ok(crate::pseudofs::proc_mountinfo::render_mounts(&ctx))
+                })
+                .into()
+            }
+            "mountinfo" => {
+                let task = self.task;
+                SimpleFile::new_regular(fs, move || {
+                    let task = require_proc_task(&task)?;
+                    let ctx_arc = task
+                        .as_thread()
+                        .clone_scope_item(&FS_CONTEXT)
+                        .ok_or(VfsError::NotFound)?;
+                    let ctx = ctx_arc.lock();
+                    Ok(crate::pseudofs::proc_mountinfo::render_mountinfo(&ctx))
+                })
+                .into()
+            }
             "cmdline" => SimpleFile::new_regular(fs, move || {
-                let cmdline = task.as_thread().proc_data.cmdline.read();
+                let cmdline = task.as_thread().proc_data.cmdline();
                 let mut buf = Vec::new();
                 for arg in cmdline.iter() {
                     buf.extend_from_slice(arg.as_bytes());
@@ -1159,11 +1565,17 @@ impl SimpleDirOps for ThreadDir {
                 fs,
                 RwFile::new(move |req| match req {
                     SimpleFileOperation::Read => {
-                        let mut bytes = vec![0; 16];
+                        // `/proc/<pid>/comm` must return only the name plus one
+                        // trailing newline, with no NUL padding: musl's
+                        // pthread_getname_np() reads the file into a 16-byte buffer
+                        // and strips just the final byte, so any padding would leave
+                        // the newline inside the read-back name and break Envoy's
+                        // thread setName() round-trip assertion.
                         let name = task.name();
                         let copy_len = name.len().min(15);
-                        bytes[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
-                        bytes[copy_len] = b'\n';
+                        let mut bytes = Vec::with_capacity(copy_len + 1);
+                        bytes.extend_from_slice(&name.as_bytes()[..copy_len]);
+                        bytes.push(b'\n');
                         Ok(Some(bytes))
                     }
                     SimpleFileOperation::Write(data) => {
@@ -1184,14 +1596,40 @@ impl SimpleDirOps for ThreadDir {
             )
             .into(),
             "exe" => SimpleFile::new(fs, NodeType::Symlink, move || {
-                Ok(task.as_thread().proc_data.exe_path.read().clone())
+                Ok(task.as_thread().proc_data.exe_path().to_string())
+            })
+            .into(),
+            "environ" => SimpleFile::new_regular(fs, move || {
+                let envp = task.as_thread().proc_data.envp();
+                let mut buf = Vec::new();
+                for env in envp.iter() {
+                    buf.extend_from_slice(env.as_bytes());
+                    buf.push(0);
+                }
+                Ok(buf)
+            })
+            .into(),
+            "root" => SimpleFile::new(fs, NodeType::Symlink, move || {
+                Ok(task.as_thread().proc_data.root_path().to_string())
+            })
+            .into(),
+            "cwd" => SimpleFile::new(fs, NodeType::Symlink, move || {
+                Ok(task.as_thread().proc_data.cwd_path().to_string())
             })
             .into(),
             "fd" => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(ThreadFdDir {
                     fs,
-                    task: Arc::downgrade(&task),
+                    task: task.downgrade(),
+                }),
+            )
+            .into(),
+            "fdinfo" => SimpleDir::new_maker(
+                fs.clone(),
+                Arc::new(ThreadFdInfoDir {
+                    fs,
+                    task: task.downgrade(),
                 }),
             )
             .into(),
@@ -1226,8 +1664,12 @@ impl SimpleDirOps for ThreadDir {
                             let _mapped: u32 =
                                 parts[0].parse().map_err(|_| VfsError::InvalidInput)?;
                             let orig: u32 = parts[1].parse().map_err(|_| VfsError::InvalidInput)?;
-                            let _count: u32 =
+                            let count: u32 =
                                 parts[2].parse().map_err(|_| VfsError::InvalidInput)?;
+                            if !may_map_id(orig, count, |cred| cred.euid, Cred::has_cap_setuid)
+                            {
+                                return Err(VfsError::OperationNotPermitted);
+                            }
                             let thr = task.as_thread();
                             let mut cred = (*thr.cred()).clone();
                             cred.uid = orig;
@@ -1251,7 +1693,8 @@ impl SimpleDirOps for ThreadDir {
                             // getuid/geteuid/getresuid return the mapped
                             // value instead of 65534 (nobody).
                             let proc_data = &thr.proc_data;
-                            let nsproxy = proc_data.nsproxy.lock();
+                            let update = proc_data.namespace_update();
+                            let nsproxy = update.snapshot();
                             nsproxy.user_ns.lock().uid_mapped = true;
                         }
                         Ok(None)
@@ -1285,8 +1728,12 @@ impl SimpleDirOps for ThreadDir {
                             let _mapped: u32 =
                                 parts[0].parse().map_err(|_| VfsError::InvalidInput)?;
                             let orig: u32 = parts[1].parse().map_err(|_| VfsError::InvalidInput)?;
-                            let _count: u32 =
+                            let count: u32 =
                                 parts[2].parse().map_err(|_| VfsError::InvalidInput)?;
+                            if !may_map_id(orig, count, |cred| cred.egid, Cred::has_cap_setgid)
+                            {
+                                return Err(VfsError::OperationNotPermitted);
+                            }
                             let thr = task.as_thread();
                             let mut cred = (*thr.cred()).clone();
                             cred.gid = orig;
@@ -1297,7 +1744,8 @@ impl SimpleDirOps for ThreadDir {
                             Thread::set_cred(thr, cred);
                             thr.set_gid_map_written(true);
                             let proc_data = &thr.proc_data;
-                            let nsproxy = proc_data.nsproxy.lock();
+                            let update = proc_data.namespace_update();
+                            let nsproxy = update.snapshot();
                             nsproxy.user_ns.lock().gid_mapped = true;
                         }
                         Ok(None)
@@ -1331,12 +1779,25 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "cgroup" => SimpleFile::new_regular(fs, move || Ok("0::/\n")).into(),
+            "cgroup" => SimpleFile::new_regular(fs, move || {
+                let reader = current_user_task();
+                let reader_cgroup_ns = reader
+                    .as_thread()
+                    .proc_data
+                    .namespace_snapshot()
+                    .cgroup_ns
+                    .clone();
+                let reader_root = reader_cgroup_ns.lock().root();
+                let target_membership = task.as_thread().proc_data.cgroup_node();
+                let path = crate::cgroup::relative_path(&reader_root, &target_membership);
+                Ok(format!("0::{path}\n"))
+            })
+            .into(),
             "ns" => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(NsDir {
                     fs,
-                    task: self.task.clone(),
+                    task: self.task,
                 }),
             )
             .into(),
@@ -1350,50 +1811,51 @@ impl SimpleDirOps for ThreadDir {
 }
 
 /// Handles /proc/[pid] & /proc/self
-struct ProcFsHandler(Arc<SimpleFs>);
+struct ProcFsHandler {
+    fs: Arc<SimpleFs>,
+    view: PidView,
+}
 
 impl SimpleDirOps for ProcFsHandler {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
             processes()
                 .into_iter()
-                .map(|proc_data| procfs_visible_pid(&proc_data.proc).to_string().into())
+                .filter_map(|proc_data| {
+                    procfs_visible_pid(&self.view, &proc_data.proc)
+                        .map(|pid| pid.to_string().into())
+                })
                 .chain([Cow::Borrowed("self")]),
         )
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let (task, path_pid, procfs_pid, proc_data) = if name == "self" {
-            let task = current().clone();
-            let path_pid = task.as_thread().proc_data.proc.pid();
-            let proc_data = procfs_lookup_process(path_pid).map_err(|_| VfsError::NotFound)?;
+            let task = current_user_task();
+            let proc_data = task.as_thread().proc_data.clone();
+            let path_pid =
+                procfs_visible_pid(&self.view, &proc_data.proc).ok_or(VfsError::NotFound)?;
             (task, path_pid, None, proc_data)
         } else {
             let pid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-            let proc_data = procfs_lookup_process(pid).map_err(|_| VfsError::NotFound)?;
-            let task = if let Ok(task) = get_task(pid) {
-                task
-            } else {
-                let tid = proc_data
-                    .proc
-                    .threads()
-                    .into_iter()
-                    .next()
-                    .ok_or(VfsError::NotFound)?;
-                get_task(tid).map_err(|_| VfsError::NotFound)?
-            };
-            let procfs_pid =
-                (procfs_visible_pid(&proc_data.proc) != proc_data.proc.pid()).then_some(pid);
+            let identity = self
+                .view
+                .resolve_process(TgidNumber::try_from(pid).map_err(|_| VfsError::NotFound)?)
+                .map_err(|_| VfsError::NotFound)?;
+            let proc_data = identity.live_data().ok_or(VfsError::NotFound)?;
+            let task = identity.live_task().ok_or(VfsError::NotFound)?;
+            let procfs_pid = Some(pid);
             (task, pid, procfs_pid, proc_data)
         };
         let node = NodeOpsMux::Dir(SimpleDir::new_maker(
-            self.0.clone(),
+            self.fs.clone(),
             Arc::new(ThreadDir {
-                fs: self.0.clone(),
-                task: Arc::downgrade(&task),
+                fs: self.fs.clone(),
+                task: task.downgrade(),
                 proc_data,
                 path_pid,
                 procfs_pid,
+                view: self.view.clone(),
             }),
         ));
         Ok(node)
@@ -1404,11 +1866,90 @@ impl SimpleDirOps for ProcFsHandler {
     }
 }
 
-fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+/// Build a writable `/proc/sys/fs/mqueue/*` tunable file over a live atomic.
+/// Reads render the current value; writes parse a decimal integer, clamp it to
+/// `[min, max]` (as `proc_dointvec_minmax` in ipc/mq_sysctl.c does — an
+/// out-of-range value is rejected with `EINVAL`) and store it, so the next
+/// `mq_open` sees the change.
+///
+/// These files are owned by the ipc-namespace root (uid 0) and mode `0644`, and
+/// Linux gates writes through `mq_permissions` (ipc/mq_sysctl.c:92): only the
+/// owning root gets the write bit, everyone else sees the file read-only. Raising
+/// `msg_max`/`msgsize_max` toward the hard ceiling is a system-wide resource
+/// change, so the faithful capability is `CAP_SYS_RESOURCE`. Reads stay open to
+/// all; an unprivileged write is rejected with `EPERM`.
+fn mq_sysctl_file(
+    fs: &Arc<SimpleFs>,
+    cell: &'static core::sync::atomic::AtomicUsize,
+    min: usize,
+    max: usize,
+) -> Arc<SimpleFile> {
+    SimpleFile::new_regular(
+        fs.clone(),
+        RwFile::new(move |req| match req {
+            SimpleFileOperation::Read => Ok(Some(
+                format!("{}\n", cell.load(Ordering::Relaxed)).into_bytes(),
+            )),
+            SimpleFileOperation::Write(data) => {
+                // A truncating open (`fopen(path, "w")`) writes an empty buffer
+                // first; treat it as a no-op rather than a parse error, the way
+                // the other writable procfs files here do. Gate the no-op too so
+                // a truncating open by an unprivileged writer still fails cleanly.
+                if !current_user_task()
+                    .as_thread()
+                    .cred()
+                    .has_cap_sys_resource()
+                {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                let value: usize = trimmed.parse().map_err(|_| VfsError::InvalidInput)?;
+                if value < min || value > max {
+                    return Err(VfsError::InvalidInput);
+                }
+                cell.store(value, Ordering::Relaxed);
+                Ok(None)
+            }
+        }),
+    )
+}
+
+/// Builds an integer sysctl whose owning resource limit is not implemented.
+///
+/// Do not acknowledge writes until PID allocation and VMA admission consume
+/// these settings. Returning `EOPNOTSUPP` keeps procfs from reporting a limit
+/// that the kernel does not enforce.
+fn unsupported_limit_sysctl_file(fs: &Arc<SimpleFs>, value: &'static str) -> Arc<SimpleFile> {
+    SimpleFile::new_regular(
+        fs.clone(),
+        RwFile::new(move |operation| match operation {
+            SimpleFileOperation::Read => Ok(Some(value)),
+            SimpleFileOperation::Write(_) => Err(VfsError::OperationNotSupported),
+        }),
+    )
+}
+
+fn builder(fs: Arc<SimpleFs>, view: PidView) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
         "mounts",
-        SimpleFile::new_regular(fs.clone(), || Ok(render_mounts())),
+        SimpleFile::new_regular(fs.clone(), || {
+            let fs_context = current_fs_context();
+            let ctx = fs_context.lock();
+            Ok(crate::pseudofs::proc_mountinfo::render_mounts(&ctx))
+        }),
+    );
+    root.add(
+        "mountinfo",
+        SimpleFile::new_regular(fs.clone(), || {
+            let fs_context = current_fs_context();
+            let ctx = fs_context.lock();
+            Ok(crate::pseudofs::proc_mountinfo::render_mountinfo(&ctx))
+        }),
     );
     // /proc/filesystems — list of registered filesystem types. Tools like
     // `mount`/`findmnt` and some container runtimes read it to decide what they
@@ -1419,10 +1960,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Ok("nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text4\n")
         }),
     );
-    root.add(
-        "stat",
-        SimpleFile::new_regular(fs.clone(), || Ok(render_stat())),
-    );
+    root.add("stat", SimpleFile::new_regular(fs.clone(), render_stat));
     root.add(
         "diskstats",
         SimpleFile::new_regular(fs.clone(), || Ok(render_diskstats())),
@@ -1456,7 +1994,12 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             let all_tasks = tasks();
             let running = all_tasks
                 .iter()
-                .filter(|t| matches!(t.state(), TaskState::Running | TaskState::Ready))
+                .filter(|task| {
+                    matches!(
+                        task.state(),
+                        ThreadState::New | ThreadState::Running | ThreadState::Waking
+                    )
+                })
                 .count();
             let total = all_tasks.len();
             Ok(format!("0.00 0.00 0.00 {running}/{total} 1\n"))
@@ -1482,26 +2025,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             }
         }),
     );
-    // Timer-tick callbacks registered once on the boot CPU.
-    // IRQ counting: increment the module-level IRQ_CNT on every tick.
-    ax_task::register_timer_callback(|_| {
-        IRQ_CNT.fetch_add(1, Ordering::Relaxed);
-    });
-    // CPU-time accounting: accumulate utime/stime for the running task on
-    // each tick, so preempted tasks don't have to wait until the next syscall
-    // to record their CPU usage.
-    // Note: this callback runs only on the boot CPU (TIMER_CALLBACKS is
-    // per-CPU).  On SMP, tasks on other CPUs still get their time recorded
-    // at syscall boundaries via set_timer_state(); the tick path is an
-    // additional precision improvement for CPU 0.
-    ax_task::register_timer_callback(|_| {
-        tick_cpu_time(&ax_task::current());
-    });
-
     root.add(
         "interrupts",
         SimpleFile::new_regular(fs.clone(), || {
-            Ok(format!("0: {}", IRQ_CNT.load(Ordering::Relaxed)))
+            Ok(format!("0: {}", ax_runtime::diagnostics::timer_irq_count()))
         }),
     );
 
@@ -1511,10 +2038,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         sys.add("kernel", {
             let mut kernel = DirMapping::new();
 
-            kernel.add(
-                "pid_max",
-                SimpleFile::new_regular(fs.clone(), || Ok("32768\n")),
-            );
+            kernel.add("pid_max", unsupported_limit_sysctl_file(&fs, "32768\n"));
             kernel.add(
                 "osrelease",
                 SimpleFile::new_regular(fs.clone(), || Ok("6.6.0-starry\n")),
@@ -1523,6 +2047,65 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 "ostype",
                 SimpleFile::new_regular(fs.clone(), || Ok("Linux\n")),
             );
+            kernel.add(
+                "hostname",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            let nodename = {
+                                let task = current_user_task();
+                                let nsproxy = task.as_thread().proc_data.namespace_snapshot();
+                                let uts_namespace = nsproxy.uts_ns.lock();
+                                uts_namespace.nodename
+                            };
+                            let name_len = nodename
+                                .iter()
+                                .position(|&byte| byte == 0)
+                                .unwrap_or(nodename.len());
+                            let mut output = Vec::with_capacity(name_len + 1);
+                            output.extend(
+                                nodename[..name_len]
+                                    .iter()
+                                    .map(|byte| byte.to_ne_bytes()[0]),
+                            );
+                            output.push(b'\n');
+                            Ok(Some(output))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if data.is_empty() {
+                                return Ok(None);
+                            }
+                            let hostname = data.strip_suffix(b"\n").unwrap_or(data);
+                            if hostname.len() > 64
+                                || hostname.iter().any(|byte| matches!(byte, 0 | b'\n'))
+                            {
+                                return Err(VfsError::InvalidInput);
+                            }
+
+                            if current_user_task().as_thread().cred().euid != 0 {
+                                return Err(VfsError::OperationNotPermitted);
+                            }
+
+                            let mut nodename = [0; 65];
+                            for (slot, byte) in nodename.iter_mut().zip(hostname) {
+                                *slot = *byte as _;
+                            }
+                            let task = current_user_task();
+                            let update = task.as_thread().proc_data.namespace_update();
+                            update.snapshot().uts_ns.lock().nodename = nodename;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add("random", {
+                let mut random = DirMapping::new();
+                if let Some(boot_id) = boot_id_proc_file(fs.clone()) {
+                    random.add("boot_id", boot_id);
+                }
+                SimpleDir::new_maker(fs.clone(), Arc::new(random))
+            });
 
             // perf knobs the upstream Linux `perf` tool probes at startup.
             // `perf_event_paranoid` gates how much unprivileged users may
@@ -1557,7 +2140,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             );
             vm.add(
                 "max_map_count",
-                SimpleFile::new_regular(fs.clone(), || Ok("65530\n")),
+                unsupported_limit_sysctl_file(&fs, "65530\n"),
             );
             SimpleDir::new_maker(fs.clone(), Arc::new(vm))
         });
@@ -1573,6 +2156,60 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 "nr_open",
                 SimpleFile::new_regular(fs.clone(), || Ok("1048576\n")),
             );
+            // /proc/sys/fs/mqueue/{queues_max,msg_max,msgsize_max,
+            // msg_default,msgsize_default} — the writable POSIX message-queue
+            // tunables Linux registers in ipc/mq_sysctl.c. Reads return the
+            // live value; writes clamp to the same [min,max] the kernel
+            // enforces and take effect on the next mq_open.
+            fs_sys.add("mqueue", {
+                let mut mqueue = DirMapping::new();
+                mqueue.add(
+                    "queues_max",
+                    mq_sysctl_file(
+                        &fs,
+                        &crate::ipc::mqueue::MQ_QUEUES_MAX,
+                        0,
+                        i32::MAX as usize,
+                    ),
+                );
+                mqueue.add(
+                    "msg_max",
+                    mq_sysctl_file(
+                        &fs,
+                        &crate::ipc::mqueue::MQ_MSG_MAX,
+                        crate::ipc::mqueue::MQ_MIN_MSG_MAX,
+                        crate::ipc::mqueue::MQ_HARD_MSG_MAX,
+                    ),
+                );
+                mqueue.add(
+                    "msgsize_max",
+                    mq_sysctl_file(
+                        &fs,
+                        &crate::ipc::mqueue::MQ_MSGSIZE_MAX,
+                        crate::ipc::mqueue::MQ_MIN_MSGSIZE_MAX,
+                        crate::ipc::mqueue::MQ_HARD_MSGSIZE_MAX,
+                    ),
+                );
+                mqueue.add(
+                    "msg_default",
+                    mq_sysctl_file(
+                        &fs,
+                        &crate::ipc::mqueue::MQ_MSG_DEFAULT,
+                        crate::ipc::mqueue::MQ_MIN_MSG_MAX,
+                        crate::ipc::mqueue::MQ_HARD_MSG_MAX,
+                    ),
+                );
+                mqueue.add(
+                    "msgsize_default",
+                    mq_sysctl_file(
+                        &fs,
+                        &crate::ipc::mqueue::MQ_MSGSIZE_DEFAULT,
+                        crate::ipc::mqueue::MQ_MIN_MSGSIZE_MAX,
+                        crate::ipc::mqueue::MQ_HARD_MSGSIZE_MAX,
+                    ),
+                );
+                SimpleDir::new_maker(fs.clone(), Arc::new(mqueue))
+            });
             SimpleDir::new_maker(fs.clone(), Arc::new(fs_sys))
         });
 
@@ -1590,6 +2227,41 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             SimpleDir::new_maker(fs.clone(), Arc::new(net))
         });
 
+        // /proc/sys/user/max_*_namespaces — nix checks these to decide
+        // whether namespaces are available for sandboxed builds.
+        sys.add("user", {
+            let mut user = DirMapping::new();
+            user.add(
+                "max_user_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_mnt_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_pid_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_net_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_uts_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_ipc_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            user.add(
+                "max_cgroup_namespaces",
+                SimpleFile::new_regular(fs.clone(), || Ok("65536\n")),
+            );
+            SimpleDir::new_maker(fs.clone(), Arc::new(user))
+        });
+
         SimpleDir::new_maker(fs.clone(), Arc::new(sys))
     });
 
@@ -1604,8 +2276,24 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             "dev",
             SimpleFile::new_regular(fs.clone(), || Ok(render_proc_net_dev())),
         );
-
+        net.add(
+            "snmp",
+            SimpleFile::new_regular(fs.clone(), || Ok(render_proc_net_snmp())),
+        );
         SimpleDir::new_maker(fs.clone(), Arc::new(net))
+    });
+
+    root.add("bus", {
+        let mut bus = DirMapping::new();
+        bus.add("usb", {
+            let mut usb = DirMapping::new();
+            usb.add(
+                "devices",
+                SimpleFile::new_regular(fs.clone(), || Ok(render_proc_bus_usb_devices())),
+            );
+            SimpleDir::new_maker(fs.clone(), Arc::new(usb))
+        });
+        SimpleDir::new_maker(fs.clone(), Arc::new(bus))
     });
 
     // /proc/device-tree/{compatible,model} — minimal Open Firmware view from the
@@ -1645,13 +2333,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
     static ALL_SYMS: LazyInit<String> = LazyInit::new();
 
-    let ksym = read_kallsyms();
-    KALLSYMS.init_once(ksym);
+    KALLSYMS.get_or_init(read_kallsyms);
 
     root.add("kallsyms", {
-        if !ALL_SYMS.is_inited() {
-            ALL_SYMS.init_once(KALLSYMS.dump_all_symbols());
-        }
+        ALL_SYMS.get_or_init(|| KALLSYMS.dump_all_symbols());
         let seq_obj = SeqObject::new(|| Ok(ALL_SYMS.as_str()));
         SpecialFsFile::new_regular_with_perm(
             fs.clone(),
@@ -1660,7 +2345,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         )
     });
 
-    let proc_dir = ProcFsHandler(fs.clone());
+    let proc_dir = ProcFsHandler {
+        fs: fs.clone(),
+        view,
+    };
     SimpleDir::new_maker(fs, Arc::new(proc_dir.chain(root)))
 }
 
@@ -1678,14 +2366,14 @@ impl<W: core::fmt::Write> SeqWriter<W> {
 impl<W: core::fmt::Write> SeqWriter<W> {
     fn write_str(&mut self, s: &str) -> VfsResult<()> {
         self.col += s.len();
-        self.inner.write_str(s)?;
+        self.inner.write_str(s).map_err(|_| VfsError::Io)?;
         Ok(())
     }
 
     #[allow(unused)]
     fn write_char(&mut self, c: char) -> VfsResult<()> {
         self.col += c.len_utf8();
-        self.inner.write_char(c)?;
+        self.inner.write_char(c).map_err(|_| VfsError::Io)?;
         Ok(())
     }
 
@@ -1693,7 +2381,7 @@ impl<W: core::fmt::Write> SeqWriter<W> {
         if self.col < target {
             let pad = target - self.col;
             for _ in 0..pad {
-                self.inner.write_char(' ')?;
+                self.inner.write_char(' ').map_err(|_| VfsError::Io)?;
             }
             self.col = target;
         }
@@ -1701,7 +2389,7 @@ impl<W: core::fmt::Write> SeqWriter<W> {
     }
 
     fn newline(&mut self) -> VfsResult<()> {
-        self.inner.write_char('\n')?;
+        self.inner.write_char('\n').map_err(|_| VfsError::Io)?;
         self.col = 0;
         Ok(())
     }
@@ -1712,180 +2400,27 @@ impl<W: core::fmt::Write> core::fmt::Write for SeqWriter<W> {
         self.write_str(s).map_err(|_| core::fmt::Error)
     }
 }
-#[cfg(test)]
-mod tests {
-    use alloc::{format, string::String};
 
-    use super::{
-        TaskStatusBase, TaskStatusFields, collect_cpu_presence, format_cpu_presence_hex,
-        format_cpu_presence_list, render_task_status_fields,
-    };
-    use crate::{mm::ProcessMemStats, task::Cred};
-
-    fn sample_mem_stats() -> ProcessMemStats {
-        ProcessMemStats {
-            vss_pages: 128,
-            resident_pages: 128,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_render_task_status(tgid: u32, pid: u64) -> String {
-        format!(
-            "Tgid:\t{}\nPid:\t{}\nUid:\t0 0 0 0\nGid:\t0 0 0 \
-             0\nCpus_allowed:\t1\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0",
-            tgid, pid
-        )
-    }
-
-    fn render_task_status_from_cpus(tgid: u32, pid: u64, cpus: &[usize], cpu_num: usize) -> String {
-        let cpu_presence = collect_cpu_presence(cpus.iter().copied(), cpu_num);
-        let cpus_allowed = format_cpu_presence_hex(&cpu_presence);
-        let cpus_allowed_list = format_cpu_presence_list(&cpu_presence);
-
-        render_task_status_fields(&TaskStatusFields {
-            base: TaskStatusBase {
-                name: "proc-status-test",
-                state: "R (running)",
-                tgid,
-                pid,
-                ppid: 0,
-                tracer_pid: 0,
-                cred: &Cred::root(),
-                num_threads: 1,
-            },
-            cpus_allowed: &cpus_allowed,
-            cpus_allowed_list: &cpus_allowed_list,
-            mem: &sample_mem_stats(),
+#[cfg(all(test, axtest))]
+fn proc_mountinfo_lines_match_linux_layout() -> bool {
+    let ctx_arc = current_fs_context();
+    let ctx = ctx_arc.lock();
+    let text = crate::pseudofs::proc_mountinfo::render_mountinfo(&ctx);
+    !text.is_empty()
+        && text.lines().any(|line| line.contains(" / / "))
+        && text.lines().all(|line| {
+            let Some((pre_separator, post_separator)) = line.split_once(" - ") else {
+                return false;
+            };
+            pre_separator.split_whitespace().count() >= 6
+                && post_separator.split_whitespace().count() >= 3
         })
-    }
+}
 
-    #[test]
-    fn old_hardcoded_status_lies_about_non_cpu0_affinity() {
-        let legacy = legacy_render_task_status(42, 84);
-
-        assert!(legacy.contains("Cpus_allowed:\t1\n"));
-        assert!(legacy.contains("Cpus_allowed_list:\t0\n"));
-        assert!(!legacy.contains("Cpus_allowed:\t0000000a\n"));
-        assert!(!legacy.contains("Cpus_allowed_list:\t1,3\n"));
-    }
-
-    #[test]
-    fn cpus_allowed_hex_matches_actual_affinity_bits() {
-        let cpu_presence = collect_cpu_presence([1, 3], 4);
-
-        assert_eq!(format_cpu_presence_hex(&cpu_presence), "0000000a");
-    }
-
-    #[test]
-    fn cpus_allowed_hex_orders_32bit_words_from_high_to_low() {
-        let cpu_presence = collect_cpu_presence([0, 1, 32, 63], 64);
-
-        assert_eq!(format_cpu_presence_hex(&cpu_presence), "80000001,00000003");
-    }
-
-    #[test]
-    fn cpus_allowed_list_compacts_contiguous_ranges() {
-        let cpu_presence = collect_cpu_presence([0, 2, 3, 4, 7, 9, 10, 11], 12);
-
-        assert_eq!(format_cpu_presence_list(&cpu_presence), "0,2-4,7,9-11");
-    }
-
-    #[test]
-    fn task_status_reports_real_affinity_instead_of_cpu0_only() {
-        let status = render_task_status_from_cpus(42, 84, &[1, 3], 4);
-
-        assert!(status.contains("Tgid:\t42\n"));
-        assert!(status.contains("Pid:\t84\n"));
-        assert!(status.contains("Name:\tproc-status-test\n"));
-        assert!(status.contains("State:\tR (running)\n"));
-        assert!(status.contains("PPid:\t0\n"));
-        assert!(status.contains("Cpus_allowed:\t0000000a\n"));
-        assert!(status.contains("Cpus_allowed_list:\t1,3\n"));
-    }
-
-    #[test]
-    fn task_status_emits_tab_separated_threads_line_for_psutil() {
-        // psutil `Process.num_threads()` parses this line with the regex
-        // `br'Threads:\t(\d+)'` and blindly indexes `[0]`; a missing line
-        // raises an uncaught IndexError that crashes glances' process_iter.
-        let cpu_presence = collect_cpu_presence([0usize], 1);
-        let cpus_allowed = format_cpu_presence_hex(&cpu_presence);
-        let cpus_allowed_list = format_cpu_presence_list(&cpu_presence);
-        let status = render_task_status_fields(&TaskStatusFields {
-            base: TaskStatusBase {
-                name: "proc-status-test",
-                state: "S (sleeping)",
-                tgid: 1,
-                pid: 1,
-                ppid: 0,
-                tracer_pid: 0,
-                cred: &Cred::root(),
-                num_threads: 3,
-            },
-            cpus_allowed: &cpus_allowed,
-            cpus_allowed_list: &cpus_allowed_list,
-            mem: &sample_mem_stats(),
-        });
-
-        assert!(status.contains("Threads:\t3\n"));
-        // Tab-separated, exactly as the psutil regex expects (not space).
-        assert!(!status.contains("Threads: 3"));
-        assert!(status.contains("State:\tS (sleeping)\n"));
-    }
-
-    #[test]
-    fn task_status_reports_tracer_pid_for_debuggers() {
-        let cpu_presence = collect_cpu_presence([0usize], 1);
-        let cpus_allowed = format_cpu_presence_hex(&cpu_presence);
-        let cpus_allowed_list = format_cpu_presence_list(&cpu_presence);
-        let status = render_task_status_fields(&TaskStatusFields {
-            base: TaskStatusBase {
-                name: "proc-status-test",
-                state: "R (running)",
-                tgid: 10,
-                pid: 11,
-                ppid: 9,
-                tracer_pid: 42,
-                cred: &Cred::root(),
-                num_threads: 1,
-            },
-            cpus_allowed: &cpus_allowed,
-            cpus_allowed_list: &cpus_allowed_list,
-            mem: &sample_mem_stats(),
-        });
-
-        assert!(status.contains("PPid:\t9\n"));
-        assert!(status.contains("TracerPid:\t42\n"));
-    }
-
-    #[test]
-    fn status_includes_vm_size_from_mem_stats() {
-        let cpu_presence = collect_cpu_presence([0usize], 1);
-        let cpus_allowed = format_cpu_presence_hex(&cpu_presence);
-        let cpus_allowed_list = format_cpu_presence_list(&cpu_presence);
-        let mem = ProcessMemStats {
-            vss_pages: 128,
-            resident_pages: 128,
-            ..Default::default()
-        };
-        let status = render_task_status_fields(&TaskStatusFields {
-            base: TaskStatusBase {
-                name: "proc-status-test",
-                state: "R (running)",
-                tgid: 1,
-                pid: 1,
-                ppid: 0,
-                tracer_pid: 0,
-                cred: &Cred::root(),
-                num_threads: 1,
-            },
-            cpus_allowed: &cpus_allowed,
-            cpus_allowed_list: &cpus_allowed_list,
-            mem: &mem,
-        });
-
-        assert!(status.contains("VmSize:\t512 kB\n"));
-        assert!(status.contains("VmRSS:\t512 kB\n"));
+#[cfg(all(test, axtest))]
+mod tests {
+    #[axtest::axtest]
+    fn proc_mountinfo_lines_match_linux_layout() {
+        assert!(super::proc_mountinfo_lines_match_linux_layout());
     }
 }

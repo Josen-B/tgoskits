@@ -36,7 +36,7 @@ where
     W: Write + ?Sized,
 {
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); DEFAULT_BUF_SIZE];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
 
     let mut len = 0;
 
@@ -202,7 +202,7 @@ impl<I: Write + ?Sized> BufferedWriterSpec for BufWriter<I> {
 
         loop {
             let buf = self.buffer_mut();
-            let mut read_buf: BorrowedBuf<'_> = buf.spare_capacity_mut().into();
+            let mut read_buf: BorrowedBuf<'_, u8> = buf.spare_capacity_mut().into();
 
             if init {
                 // SAFETY: init is either 0 or the init_len from the previous iteration.
@@ -236,5 +236,145 @@ impl<I: Write + ?Sized> BufferedWriterSpec for BufWriter<I> {
                 self.flush_buf()?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+struct AxtestShortReader<'a> {
+    remaining: &'a [u8],
+    max_read: usize,
+    largest_request: usize,
+}
+
+#[cfg(test)]
+impl Read for AxtestShortReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.largest_request = self.largest_request.max(buf.len());
+
+        let bytes = self.remaining.len().min(self.max_read).min(buf.len());
+        let (copied, remaining) = self.remaining.split_at(bytes);
+        buf[..bytes].copy_from_slice(copied);
+        self.remaining = remaining;
+
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+struct AxtestFixedWriter<'a> {
+    output: &'a mut [u8],
+    written: usize,
+    largest_write: usize,
+}
+
+#[cfg(test)]
+impl AxtestFixedWriter<'_> {
+    fn filled(&self) -> &[u8] {
+        &self.output[..self.written]
+    }
+}
+
+#[cfg(test)]
+impl Write for AxtestFixedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.largest_write = self.largest_write.max(buf.len());
+
+        let bytes = (self.output.len() - self.written).min(buf.len());
+        let end = self.written + bytes;
+        self.output[self.written..end].copy_from_slice(&buf[..bytes]);
+        self.written = end;
+
+        Ok(bytes)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_constants_hold() {
+        let source = *b"stack-buffer-copy";
+        let mut reader = AxtestShortReader {
+            remaining: &source,
+            max_read: 3,
+            largest_request: 0,
+        };
+        let mut output = [0; 17];
+        let mut writer = AxtestFixedWriter {
+            output: &mut output,
+            written: 0,
+            largest_write: 0,
+        };
+
+        assert_eq!(
+            stack_buffer_copy(&mut reader, &mut writer),
+            Ok(source.len() as u64)
+        );
+        assert_eq!(writer.filled(), source);
+        assert!(reader.remaining.is_empty());
+        assert_eq!(reader.largest_request, DEFAULT_BUF_SIZE);
+
+        let mut reader = AxtestShortReader {
+            remaining: &source,
+            max_read: source.len(),
+            largest_request: 0,
+        };
+        let mut short_output = [0; 4];
+        let mut short_writer = AxtestFixedWriter {
+            output: &mut short_output,
+            written: 0,
+            largest_write: 0,
+        };
+
+        assert_eq!(
+            stack_buffer_copy(&mut reader, &mut short_writer),
+            Err(Error::WriteZero)
+        );
+    }
+
+    #[test]
+    fn copy_buffered_reader_spec_hold() {
+        let source = [0x5a; DEFAULT_BUF_SIZE * 2 + 11];
+        let mut reader = BufReader::with_capacity(
+            DEFAULT_BUF_SIZE * 2,
+            AxtestShortReader {
+                remaining: &source,
+                max_read: source.len(),
+                largest_request: 0,
+            },
+        );
+        let mut output = [0; DEFAULT_BUF_SIZE * 2 + 11];
+        let mut writer = AxtestFixedWriter {
+            output: &mut output,
+            written: 0,
+            largest_write: 0,
+        };
+
+        assert_eq!(copy(&mut reader, &mut writer), Ok(source.len() as u64));
+        assert_eq!(writer.filled(), source);
+        assert_eq!(writer.largest_write, DEFAULT_BUF_SIZE * 2);
+        assert!(reader.into_inner().remaining.is_empty());
+    }
+
+    #[test]
+    fn copy_slice_specialization_hold() {
+        let source = [0x7b; DEFAULT_BUF_SIZE + 17];
+        let mut reader = source.as_slice();
+        let mut output = [0; DEFAULT_BUF_SIZE + 17];
+        let mut writer = AxtestFixedWriter {
+            output: &mut output,
+            written: 0,
+            largest_write: 0,
+        };
+
+        assert_eq!(copy(&mut reader, &mut writer), Ok(source.len() as u64));
+        assert_eq!(writer.filled(), source);
+        assert_eq!(writer.largest_write, source.len());
+        assert!(reader.is_empty());
     }
 }

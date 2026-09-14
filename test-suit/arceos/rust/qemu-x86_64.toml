@@ -4,7 +4,7 @@ args = [
     "-smp",
     "4",
     "-device",
-    "virtio-blk-pci,drive=disk0",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
     "-drive",
     "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/runtime-assets/arceos/rust/disk.img",
     "-device",
@@ -20,12 +20,16 @@ args = [
 ]
 
 timeout = 120
-uefi = false
-to_bin = false
-success_regex = ["ArceOS test suite run OK!"]
+# x86_64 dynamic platform images boot through the configured UEFI firmware.
+# Keep the boot contract explicit instead of relying on axbuild rewriting it.
+uefi = true
+to_bin = true
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b", "ARCEOS_TEST_FAIL"]
 
 [host_http_server]
 bind = "127.0.0.1"
 port = 18180
 body = "ArceOS rust test suite host fixture\n"
+
+[[shell_check_steps]]
+success_regex = ["ArceOS test suite run OK!"]

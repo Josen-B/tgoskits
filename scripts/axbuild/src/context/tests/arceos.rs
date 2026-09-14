@@ -295,6 +295,40 @@ fn prepare_request_requires_package() {
 }
 
 #[test]
+fn prepare_request_rejects_package_override_for_c_app_config() {
+    let root = tempdir().unwrap();
+    let config_path = root.path().join("configs/c-app.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &config_path,
+        r#"
+package = "arceos-helloworld"
+target = "aarch64-unknown-none-softfloat"
+app-c = "c"
+features = []
+log = "Info"
+"#,
+    )
+    .unwrap();
+    let app = test_app_context(root.path());
+
+    let err = prepare_arceos_request(
+        &app,
+        BuildCliArgs {
+            config: Some(config_path),
+            package: Some("arceos-helloworld".into()),
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("app-c"));
+    assert!(err.to_string().contains("ax-libc"));
+}
+
+#[test]
 fn prepare_request_resolves_arceos_target_from_arch() {
     let root = tempdir().unwrap();
     let app = test_app_context(root.path());
@@ -339,7 +373,6 @@ fn should_use_loongarch_lvz_only_for_axvisor_loongarch() {
 #[test]
 fn find_loongarch_qemu_dir_prefers_explicit_env_override() {
     let _lock = ENV_LOCK.lock().unwrap();
-    let root = tempdir().unwrap();
     let qemu_bin_dir = tempdir().unwrap();
     let fallback_dir = tempdir().unwrap();
     fs::write(qemu_bin_dir.path().join("qemu-system-loongarch64"), "").unwrap();
@@ -353,7 +386,7 @@ fn find_loongarch_qemu_dir_prefers_explicit_env_override() {
     let _home = TempEnvVar::unset("HOME");
 
     assert_eq!(
-        find_loongarch_qemu_dir(root.path()),
+        find_loongarch_qemu_dir(),
         Some(qemu_bin_dir.path().to_path_buf())
     );
 }
@@ -362,7 +395,6 @@ fn find_loongarch_qemu_dir_prefers_explicit_env_override() {
 fn find_loongarch_qemu_dir_uses_latest_cache() {
     let _lock = ENV_LOCK.lock().unwrap();
     let home = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
     let qemu_dir = home
         .path()
         .join(".cache/axvisor/qemu-lvz")
@@ -376,14 +408,13 @@ fn find_loongarch_qemu_dir_uses_latest_cache() {
     let _qemu_bin = TempEnvVar::unset("AXBUILD_QEMU_SYSTEM_LOONGARCH64");
     let _home = TempEnvVar::set("HOME", home.path());
 
-    assert_eq!(find_loongarch_qemu_dir(workspace.path()), Some(qemu_dir));
+    assert_eq!(find_loongarch_qemu_dir(), Some(qemu_dir));
 }
 
 #[test]
 fn find_loongarch_qemu_dir_honors_custom_latest_cache_root() {
     let _lock = ENV_LOCK.lock().unwrap();
     let cache = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
     let qemu_dir = cache.path().join("latest").join("bin");
 
     fs::create_dir_all(&qemu_dir).unwrap();
@@ -394,14 +425,13 @@ fn find_loongarch_qemu_dir_honors_custom_latest_cache_root() {
     let _home = TempEnvVar::unset("HOME");
     let _cache = TempEnvVar::set("AXVISOR_QEMU_LVZ_CACHE", cache.path());
 
-    assert_eq!(find_loongarch_qemu_dir(workspace.path()), Some(qemu_dir));
+    assert_eq!(find_loongarch_qemu_dir(), Some(qemu_dir));
 }
 
 #[test]
 fn find_loongarch_qemu_dir_uses_existing_cached_version() {
     let _lock = ENV_LOCK.lock().unwrap();
     let cache = tempdir().unwrap();
-    let workspace = tempdir().unwrap();
     let qemu_dir = cache.path().join("abcdef1234567890").join("bin");
 
     fs::create_dir_all(&qemu_dir).unwrap();
@@ -412,7 +442,7 @@ fn find_loongarch_qemu_dir_uses_existing_cached_version() {
     let _home = TempEnvVar::unset("HOME");
     let _cache = TempEnvVar::set("AXVISOR_QEMU_LVZ_CACHE", cache.path());
 
-    assert_eq!(find_loongarch_qemu_dir(workspace.path()), Some(qemu_dir));
+    assert_eq!(find_loongarch_qemu_dir(), Some(qemu_dir));
 }
 
 #[test]

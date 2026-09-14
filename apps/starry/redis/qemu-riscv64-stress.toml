@@ -5,7 +5,7 @@ args = [
     "-cpu",
     "rv64",
     "-device",
-    "virtio-blk-pci,drive=disk0",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
     "-drive",
     "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-alpine.img",
     "-device",
@@ -15,8 +15,10 @@ args = [
 ]
 uefi = false
 to_bin = true
-shell_prefix = "root@starry:"
-shell_init_cmd = "/bin/sh /usr/bin/redis-stress-tests.sh"
-success_regex = ["(?m)^REDIS_STRESS_TEST_PASSED\\s*$"]
 fail_regex = ['(?i)\bpanic(?:ked)?\b', "(?m)^REDIS_STRESS_TEST_FAILED\\s*$"]
 timeout = 1800
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "/bin/sh /usr/bin/redis-stress-tests.sh"
+success_regex = ["(?m)^REDIS_STRESS_TEST_PASSED\\s*$"]

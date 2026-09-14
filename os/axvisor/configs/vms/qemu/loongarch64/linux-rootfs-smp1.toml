@@ -6,7 +6,7 @@ id = 1
 # Guest vm name.
 name = "linux-loongarch64-qemu-rootfs"
 # Virtualization type.
-vm_type = 1
+guest_type = "passthrough"
 # The number of virtual CPUs.
 cpu_num = 1
 # Guest vm physical cpu ids.
@@ -27,6 +27,7 @@ kernel_load_addr = 0x0020_0000
 # Boot Linux through guest UEFI/ACPI, matching the LoongArch QEMU virt platform.
 enable_bios = true
 boot_protocol = "uefi"
+# The firmware path is part of this VM contract; axbuild must not rewrite it at runtime.
 uefi_firmware_path = "/tmp/ostool/ovmf/loongarch64/code.fd"
 bios_load_addr = 0x1c00_0000
 # Kernel command line. Rootfs mode intentionally uses virtio-blk /dev/vda.
@@ -43,26 +44,8 @@ memory_regions = [
 #
 # Device specifications
 #
+
+# Physical-device selection. Virtual platform devices are machine-owned.
 [devices]
-# The interrupt mode.
-interrupt_mode = "passthrough"
-
-# Pass-through devices.
-passthrough_devices = [
-  ["/"],
-]
-
-# Passthrough addresses.
-# Base-GPA  Length.
-passthrough_addresses = [
-]
-
-# Devices that are not desired to be passed through to the guest
-excluded_devices = [
-]
-
-# Emu_devices.
-emu_devices = [
-  ["fw_cfg", 0x1e02_0000, 0x18, 0, 0x3, []],
-  ["ls7a_pch_pic", 0x1000_0000, 0x1000, 0, 0x25, []],
-]
+passthrough = []
+disabled = []

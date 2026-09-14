@@ -18,6 +18,11 @@ SECTIONS {
         _ex_table_end = .;
 
         . = ALIGN(0x10);
+        _nofault_ex_table_start = .;
+        KEEP(*(__nofault_ex_table))
+        _nofault_ex_table_end = .;
+
+        . = ALIGN(0x10);
         __axtest_array = .;
         KEEP(*(SORT(.axtest_array)))
         __axtest_array_end = .;
@@ -44,9 +49,5 @@ PROVIDE(_sbss = __bss_start);
 PROVIDE(_ebss = __bss_stop);
 PROVIDE(boot_stack = __cpu0_stack);
 PROVIDE(boot_stack_top = __cpu0_stack_top);
-PROVIDE(_percpu_load_start = __percpu_start);
-PROVIDE(_percpu_load_end = __percpu_end);
-PROVIDE(_percpu_start = __percpu_start);
-PROVIDE(_percpu_end = __percpu_end);
 PROVIDE(_skernel = VM_LOAD_ADDRESS);
 PROVIDE(_ekernel = __kernel_code_end);

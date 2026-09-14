@@ -1,0 +1,37 @@
+args = [
+    "-machine",
+    "virt",
+    "-cpu",
+    "la464",
+    "-nographic",
+    "-m",
+    "2G",
+    "-smp",
+    "4",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-alpine.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+    "-device",
+    "virtio-gpu-pci",
+    "-device",
+    "virtio-keyboard-pci",
+    "-device",
+    "virtio-tablet-pci",
+]
+# The std/PIC test image must be loaded through the LoongArch UEFI handoff.
+uefi = true
+to_bin = true
+test_commands = ["exec /usr/bin/starry-run-system-tests --capture-failures"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b', "(?m)^lockdep fatal violation\\s*$", '(?m)^STARRY_GROUPED_TEST_FAILED:']
+timeout = 1800
+
+[host_http_server]
+bind = "127.0.0.1"
+port = 18383
+body_size = 20971520
+body_byte = 97

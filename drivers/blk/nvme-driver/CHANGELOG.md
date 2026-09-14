@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.8.1...nvme-driver-v0.8.2) - 2026-09-09
+
+### Other
+
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.8.0...nvme-driver-v0.8.1) - 2026-08-25
+
+### Fixed
+
+- *(ax-fs-ng)* stabilize block runtime lifecycle publication ([#2135](https://github.com/rcore-os/tgoskits/pull/2135))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.5...nvme-driver-v0.8.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+
+### Other
+
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.7.5](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.4...nvme-driver-v0.7.5) - 2026-08-09
+
+### Other
+
+- updated the following local packages: dma-api, mmio-api, rdif-block
+
+## [0.7.4](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.3...nvme-driver-v0.7.4) - 2026-08-03
+
+### Other
+
+- *(block)* adopt IRQ-driven multi-queue runtime ([#1768](https://github.com/rcore-os/tgoskits/pull/1768))
+
+### Fixed
+
+- Wait for `CSTS.RDY` to clear before queue DMA memory is released during shutdown.
+- Treat invalid or duplicate completion IDs as fatal queue corruption after publishing the consumed CQ head.
+
+### Changed
+
+- Move controller enable, Identify, queue creation, and namespace discovery to an IRQ-driven admin state machine.
+- Give each I/O queue one task owner and one fixed MSI-X vector; retain only explicit single-queue INTx fallback.
+- Stage each accepted I/O batch into the SQ and publish it with one tail doorbell; drain each IRQ batch before publishing one CQ head update.
+
+### Removed
+
+- Remove synchronous admin helpers, CQ polling, polling configuration, and unbounded register spins.
+
+## [0.7.3](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.2...nvme-driver-v0.7.3) - 2026-07-23
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.7.2](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.1...nvme-driver-v0.7.2) - 2026-07-10
+
+### Added
+
+- *(msi)* add hierarchical MSI-X irq domains ([#1526](https://github.com/rcore-os/tgoskits/pull/1526))
+
 ## [0.7.1](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.0...nvme-driver-v0.7.1) - 2026-07-08
 
 ### Other

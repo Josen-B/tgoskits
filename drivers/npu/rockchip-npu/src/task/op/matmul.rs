@@ -58,7 +58,7 @@ impl<T: Sized + Copy, O: Sized + Copy> MatMul<T, O> {
                 self.input.set_cpu(idx, a[src]);
             }
         }
-        self.input.prepare_for_device_all();
+        self.input.prepare_for_device(0..self.input.bytes_len());
     }
 
     fn gen_matul(
@@ -309,14 +309,13 @@ impl OperationTrait for MatMul<i8, i32> {
         } else {
             fd_banks + 1
         };
-        let weight_banks;
-        if (fd_banks) > NPU_CBUF_BANKS - 1 {
+        let weight_banks = if fd_banks > NPU_CBUF_BANKS - 1 {
             panic!("Input feature data size exceed cbuf size");
         } else if cna_desc.weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE as u32 {
-            weight_banks = NPU_CBUF_BANKS as u32 - fd_banks as u32;
+            NPU_CBUF_BANKS as u32 - fd_banks as u32
         } else {
             panic!("Weight data size exceed cbuf size");
-        }
+        };
 
         cna_desc.weight_bank = weight_banks as _;
         cna_desc.data_bank = fd_banks as _;
@@ -418,7 +417,7 @@ impl MatMul<i8, i32> {
                 self.weight.set_cpu(idx, b[src]);
             }
         }
-        self.weight.prepare_for_device_all();
+        self.weight.prepare_for_device(0..self.weight.bytes_len());
     }
 
     pub fn get_output(&self, m: usize, n: usize) -> i32 {
@@ -428,7 +427,7 @@ impl MatMul<i8, i32> {
     }
 
     pub fn output_buffer(&self) -> &[i32] {
-        self.output.complete_for_cpu_all();
+        self.output.complete_for_cpu(0..self.output.bytes_len());
         self.output.as_slice_cpu()
     }
 }

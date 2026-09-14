@@ -12,7 +12,7 @@ OUTPUT_ARCH(loongarch)
 ENTRY(kernel_entry)
 PHDRS {
 	text PT_LOAD FLAGS(7);	/* RWX */
-	tls PT_TLS FLAGS(4);	/* R__ */
+${tls_phdr}
 	note PT_NOTE FLAGS(4);	/* R__ */
 }
 
@@ -23,16 +23,6 @@ SECTIONS
         KEEP(*(.head.text))
     }
 ${ld_text}
-
-    /* Exception vector table - must be 64KB aligned */
-    /* VECSIZE = 0x200 (512 bytes), 128 vectors = 64KB total */
-    . = ALIGN(0x10000);
-    __exception_vectors = .;
-    .exception.vectors : {
-        KEEP(*(.exception.vectors))
-    } :text
-    . = __exception_vectors + 0x10000;
-    __exception_vectors_end = .;
 
     . = ALIGN(PAGE_SIZE);
     .vectors : {

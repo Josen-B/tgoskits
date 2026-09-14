@@ -1,0 +1,7 @@
+//! AArch64 architectural timer binding.
+
+mod host_ppi;
+mod state;
+
+pub(super) use host_ppi::ensure_host_timer_ppi;
+pub(super) use state::{Aarch64TimerBinding, Aarch64TimerWaitToken, physical_counter};

@@ -1,5 +1,5 @@
 [package]
-name = "arceos-tokio_test"
+name = "arceos-tokio-test"
 version = "0.1.0"
 edition.workspace = true
 publish = false
@@ -7,12 +7,9 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
-arceos = ["dep:ax-std", "ax-std/multitask", "ax-std/irq"]
+default = ["arceos"]
+arceos = ["dep:ax-std", "ax-std/arceos"]
 
 [dependencies]
-ax-std = { workspace = true, optional = true }
+ax-std = { workspace = true, optional = true, features = ["default"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
-
-[package.metadata.axstd]
-features = ["log-level-off"]

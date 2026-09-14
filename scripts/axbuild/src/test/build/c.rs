@@ -39,6 +39,29 @@ pub(crate) fn prepare_c_case_assets_sync(
     layout: &case_assets::CaseAssetLayout,
     config: &CaseAssetConfig,
 ) -> anyhow::Result<()> {
+    prepare_c_case_overlay_sync(arch, case, case_rootfs, layout, config)?;
+    let timing_stage = timing::TimingStage::new(
+        "qemu-asset-c",
+        [
+            ("case", case.display_name.clone()),
+            ("phase", "inject-overlay".to_string()),
+        ],
+    );
+    let result = crate::rootfs::inject::inject_overlay(case_rootfs, &layout.overlay_dir);
+    timing_stage.finish();
+    result
+}
+
+/// Builds a C case into its overlay without injecting that overlay into a rootfs.
+///
+/// Board tests use the resulting overlay as their session upload root.
+pub(crate) fn prepare_c_case_overlay_sync(
+    arch: &str,
+    case: &TestQemuCase,
+    case_rootfs: &Path,
+    layout: &case_assets::CaseAssetLayout,
+    config: &CaseAssetConfig,
+) -> anyhow::Result<()> {
     let source_dir = case_c_source_dir(case);
     let cmake_lists = source_dir.join(CASE_CMAKE_FILE_NAME);
     ensure!(
@@ -111,19 +134,10 @@ pub(crate) fn prepare_c_case_assets_sync(
         "qemu-asset-c",
         [
             ("case", case.display_name.clone()),
-            ("phase", "find-qemu-user".to_string()),
-        ],
-    );
-    let qemu_runner = find_host_binary_candidates(qemu_user_binary_names(arch)?)?;
-    timing_stage.finish();
-    let timing_stage = timing::TimingStage::new(
-        "qemu-asset-c",
-        [
-            ("case", case.display_name.clone()),
             ("phase", "prepare-cross-env".to_string()),
         ],
     );
-    let build_env = prepare_host_cross_build_env(arch, layout, &qemu_runner)?;
+    let build_env = prepare_host_cross_build_env(arch, layout)?;
     timing_stage.finish();
 
     let timing_stage = timing::TimingStage::new(
@@ -135,7 +149,7 @@ pub(crate) fn prepare_c_case_assets_sync(
     );
     let mut configure = build_cmake_configure_command(case, layout, &build_env, config);
     let result = configure
-        .exec()
+        .exec_quiet()
         .context("failed to configure case C project");
     timing_stage.finish();
     result?;
@@ -148,7 +162,7 @@ pub(crate) fn prepare_c_case_assets_sync(
         ],
     );
     let mut build = build_cmake_build_command(layout, &build_env);
-    let result = build.exec().context("failed to build case C project");
+    let result = build.exec_quiet().context("failed to build case C project");
     timing_stage.finish();
     result?;
 
@@ -160,7 +174,9 @@ pub(crate) fn prepare_c_case_assets_sync(
         ],
     );
     let mut install = build_cmake_install_command(layout, &build_env);
-    let result = install.exec().context("failed to install case C project");
+    let result = install
+        .exec_quiet()
+        .context("failed to install case C project");
     timing_stage.finish();
     result?;
 
@@ -171,16 +187,11 @@ pub(crate) fn prepare_c_case_assets_sync(
             ("phase", "sync-runtime-deps".to_string()),
         ],
     );
-    crate::rootfs::runtime::sync_runtime_dependencies(&layout.staging_root, &layout.overlay_dir)?;
+    crate::rootfs::runtime::sync_runtime_dependencies(
+        arch,
+        &layout.staging_root,
+        &layout.overlay_dir,
+    )?;
     timing_stage.finish();
-    let timing_stage = timing::TimingStage::new(
-        "qemu-asset-c",
-        [
-            ("case", case.display_name.clone()),
-            ("phase", "inject-overlay".to_string()),
-        ],
-    );
-    let result = crate::rootfs::inject::inject_overlay(case_rootfs, &layout.overlay_dir);
-    timing_stage.finish();
-    result
+    Ok(())
 }

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.3.0...rdif-pcie-v0.3.1) - 2026-09-09
+
+### Other
+
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+
+## [0.3.0](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.7...rdif-pcie-v0.3.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+
+## [0.2.7](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.6...rdif-pcie-v0.2.7) - 2026-08-09
+
+### Other
+
+- updated the following local packages: axtest, rdif-base
+
+## [0.2.6](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.5...rdif-pcie-v0.2.6) - 2026-08-03
+
+### Other
+
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
 ## [0.2.5](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.4...rdif-pcie-v0.2.5) - 2026-06-22
 
 ### Fixed

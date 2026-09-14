@@ -12,35 +12,67 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{collections::BTreeMap, format, sync::Arc, vec::Vec};
-use core::ops::Range;
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
-#[cfg(target_arch = "aarch64")]
-use arm_vgic::Vgic;
-use ax_errno::{AxResult, ax_err, ax_err_type};
-use ax_kspin::SpinNoIrq as Mutex;
-#[cfg(target_arch = "aarch64")]
-use ax_memory_addr::PhysAddr;
-use ax_memory_addr::is_aligned_4k;
-#[cfg(target_arch = "x86_64")]
-use axdevice_base::PortDeviceAdapter;
-use axdevice_base::{
-    AccessWidth, BusAccess, BusKind, BusResponse, BusRouter, Device, DeviceError, DeviceId,
-    DeviceRegistry, InvalidResourceReason, MmioDeviceAdapter, Port, RegistryError, Resource,
-    SysRegAddr,
-};
-use axvm_types::{EmulatedDeviceConfig, EmulatedDeviceType, GuestPhysAddr};
-#[cfg(target_arch = "riscv64")]
-use riscv_vplic::VPlicGlobal;
-#[cfg(target_arch = "x86_64")]
-use x86_vlapic::{EmulatedIoApic, EmulatedPit, EmulatedSerialPort, IoApicEoi, IoApicInterrupt};
+use axdevice_base::*;
+use axvm_types::GuestPhysAddr;
 
-use crate::{
-    AxVmDeviceConfig, DeviceBuildContext, DeviceBundle, DeviceFactoryRegistry, FwCfg,
-    PollableDeviceOps, range_alloc::RangeAllocator,
-};
-#[cfg(target_arch = "loongarch64")]
-use crate::{LoongArchPchPic, PchPicOutputEvent};
+use crate::{runtime_resources::*, *};
+
+/// Runtime backend for access-scoped virtual timer requests.
+pub trait TimerAccessPort: Send + Sync {
+    /// Schedules a VM-local timer deadline for `device_id`.
+    fn schedule_timer(&self, device_id: DeviceId, deadline_ns: u64) -> DeviceManagerResult;
+}
+
+/// Runtime backend for access-scoped vCPU wake requests.
+pub trait WakeAccessPort: Send + Sync {
+    /// Wakes a VM-local vCPU on behalf of `device_id`.
+    fn wake_vcpu(&self, device_id: DeviceId, vcpu_id: usize) -> DeviceManagerResult;
+}
+
+/// Runtime backend for access-scoped VM stop requests.
+pub trait StopAccessPort: Send + Sync {
+    /// Requests a VM stop on behalf of `device_id`.
+    fn request_vm_stop(&self, device_id: DeviceId, reason: &str) -> DeviceManagerResult;
+}
+
+/// VM runtime capabilities injected into one sealed [`DeviceRuntime`].
+#[derive(Clone, Default)]
+pub struct RuntimeAccessPorts {
+    timer: Option<Arc<dyn TimerAccessPort>>,
+    wake: Option<Arc<dyn WakeAccessPort>>,
+    stop: Option<Arc<dyn StopAccessPort>>,
+}
+
+impl RuntimeAccessPorts {
+    /// Creates an empty access-port set.
+    pub const fn new() -> Self {
+        Self {
+            timer: None,
+            wake: None,
+            stop: None,
+        }
+    }
+
+    /// Adds a timer scheduling port.
+    pub fn with_timer(mut self, timer: Arc<dyn TimerAccessPort>) -> Self {
+        self.timer = Some(timer);
+        self
+    }
+
+    /// Adds a vCPU wake port.
+    pub fn with_wake(mut self, wake: Arc<dyn WakeAccessPort>) -> Self {
+        self.wake = Some(wake);
+        self
+    }
+
+    /// Adds a VM stop-request port.
+    pub fn with_stop(mut self, stop: Arc<dyn StopAccessPort>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+}
 
 #[inline]
 #[allow(dead_code)]
@@ -61,8 +93,50 @@ struct RangeEntry {
     size: u64,
 }
 
-/// represent A vm own devices
-pub struct AxVmDevices {
+fn ranges_overlap(start: u64, end: u64, other_start: u64, other_end: u64) -> bool {
+    start < other_end && other_start < end
+}
+
+fn range_contains_access(base: u64, size: u64, addr: u64, width: AccessWidth) -> bool {
+    let Some(resource_end) = base.checked_add(size) else {
+        return false;
+    };
+    let Some(access_end) = addr.checked_add(width.size() as u64) else {
+        return false;
+    };
+
+    base <= addr && access_end <= resource_end
+}
+
+fn validate_bundle_grant_indices<T>(
+    device_count: usize,
+    grants: &[(usize, T)],
+    operation: &'static str,
+    capability_name: &'static str,
+) -> DeviceManagerResult {
+    if grants.iter().any(|(index, _)| *index >= device_count)
+        || grants.iter().enumerate().any(|(position, (index, _))| {
+            grants[..position]
+                .iter()
+                .any(|(existing, _)| existing == index)
+        })
+    {
+        return Err(DeviceManagerError::InvalidConfig {
+            operation,
+            detail: alloc::format!("{capability_name} must name each bundled device at most once"),
+        });
+    }
+    Ok(())
+}
+
+/// Per-VM runtime that owns the static emulated-device topology.
+///
+/// Construction mutates the registry through [`DeviceRegistry`]. Once shared
+/// with vCPUs, routing is read-only and every access enters through
+/// [`DeviceRuntime::try_read`] or [`DeviceRuntime::try_write`]. Production
+/// construction always uses a factory and an atomic [`DeviceBundle`]
+/// registration.
+pub struct DeviceRuntime {
     /// Registered devices (append-only; index is the DeviceId).
     devices: Vec<Arc<dyn Device>>,
     /// MMIO base address → range entry (slot, size).
@@ -73,458 +147,429 @@ pub struct AxVmDevices {
     sysreg_index: BTreeMap<u32, RangeEntry>,
     /// Devices that require periodic polling.
     pollable_devices: Vec<Arc<dyn PollableDeviceOps>>,
-    /// x86 IOAPIC — kept for type-specific access.
-    #[cfg(target_arch = "x86_64")]
-    x86_ioapic: Option<Arc<EmulatedIoApic>>,
-    /// x86 PIT — kept for type-specific access.
-    #[cfg(target_arch = "x86_64")]
-    x86_pit: Option<Arc<EmulatedPit>>,
-    /// x86 16550 serial port — kept for type-specific access.
-    #[cfg(target_arch = "x86_64")]
-    x86_serial: Option<Arc<EmulatedSerialPort>>,
-    /// LoongArch PCH-PIC — kept for type-specific access.
-    #[cfg(target_arch = "loongarch64")]
-    loongarch_pch_pic: Option<Arc<LoongArchPchPic>>,
-    /// QEMU fw_cfg — kept for DMA access routing.
-    fw_cfg: Option<Arc<FwCfg>>,
-    /// IVC channel range allocator
-    ivc_channel: Option<Mutex<RangeAllocator>>,
+    /// Devices whose periodic progress requires scoped guest-memory DMA.
+    dma_pollable_devices: Vec<DmaPollableRuntimeDevice>,
+    /// Optional lifecycle capabilities in contribution registration order.
+    lifecycle_devices: Vec<Arc<dyn DeviceLifecycle>>,
+    /// Typed capabilities contributed during VM preparation.
+    services: DeviceServices,
+    /// Planned controller, endpoint, and lease state.
+    planned: PlannedRuntimeResources,
+    /// Devices explicitly granted access to guest memory during a routed access.
+    ///
+    /// The grant is intentionally narrow: the VM supplies a guest-memory port
+    /// only for the duration of one device write or DMA poll callback.
+    dma_grants: Vec<(DeviceId, DmaGrant)>,
+    /// Devices explicitly granted timer scheduling during a routed access.
+    timer_grants: Vec<(DeviceId, TimerGrant)>,
+    /// Devices explicitly granted vCPU wake access during a routed access.
+    wake_grants: Vec<(DeviceId, WakeGrant)>,
+    /// Devices explicitly granted VM stop-request access during a routed access.
+    stop_grants: Vec<(DeviceId, StopGrant)>,
+    /// VM runtime access ports used after grant verification.
+    access_ports: RuntimeAccessPorts,
+    /// Routed endpoint grants minted by successful PCI endpoint binding.
+    routed_grants: Vec<RoutedDeviceGrant>,
+    /// Whether this runtime topology has been frozen after VM preparation.
+    sealed: bool,
+    pci_roots: BTreeMap<DeviceNodeId, Arc<PciRootBinding>>,
+    pci_binding_leases: Vec<crate::pci::PciBindingLease>,
 }
 
-/// The implemention for AxVmDevices
-impl AxVmDevices {
-    fn empty() -> Self {
+struct DmaPollableRuntimeDevice {
+    device_id: DeviceId,
+    pollable: Arc<dyn DmaPollableDeviceOps>,
+    grant: DmaGrant,
+    pci_binding: Option<Arc<PciRootBinding>>,
+}
+
+/// Stack-scoped metadata for one routed device access.
+struct RuntimeDeviceContext<'runtime, 'memory> {
+    device_id: DeviceId,
+    routed_context: RoutedContextKind,
+    memory: Option<&'memory mut dyn GuestMemoryAccess>,
+    dma_grants: &'runtime [(DeviceId, DmaGrant)],
+    timer_grants: &'runtime [(DeviceId, TimerGrant)],
+    wake_grants: &'runtime [(DeviceId, WakeGrant)],
+    stop_grants: &'runtime [(DeviceId, StopGrant)],
+    routed_grants: &'runtime [RoutedDeviceGrant],
+    access_ports: &'runtime RuntimeAccessPorts,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RoutedContextKind {
+    Root,
+    Nested,
+}
+
+struct RuntimeRegistrationCheckpoint {
+    devices_len: usize,
+    dma_grants_len: usize,
+    timer_grants_len: usize,
+    wake_grants_len: usize,
+    stop_grants_len: usize,
+    pollable_devices_len: usize,
+    dma_pollable_devices_len: usize,
+    lifecycle_devices_len: usize,
+    routed_grants_len: usize,
+    pci_binding_leases_len: usize,
+    services_len: usize,
+    planned: PlannedRuntimeCheckpoint,
+}
+
+struct RuntimeRegistrationTransaction<'runtime> {
+    runtime: &'runtime mut DeviceRuntime,
+    checkpoint: RuntimeRegistrationCheckpoint,
+    root_node: DeviceNodeId,
+    root_inserted: bool,
+    committed: bool,
+}
+
+impl<'runtime> RuntimeRegistrationTransaction<'runtime> {
+    fn new(runtime: &'runtime mut DeviceRuntime, root_node: DeviceNodeId) -> Self {
+        let checkpoint = RuntimeRegistrationCheckpoint {
+            devices_len: runtime.devices.len(),
+            dma_grants_len: runtime.dma_grants.len(),
+            timer_grants_len: runtime.timer_grants.len(),
+            wake_grants_len: runtime.wake_grants.len(),
+            stop_grants_len: runtime.stop_grants.len(),
+            pollable_devices_len: runtime.pollable_devices.len(),
+            dma_pollable_devices_len: runtime.dma_pollable_devices.len(),
+            lifecycle_devices_len: runtime.lifecycle_devices.len(),
+            routed_grants_len: runtime.routed_grants.len(),
+            pci_binding_leases_len: runtime.pci_binding_leases.len(),
+            services_len: runtime.services.len(),
+            planned: runtime.planned.checkpoint(),
+        };
+        Self {
+            runtime,
+            checkpoint,
+            root_node,
+            root_inserted: false,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RuntimeRegistrationTransaction<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.runtime
+            .pci_binding_leases
+            .truncate(self.checkpoint.pci_binding_leases_len);
+        self.runtime
+            .routed_grants
+            .truncate(self.checkpoint.routed_grants_len);
+        if self.root_inserted {
+            self.runtime.pci_roots.remove(&self.root_node);
+        }
+        self.runtime.truncate_devices(self.checkpoint.devices_len);
+        self.runtime
+            .dma_grants
+            .truncate(self.checkpoint.dma_grants_len);
+        self.runtime
+            .timer_grants
+            .truncate(self.checkpoint.timer_grants_len);
+        self.runtime
+            .wake_grants
+            .truncate(self.checkpoint.wake_grants_len);
+        self.runtime
+            .stop_grants
+            .truncate(self.checkpoint.stop_grants_len);
+        self.runtime
+            .pollable_devices
+            .truncate(self.checkpoint.pollable_devices_len);
+        self.runtime
+            .dma_pollable_devices
+            .truncate(self.checkpoint.dma_pollable_devices_len);
+        self.runtime
+            .lifecycle_devices
+            .truncate(self.checkpoint.lifecycle_devices_len);
+        self.runtime.services.truncate(self.checkpoint.services_len);
+        self.runtime
+            .planned
+            .rollback(self.checkpoint.planned.clone());
+    }
+}
+
+impl RuntimeDeviceContext<'_, '_> {
+    fn has_grant<T>(&self, grants: &[(DeviceId, T)], matches_token: impl Fn(&T) -> bool) -> bool {
+        grants.iter().any(|(device_id, registered)| {
+            *device_id == self.device_id && matches_token(registered)
+        })
+    }
+
+    fn has_routed_grant(&self, grant: &RoutedDeviceGrant) -> bool {
+        self.routed_grants.iter().any(|registered| {
+            registered.binding_generation() == grant.binding_generation()
+                && registered.device_id() == grant.device_id()
+                && registered.same_token(grant)
+                && grant.admission_is_open()
+        })
+    }
+}
+
+impl DeviceContext for RuntimeDeviceContext<'_, '_> {
+    fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    fn with_routed_device(
+        &mut self,
+        grant: &RoutedDeviceGrant,
+        callback: &mut dyn FnMut(&mut dyn DeviceContext) -> DeviceResult,
+    ) -> DeviceResult {
+        if self.routed_context == RoutedContextKind::Nested {
+            return Err(DeviceError::Unsupported {
+                operation: "enter routed device context",
+                detail: "routed device contexts are single-hop capabilities".into(),
+            });
+        }
+        if !self.has_routed_grant(grant) {
+            return Err(DeviceError::Unsupported {
+                operation: "enter routed device context",
+                detail: "device has no matching routed-device grant".into(),
+            });
+        }
+        let transfers_memory = grant.dma_enabled();
+        let memory = if transfers_memory {
+            self.memory.take()
+        } else {
+            None
+        };
+        let mut nested = RuntimeDeviceContext {
+            device_id: grant.device_id(),
+            routed_context: RoutedContextKind::Nested,
+            memory,
+            dma_grants: self.dma_grants,
+            timer_grants: self.timer_grants,
+            wake_grants: self.wake_grants,
+            stop_grants: self.stop_grants,
+            routed_grants: self.routed_grants,
+            access_ports: self.access_ports,
+        };
+        let result = callback(&mut nested);
+        if transfers_memory {
+            self.memory = nested.memory;
+        }
+        result
+    }
+
+    fn read_guest_memory(
+        &mut self,
+        grant: &DmaGrant,
+        addr: GuestPhysAddr,
+        data: &mut [u8],
+    ) -> Result<(), DeviceError> {
+        if !self.has_grant(self.dma_grants, |registered| registered.same_token(grant)) {
+            return Err(DeviceError::Unsupported {
+                operation: "read guest memory from device access",
+                detail: "device has no DMA memory grant".into(),
+            });
+        }
+        let memory = self
+            .memory
+            .as_mut()
+            .ok_or_else(|| DeviceError::Unsupported {
+                operation: "read guest memory from device access",
+                detail: "this bus access has no DMA memory port".into(),
+            })?;
+        memory.read(addr, data)
+    }
+    fn write_guest_memory(
+        &mut self,
+        grant: &DmaGrant,
+        addr: GuestPhysAddr,
+        data: &[u8],
+    ) -> Result<(), DeviceError> {
+        if !self.has_grant(self.dma_grants, |registered| registered.same_token(grant)) {
+            return Err(DeviceError::Unsupported {
+                operation: "write guest memory from device access",
+                detail: "device has no DMA memory grant".into(),
+            });
+        }
+        let memory = self
+            .memory
+            .as_mut()
+            .ok_or_else(|| DeviceError::Unsupported {
+                operation: "write guest memory from device access",
+                detail: "this bus access has no DMA memory port".into(),
+            })?;
+        memory.write(addr, data)
+    }
+
+    fn schedule_timer(&mut self, grant: &TimerGrant, deadline_ns: u64) -> Result<(), DeviceError> {
+        if !self.has_grant(self.timer_grants, |registered| registered.same_token(grant)) {
+            return Err(DeviceError::Unsupported {
+                operation: "schedule timer from device access",
+                detail: "device has no timer grant".into(),
+            });
+        }
+        let timer = self
+            .access_ports
+            .timer
+            .as_ref()
+            .ok_or_else(|| DeviceError::Unsupported {
+                operation: "schedule timer from device access",
+                detail: "no timer port is attached to this VM runtime".into(),
+            })?;
+        timer
+            .schedule_timer(self.device_id, deadline_ns)
+            .map_err(DeviceError::from)
+    }
+
+    fn wake_vcpu(&mut self, grant: &WakeGrant, vcpu_id: usize) -> Result<(), DeviceError> {
+        if !self.has_grant(self.wake_grants, |registered| registered.same_token(grant)) {
+            return Err(DeviceError::Unsupported {
+                operation: "wake vCPU from device access",
+                detail: "device has no wake grant".into(),
+            });
+        }
+        let wake = self
+            .access_ports
+            .wake
+            .as_ref()
+            .ok_or_else(|| DeviceError::Unsupported {
+                operation: "wake vCPU from device access",
+                detail: "no vCPU wake port is attached to this VM runtime".into(),
+            })?;
+        wake.wake_vcpu(self.device_id, vcpu_id)
+            .map_err(DeviceError::from)
+    }
+
+    fn request_vm_stop(&mut self, grant: &StopGrant, reason: &str) -> Result<(), DeviceError> {
+        if !self.has_grant(self.stop_grants, |registered| registered.same_token(grant)) {
+            return Err(DeviceError::Unsupported {
+                operation: "request VM stop from device access",
+                detail: "device has no stop grant".into(),
+            });
+        }
+        let stop = self
+            .access_ports
+            .stop
+            .as_ref()
+            .ok_or_else(|| DeviceError::Unsupported {
+                operation: "request VM stop from device access",
+                detail: "no VM stop port is attached to this VM runtime".into(),
+            })?;
+        stop.request_vm_stop(self.device_id, reason)
+            .map_err(DeviceError::from)
+    }
+}
+
+impl DeviceRuntime {
+    pub(crate) fn empty() -> Self {
         Self {
             devices: Vec::new(),
             mmio_index: BTreeMap::new(),
             port_index: BTreeMap::new(),
             sysreg_index: BTreeMap::new(),
             pollable_devices: Vec::new(),
-            #[cfg(target_arch = "x86_64")]
-            x86_ioapic: None,
-            #[cfg(target_arch = "x86_64")]
-            x86_pit: None,
-            #[cfg(target_arch = "x86_64")]
-            x86_serial: None,
-            #[cfg(target_arch = "loongarch64")]
-            loongarch_pch_pic: None,
-            fw_cfg: None,
-            ivc_channel: None,
+            dma_pollable_devices: Vec::new(),
+            lifecycle_devices: Vec::new(),
+            services: DeviceServices::new(),
+            planned: PlannedRuntimeResources::new(),
+            dma_grants: Vec::new(),
+            timer_grants: Vec::new(),
+            wake_grants: Vec::new(),
+            stop_grants: Vec::new(),
+            access_ports: RuntimeAccessPorts::new(),
+            routed_grants: Vec::new(),
+            sealed: false,
+            pci_roots: BTreeMap::new(),
+            pci_binding_leases: Vec::new(),
         }
     }
 
-    /// According AxVmDeviceConfig to init the AxVmDevices
-    pub fn new(config: AxVmDeviceConfig) -> AxResult<Self> {
-        let mut this = Self::empty();
-
-        Self::init(&mut this, &config.emu_configs)?;
-        Ok(this)
+    pub(crate) fn attach_access_ports(&mut self, access_ports: RuntimeAccessPorts) {
+        self.access_ports = access_ports;
     }
 
-    /// Builds devices with registered factories and explicit legacy fallbacks.
-    pub fn build_with_factories(
-        config: AxVmDeviceConfig,
-        factories: &DeviceFactoryRegistry,
-        context: &DeviceBuildContext<'_>,
-    ) -> AxResult<Self> {
-        let mut this = Self::empty();
-        for config in &config.emu_configs {
-            if factories.get(config.emu_type).is_some() {
-                this.register_factory_device(config, factories, context)?;
-            } else if Self::is_legacy_fallback(config.emu_type) {
-                Self::init(&mut this, core::slice::from_ref(config))?;
-            } else {
-                return ax_err!(
-                    Unsupported,
-                    format_args!(
-                        "no factory is registered for emulated device '{}' of type {}",
-                        config.name, config.emu_type
-                    )
-                );
-            }
-        }
-        Ok(this)
+    pub(crate) const fn interrupt_registry(&self) -> &crate::interrupt::InterruptRegistry {
+        &self.planned.interrupts
     }
 
-    /// Builds and atomically registers one factory-managed device.
-    pub fn register_factory_device(
-        &mut self,
-        config: &EmulatedDeviceConfig,
-        factories: &DeviceFactoryRegistry,
-        context: &DeviceBuildContext<'_>,
-    ) -> AxResult {
-        let bundle = factories.build(config, context)?;
-        self.register_bundle(bundle)
+    /// Freezes this runtime topology after VM preparation.
+    pub(crate) fn seal(&mut self) {
+        self.sealed = true;
     }
 
-    fn is_legacy_fallback(device_type: EmulatedDeviceType) -> bool {
-        matches!(
-            device_type,
-            EmulatedDeviceType::InterruptController
-                | EmulatedDeviceType::Console
-                | EmulatedDeviceType::IVCChannel
-                | EmulatedDeviceType::GPPTRedistributor
-                | EmulatedDeviceType::GPPTDistributor
-                | EmulatedDeviceType::GPPTITS
-                | EmulatedDeviceType::FwCfg
-                | EmulatedDeviceType::LoongArchPchPic
-                | EmulatedDeviceType::X86IoApic
-                | EmulatedDeviceType::X86Pit
-                | EmulatedDeviceType::PPPTGlobal
-        )
-    }
-
-    /// According the emu_configs to init every  specific device
-    fn init(this: &mut Self, emu_configs: &[EmulatedDeviceConfig]) -> AxResult {
-        for config in emu_configs {
-            match config.emu_type {
-                EmulatedDeviceType::InterruptController => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        #[allow(clippy::arc_with_non_send_sync)]
-                        this.register(
-                            MmioDeviceAdapter::from_arc(Arc::new(Vgic::new())) as Arc<dyn Device>
-                        )
-                        .map_err(|e| {
-                            ax_err_type!(InvalidInput, alloc::format!("register vgic: {e:?}"))
-                        })?;
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::GPPTRedistributor => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        const GPPT_GICR_ARG_ERR_MSG: &str =
-                            "expect 3 args for gppt redistributor (cpu_num, stride, pcpu_id)";
-
-                        let cpu_num = config
-                            .cfg_list
-                            .first()
-                            .copied()
-                            .expect(GPPT_GICR_ARG_ERR_MSG);
-                        let stride = config
-                            .cfg_list
-                            .get(1)
-                            .copied()
-                            .expect(GPPT_GICR_ARG_ERR_MSG);
-                        let pcpu_id = config
-                            .cfg_list
-                            .get(2)
-                            .copied()
-                            .expect(GPPT_GICR_ARG_ERR_MSG);
-
-                        for i in 0..cpu_num {
-                            let addr = config.base_gpa + i * stride;
-                            let size = config.length;
-                            #[allow(clippy::arc_with_non_send_sync)]
-                            this.register(MmioDeviceAdapter::from_arc(Arc::new(
-                                arm_vgic::v3::vgicr::VGicR::new(
-                                    addr.into(),
-                                    Some(size),
-                                    pcpu_id + i,
-                                ),
-                            )) as Arc<dyn Device>)
-                                .map_err(|e| {
-                                    ax_err_type!(
-                                        InvalidInput,
-                                        alloc::format!("register gicr: {e:?}")
-                                    )
-                                })?;
-
-                            info!(
-                                "GPPT Redistributor initialized for vCPU {i} with base GPA \
-                                 {addr:#x} and length {size:#x}"
-                            );
-                        }
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::GPPTDistributor => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        #[allow(clippy::arc_with_non_send_sync)]
-                        this.register(MmioDeviceAdapter::from_arc(Arc::new(
-                            arm_vgic::v3::vgicd::VGicD::new(
-                                config.base_gpa.into(),
-                                Some(config.length),
-                            ),
-                        )) as Arc<dyn Device>)
-                            .map_err(|e| {
-                                ax_err_type!(InvalidInput, alloc::format!("register gicd: {e:?}"))
-                            })?;
-
-                        info!(
-                            "GPPT Distributor initialized with base GPA {base_gpa:#x} and length \
-                             {length:#x}",
-                            base_gpa = config.base_gpa,
-                            length = config.length
-                        );
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::GPPTITS => {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        let host_gits_base = config
-                            .cfg_list
-                            .first()
-                            .copied()
-                            .map(PhysAddr::from_usize)
-                            .expect("expect 1 arg for gppt its (host_gits_base)");
-
-                        #[allow(clippy::arc_with_non_send_sync)]
-                        this.register(MmioDeviceAdapter::from_arc(Arc::new(
-                            arm_vgic::v3::gits::Gits::new(
-                                config.base_gpa.into(),
-                                Some(config.length),
-                                host_gits_base,
-                                false,
-                            ),
-                        )) as Arc<dyn Device>)
-                            .map_err(|e| {
-                                ax_err_type!(InvalidInput, alloc::format!("register gits: {e:?}"))
-                            })?;
-
-                        info!(
-                            "GPPT ITS initialized with base GPA {base_gpa:#x} and length \
-                             {length:#x}, host GITS base {host_gits_base:#x}",
-                            base_gpa = config.base_gpa,
-                            length = config.length,
-                            host_gits_base = host_gits_base
-                        );
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::PPPTGlobal => {
-                    #[cfg(target_arch = "riscv64")]
-                    {
-                        let context_num = config
-                            .cfg_list
-                            .first()
-                            .copied()
-                            .expect("expect 1 arg for pppt global (context_num)");
-                        this.register(MmioDeviceAdapter::from_arc(Arc::new(VPlicGlobal::new(
-                            config.base_gpa.into(),
-                            Some(config.length),
-                            context_num,
-                        ))) as Arc<dyn Device>)
-                            .map_err(|e| {
-                                ax_err_type!(InvalidInput, alloc::format!("register pppt: {e:?}"))
-                            })?;
-                        // PLIC Partial Passthrough Global.
-                        info!(
-                            "Partial PLIC Passthrough Global initialized with base GPA {:#x} and \
-                             length {:#x}",
-                            config.base_gpa, config.length
-                        );
-                    }
-                    #[cfg(not(target_arch = "riscv64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::Console => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let serial = Arc::new(EmulatedSerialPort::new());
-                        this.register(PortDeviceAdapter::from_arc(serial.clone())
-                            as Arc<dyn Device + Send + Sync + 'static>)
-                            .map_err(|e| {
-                                ax_err_type!(InvalidInput, format!("register x86 serial: {e:?}"))
-                            })?;
-                        this.x86_serial = Some(serial);
-                        info!("x86 16550 serial initialized for ports 0x3f8..=0x3ff");
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::X86IoApic => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let ioapic = Arc::new(EmulatedIoApic::new(
-                            config.base_gpa.into(),
-                            Some(config.length),
-                        ));
-                        this.register(MmioDeviceAdapter::from_arc(ioapic.clone())
-                            as Arc<dyn Device + Send + Sync + 'static>)
-                            .map_err(|e| {
-                                ax_err_type!(InvalidInput, format!("register x86 ioapic: {e:?}"))
-                            })?;
-                        this.x86_ioapic = Some(ioapic);
-                        info!(
-                            "x86 IO APIC initialized with base GPA {:#x} and length {:#x}",
-                            config.base_gpa, config.length
-                        );
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::X86Pit => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let pit = Arc::new(EmulatedPit::new());
-                        this.register(PortDeviceAdapter::from_arc(pit.clone()) as Arc<dyn Device>)
-                            .map_err(|e| {
-                                ax_err_type!(InvalidInput, format!("register x86 pit: {e:?}"))
-                            })?;
-                        this.x86_pit = Some(pit);
-                        info!("x86 PIT initialized for ports 0x40..=0x43 and 0x61");
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::LoongArchPchPic => {
-                    #[cfg(target_arch = "loongarch64")]
-                    {
-                        let pch_pic =
-                            Arc::new(LoongArchPchPic::new(config.base_gpa.into(), config.length));
-                        this.register(MmioDeviceAdapter::from_arc(pch_pic.clone())
-                            as Arc<dyn Device + Send + Sync + 'static>)
-                            .map_err(|e| {
-                                ax_err_type!(
-                                    InvalidInput,
-                                    format!("register loongarch pch-pic: {e:?}")
-                                )
-                            })?;
-                        this.loongarch_pch_pic = Some(pch_pic);
-                        info!(
-                            "LoongArch PCH-PIC initialized with base GPA {:#x} and length {:#x}",
-                            config.base_gpa, config.length
-                        );
-                    }
-                    #[cfg(not(target_arch = "loongarch64"))]
-                    {
-                        warn!(
-                            "emu type: {} is not supported on this platform",
-                            config.emu_type
-                        );
-                    }
-                }
-                EmulatedDeviceType::FwCfg => {
-                    debug!("fw_cfg device is initialized when runtime image payloads are added");
-                }
-                EmulatedDeviceType::IVCChannel => {
-                    if this.ivc_channel.is_none() {
-                        // Initialize the IVC channel range allocator
-                        this.ivc_channel = Some(Mutex::new(RangeAllocator::new(Range {
-                            start: config.base_gpa,
-                            end: config.base_gpa + config.length,
-                        })));
-                        info!(
-                            "IVCChannel initialized with base GPA {base_gpa:#x} and length \
-                             {length:#x}",
-                            base_gpa = config.base_gpa,
-                            length = config.length
-                        );
-                    } else {
-                        warn!("IVCChannel already initialized, ignoring additional config");
-                    }
-                }
-                _ => {
-                    warn!(
-                        "Emulated device {}'s type {:?} is not supported yet",
-                        config.name, config.emu_type
-                    );
-                }
-            }
+    fn ensure_unsealed(&self, operation: &'static str) -> DeviceManagerResult {
+        if self.sealed {
+            return Err(DeviceManagerError::InvalidState {
+                operation,
+                detail: "device runtime topology is sealed".into(),
+            });
         }
         Ok(())
     }
 
-    /// Allocates an IVC (Inter-VM Communication) channel of the specified size.
-    pub fn alloc_ivc_channel(&self, size: usize) -> AxResult<GuestPhysAddr> {
-        if size == 0 {
-            return ax_err!(InvalidInput, "Size must be greater than 0");
-        }
-        if !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "Size must be aligned to 4K");
-        }
-
-        if let Some(allocator) = &self.ivc_channel {
-            allocator
-                .lock()
-                .allocate_range(size)
-                .ok_or_else(|| {
-                    warn!("Failed to allocate IVC channel range with size {size:#x}");
-                    ax_errno::ax_err_type!(NoMemory, "IVC channel allocation failed")
-                })
-                .map(|range| {
-                    debug!("Allocated IVC channel range: {range:x?}");
-                    GuestPhysAddr::from_usize(range.start)
-                })
-        } else {
-            ax_err!(InvalidInput, "IVC channel not exists")
-        }
-    }
-
-    /// Releases an IVC channel at the specified address and size.
-    pub fn release_ivc_channel(&self, addr: GuestPhysAddr, size: usize) -> AxResult {
-        if size == 0 {
-            return ax_err!(InvalidInput, "Size must be greater than 0");
-        }
-        if !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "Size must be aligned to 4K");
-        }
-
-        if let Some(allocator) = &self.ivc_channel {
-            let range = addr.as_usize()..addr.as_usize() + size;
-            if allocator.lock().free_range(range.clone()) {
-                debug!("Released IVC channel range: {range:x?}");
-                Ok(())
-            } else {
-                ax_err!(InvalidInput, "Invalid IVC channel range")
-            }
-        } else {
-            ax_err!(InvalidInput, "IVC channel not exists")
-        }
+    /// Returns a typed service contributed by one emulated device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no provider exists for `K`, or when `K` is a
+    /// multi-provider service that must be queried through a future explicit
+    /// multi-provider runtime API.
+    pub fn service<K: ServiceKey>(&self) -> DeviceManagerResult<Arc<K::Service>> {
+        self.services.require::<K>()
     }
 
     /// Registers a bundle atomically.  If any device fails to register,
     /// already-registered devices in this bundle are rolled back via
     /// `pop()` + index-key removal.
-    pub fn register_bundle(&mut self, bundle: DeviceBundle) -> AxResult {
+    pub fn register_bundle(&mut self, bundle: DeviceBundle) -> DeviceManagerResult {
+        if bundle.pci_function.is_some() || !bundle.services.all::<PciRootBindingKey>().is_empty() {
+            return Err(DeviceManagerError::InvalidInput {
+                operation: "register device bundle",
+                detail: "PCI bindings require resolved graph-node registration".into(),
+            });
+        }
+        self.register_bundle_inner(bundle)
+    }
+
+    fn register_bundle_inner(&mut self, bundle: DeviceBundle) -> DeviceManagerResult {
+        self.ensure_unsealed("register device bundle")?;
+        validate_bundle_grant_indices(
+            bundle.devices.len(),
+            &bundle.guest_memory_devices,
+            "register device guest-memory capability",
+            "guest-memory capability",
+        )?;
+        validate_bundle_grant_indices(
+            bundle.devices.len(),
+            &bundle
+                .dma_pollable
+                .iter()
+                .map(|(index, _, grant)| (*index, grant.clone()))
+                .collect::<Vec<_>>(),
+            "register DMA-pollable device",
+            "DMA-pollable capability",
+        )?;
+        validate_bundle_grant_indices(
+            bundle.devices.len(),
+            &bundle.timer_devices,
+            "register device timer capability",
+            "timer capability",
+        )?;
+        validate_bundle_grant_indices(
+            bundle.devices.len(),
+            &bundle.wake_devices,
+            "register device wake capability",
+            "wake capability",
+        )?;
+        validate_bundle_grant_indices(
+            bundle.devices.len(),
+            &bundle.stop_devices,
+            "register device stop capability",
+            "stop capability",
+        )?;
         for (index, pollable) in bundle.pollable.iter().enumerate() {
             if self
                 .pollable_devices
@@ -532,58 +577,245 @@ impl AxVmDevices {
                 .chain(bundle.pollable[..index].iter())
                 .any(|existing| Arc::ptr_eq(existing, pollable))
             {
-                return ax_err!(
-                    AlreadyExists,
-                    "failed to register pollable device: the same capability is already registered"
-                );
+                return Err(DeviceManagerError::ResourceConflict {
+                    operation: "register pollable device",
+                    detail: "the same pollable capability is already registered".into(),
+                });
             }
         }
+        for (index, (_, pollable, _)) in bundle.dma_pollable.iter().enumerate() {
+            if self
+                .dma_pollable_devices
+                .iter()
+                .map(|registered| &registered.pollable)
+                .chain(
+                    bundle.dma_pollable[..index]
+                        .iter()
+                        .map(|(_, existing, _)| existing),
+                )
+                .any(|existing| Arc::ptr_eq(existing, pollable))
+            {
+                return Err(DeviceManagerError::ResourceConflict {
+                    operation: "register DMA-pollable device",
+                    detail: "the same DMA-pollable capability is already registered".into(),
+                });
+            }
+        }
+        for (index, lifecycle) in bundle.lifecycle.iter().enumerate() {
+            if self
+                .lifecycle_devices
+                .iter()
+                .chain(bundle.lifecycle[..index].iter())
+                .any(|existing| Arc::ptr_eq(existing, lifecycle))
+            {
+                return Err(DeviceManagerError::ResourceConflict {
+                    operation: "register device lifecycle",
+                    detail: "the same lifecycle capability is already registered".into(),
+                });
+            }
+        }
+        self.services.validate_merge(&bundle.services)?;
+        self.planned.validate_bundle(&bundle.planned)?;
 
         let saved_len = self.devices.len();
         for device in &bundle.devices {
-            match self.register(device.clone()) {
-                Ok(_id) => {}
-                Err(e) => {
-                    // Rollback: pop back to saved_len, remove from index maps.
-                    while self.devices.len() > saved_len {
-                        let popped = self.devices.pop().unwrap();
-                        for r in popped.resources() {
-                            match *r {
-                                Resource::MmioRange { base, .. } => {
-                                    self.mmio_index.remove(&base);
-                                }
-                                Resource::PortRange { base, .. } => {
-                                    self.port_index.remove(&base);
-                                }
-                                Resource::SysReg { addr, .. } => {
-                                    self.sysreg_index.remove(&addr);
-                                }
-                            }
-                        }
-                    }
-                    let kind = match &e {
-                        RegistryError::AddressConflict { .. } => ax_errno::AxError::AddrInUse,
-                        _ => ax_errno::AxError::InvalidInput,
-                    };
-                    return Err(ax_err_type!(
-                        kind,
-                        format!("device registration failed: {e:?}")
-                    ));
-                }
+            if let Err(error) = self.register(device.clone()) {
+                self.truncate_devices(saved_len);
+                return Err(error.into());
             }
         }
+        self.dma_grants.extend(
+            bundle
+                .guest_memory_devices
+                .iter()
+                .map(|(index, grant)| (DeviceId::new((saved_len + index) as u32), grant.clone())),
+        );
+        self.timer_grants.extend(
+            bundle
+                .timer_devices
+                .iter()
+                .map(|(index, grant)| (DeviceId::new((saved_len + index) as u32), grant.clone())),
+        );
+        self.wake_grants.extend(
+            bundle
+                .wake_devices
+                .iter()
+                .map(|(index, grant)| (DeviceId::new((saved_len + index) as u32), grant.clone())),
+        );
+        self.stop_grants.extend(
+            bundle
+                .stop_devices
+                .iter()
+                .map(|(index, grant)| (DeviceId::new((saved_len + index) as u32), grant.clone())),
+        );
         self.pollable_devices.extend(bundle.pollable);
+        self.dma_pollable_devices
+            .extend(
+                bundle
+                    .dma_pollable
+                    .into_iter()
+                    .map(|(index, pollable, grant)| DmaPollableRuntimeDevice {
+                        device_id: DeviceId::new((saved_len + index) as u32),
+                        pollable,
+                        grant,
+                        pci_binding: None,
+                    }),
+            );
+        self.lifecycle_devices.extend(bundle.lifecycle);
+        self.services.append(bundle.services);
+        self.planned.append(bundle.planned);
         Ok(())
     }
 
-    // ─── Resource rollback ────────────────────────────────────────
+    /// Registers one graph node's bundle with PCI identity validation.
+    ///
+    /// Host nodes must publish exactly one [`PciRootBindingKey`] service whose
+    /// owner and topology match the resolved node; endpoint bundles must bind
+    /// their resolved function through a dependency-hosted root. The binding
+    /// lease is retained by the runtime and its `Drop` unwinds the provisional
+    /// route (withdraw root route -> invalidate admission -> release the
+    /// endpoint reference), so any failure leaves no residue.
+    pub(crate) fn register_graph_bundle(
+        &mut self,
+        node: &ResolvedDeviceNode,
+        bundle: DeviceBundle,
+    ) -> DeviceManagerResult {
+        let root_services = bundle.services.all::<PciRootBindingKey>();
+        let root = match node.pci_host_topology() {
+            Some(topology) => {
+                if root_services.len() != 1 {
+                    return Err(DeviceManagerError::InvalidConfig {
+                        operation: "register PCI host bundle",
+                        detail: alloc::format!(
+                            "host {} must publish exactly one PciRootBinding",
+                            node.id()
+                        ),
+                    });
+                }
+                let root = root_services[0].clone();
+                if root.host() != node.id()
+                    || !root.matches_topology(topology)
+                    || self.pci_roots.contains_key(node.id())
+                {
+                    return Err(DeviceManagerError::InvalidConfig {
+                        operation: "register PCI host bundle",
+                        detail: alloc::format!(
+                            "host {} published a mismatched PCI root",
+                            node.id()
+                        ),
+                    });
+                }
+                Some(root)
+            }
+            None if root_services.is_empty() => None,
+            None => {
+                return Err(DeviceManagerError::InvalidConfig {
+                    operation: "register PCI host bundle",
+                    detail: alloc::format!("non-host node {} published a PCI root", node.id()),
+                });
+            }
+        };
 
-    /// Removes `resources` from the index maps.  Used to undo a
-    /// partially-completed insertion when a conflict is discovered
-    /// mid-way through `insert_resources`.
-    fn rollback_resources(&mut self, resources: &[Resource]) {
-        for r in resources {
-            match *r {
+        let endpoint = match (node.pci_endpoint(), bundle.pci_function.as_ref()) {
+            (Some(endpoint), Some(function)) => {
+                if function.device_index >= bundle.devices.len()
+                    || !node.dependencies().contains(&endpoint.host)
+                {
+                    return Err(DeviceManagerError::InvalidConfig {
+                        operation: "register PCI endpoint bundle",
+                        detail: alloc::format!(
+                            "endpoint {} has an invalid PCI device binding",
+                            node.id()
+                        ),
+                    });
+                }
+                if !function.function.resources().is_empty() {
+                    return Err(DeviceManagerError::InvalidConfig {
+                        operation: "register PCI endpoint bundle",
+                        detail: alloc::format!(
+                            "endpoint {} must not publish ordinary device resources",
+                            node.id()
+                        ),
+                    });
+                }
+                let binding = self.pci_roots.get(&endpoint.host).ok_or_else(|| {
+                    DeviceManagerError::ResourceNotFound {
+                        operation: "register PCI endpoint bundle",
+                        resource: alloc::format!("PCI root dependency {}", endpoint.host),
+                    }
+                })?;
+                let device = DeviceId::new((self.devices.len() + function.device_index) as u32);
+                // Keep all endpoint metadata local until ordinary device,
+                // DMA, service, and planned-resource registration succeeds.
+                // The root route is deliberately published last below.
+                Some((
+                    binding.clone(),
+                    endpoint.function_node.clone(),
+                    device,
+                    function.function.clone(),
+                ))
+            }
+            (Some(_), None) => {
+                return Err(DeviceManagerError::InvalidConfig {
+                    operation: "register PCI endpoint bundle",
+                    detail: alloc::format!(
+                        "endpoint {} did not declare its bundled PCI function",
+                        node.id()
+                    ),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(DeviceManagerError::InvalidConfig {
+                    operation: "register PCI endpoint bundle",
+                    detail: alloc::format!(
+                        "non-PCI node {} declared a bundled PCI function",
+                        node.id()
+                    ),
+                });
+            }
+            (None, None) => None,
+        };
+
+        let mut transaction = RuntimeRegistrationTransaction::new(self, node.id().clone());
+        transaction.runtime.register_bundle_inner(bundle)?;
+        if let Some(root) = root {
+            transaction
+                .runtime
+                .pci_roots
+                .insert(node.id().clone(), root);
+            transaction.root_inserted = true;
+        }
+        if let Some((binding, function_id, device, function)) = endpoint {
+            let endpoint = binding.bind_registered(
+                &function_id,
+                device,
+                function,
+                &mut transaction.runtime.routed_grants,
+            )?;
+            for registered in &mut transaction.runtime.dma_pollable_devices {
+                if registered.device_id == device {
+                    registered.pci_binding = Some(binding.clone());
+                }
+            }
+            transaction.runtime.pci_binding_leases.push(endpoint);
+        }
+        transaction.commit();
+        Ok(())
+    }
+
+    fn truncate_devices(&mut self, len: usize) {
+        while self.devices.len() > len {
+            let device = self
+                .devices
+                .pop()
+                .expect("device length was checked before rollback");
+            self.remove_resources(device.resources());
+        }
+    }
+
+    fn remove_resources(&mut self, resources: &[Resource]) {
+        for resource in resources {
+            match *resource {
                 Resource::MmioRange { base, .. } => {
                     self.mmio_index.remove(&base);
                 }
@@ -593,289 +825,32 @@ impl AxVmDevices {
                 Resource::SysReg { addr, .. } => {
                     self.sysreg_index.remove(&addr);
                 }
+                Resource::IrqLine { .. } => {}
             }
         }
     }
 
-    // ─── BTreeMap insertion with inline conflict detection ─────────
-
-    /// Inserts every resource of device `idx` into the three BTreeMap
-    /// indices, checking for validity errors and range conflicts
-    /// as each key is inserted.
-    ///
-    /// Because earlier resources of the *same* device are already in
-    /// the index when later ones are checked, same-device internal
-    /// overlaps are caught by the same predecessor/successor probes
-    /// that catch cross-device overlaps.  A conflict is reported as
-    /// [`InvalidResourceReason::OverlappingResources`] when the
-    /// neighbour entry belongs to the current device, and as
-    /// [`RegistryError::AddressConflict`] otherwise.
-    ///
-    /// On any error the keys inserted so far are rolled back through
-    /// [`rollback_resources`], leaving the indices unchanged.
-    fn insert_resources(
-        &mut self,
-        idx: usize,
-        resources: &[Resource],
-    ) -> Result<(), RegistryError> {
-        for (i, r) in resources.iter().enumerate() {
-            match *r {
+    /// Validates every resource without mutating the dispatch indices.
+    fn validate_resources(&self, resources: &[Resource]) -> Result<(), RegistryError> {
+        for (index, resource) in resources.iter().enumerate() {
+            let earlier_resources = &resources[..index];
+            match *resource {
                 Resource::MmioRange { base, size } => {
-                    if size == 0 {
-                        return Err(RegistryError::InvalidResource {
-                            resource: Resource::MmioRange { base, size },
-                            reason: InvalidResourceReason::ZeroSized,
-                        });
-                    }
-                    if base.checked_add(size).is_none() {
-                        return Err(RegistryError::InvalidResource {
-                            resource: Resource::MmioRange { base, size },
-                            reason: InvalidResourceReason::AddressOverflow,
-                        });
-                    }
-
-                    // Key collision.
-                    if let Some(existing) = self.mmio_index.get(&base) {
-                        let existing_size = existing.size;
-                        let existing_slot = existing.slot;
-                        self.rollback_resources(&resources[..i]);
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::MmioRange { base, size },
-                            existing: Resource::MmioRange {
-                                base,
-                                size: existing_size,
-                            },
-                            existing_device: DeviceId::new(existing_slot as u32),
-                        });
-                    }
-
-                    self.mmio_index.insert(base, RangeEntry { slot: idx, size });
-
-                    // Predecessor check.
-                    if let Some((prev_base, existing)) = self.mmio_index.range(..base).next_back()
-                        && prev_base.wrapping_add(existing.size) > base
-                    {
-                        let conflicting_base = *prev_base;
-                        let conflicting_size = existing.size;
-                        let conflicting_slot = existing.slot;
-                        self.rollback_resources(&resources[..=i]);
-                        if conflicting_slot == idx {
-                            return Err(RegistryError::InvalidResource {
-                                resource: Resource::MmioRange { base, size },
-                                reason: InvalidResourceReason::OverlappingResources,
-                            });
-                        }
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::MmioRange { base, size },
-                            existing: Resource::MmioRange {
-                                base: conflicting_base,
-                                size: conflicting_size,
-                            },
-                            existing_device: DeviceId::new(conflicting_slot as u32),
-                        });
-                    }
-
-                    // Successor check.
-                    let end = base + size;
-                    if let Some(next_start) = base.checked_add(1)
-                        && let Some((next_base, existing)) =
-                            self.mmio_index.range(next_start..).next()
-                        && *next_base < end
-                    {
-                        let conflicting_base = *next_base;
-                        let conflicting_size = existing.size;
-                        let conflicting_slot = existing.slot;
-                        self.rollback_resources(&resources[..=i]);
-                        if conflicting_slot == idx {
-                            return Err(RegistryError::InvalidResource {
-                                resource: Resource::MmioRange { base, size },
-                                reason: InvalidResourceReason::OverlappingResources,
-                            });
-                        }
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::MmioRange { base, size },
-                            existing: Resource::MmioRange {
-                                base: conflicting_base,
-                                size: conflicting_size,
-                            },
-                            existing_device: DeviceId::new(conflicting_slot as u32),
-                        });
-                    }
+                    self.validate_mmio_range(base, size, earlier_resources)?;
                 }
                 Resource::PortRange { base, size } => {
-                    if size == 0 {
-                        return Err(RegistryError::InvalidResource {
-                            resource: Resource::PortRange { base, size },
-                            reason: InvalidResourceReason::ZeroSized,
-                        });
-                    }
-                    let end = (base as u32).wrapping_add(size as u32);
-                    if end > (u16::MAX as u32 + 1) {
-                        return Err(RegistryError::InvalidResource {
-                            resource: Resource::PortRange { base, size },
-                            reason: InvalidResourceReason::AddressOverflow,
-                        });
-                    }
-
-                    // Key collision.
-                    if let Some(existing) = self.port_index.get(&base) {
-                        let existing_size = existing.size as u16;
-                        let existing_slot = existing.slot;
-                        self.rollback_resources(&resources[..i]);
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::PortRange { base, size },
-                            existing: Resource::PortRange {
-                                base,
-                                size: existing_size,
-                            },
-                            existing_device: DeviceId::new(existing_slot as u32),
-                        });
-                    }
-
-                    self.port_index.insert(
-                        base,
-                        RangeEntry {
-                            slot: idx,
-                            size: size as u64,
-                        },
-                    );
-
-                    // Predecessor check.
-                    if let Some((prev_base, existing)) = self.port_index.range(..base).next_back()
-                        && (*prev_base as u32).wrapping_add(existing.size as u32) > base as u32
-                    {
-                        let conflicting_base = *prev_base;
-                        let conflicting_size = existing.size as u16;
-                        let conflicting_slot = existing.slot;
-                        self.rollback_resources(&resources[..=i]);
-                        if conflicting_slot == idx {
-                            return Err(RegistryError::InvalidResource {
-                                resource: Resource::PortRange { base, size },
-                                reason: InvalidResourceReason::OverlappingResources,
-                            });
-                        }
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::PortRange { base, size },
-                            existing: Resource::PortRange {
-                                base: conflicting_base,
-                                size: conflicting_size,
-                            },
-                            existing_device: DeviceId::new(conflicting_slot as u32),
-                        });
-                    }
-
-                    // Successor check.
-                    if let Some(next_port) = base.checked_add(1)
-                        && let Some((next_base, existing)) =
-                            self.port_index.range(next_port..).next()
-                        && (*next_base as u32) < end
-                    {
-                        let conflicting_base = *next_base;
-                        let conflicting_size = existing.size as u16;
-                        let conflicting_slot = existing.slot;
-                        self.rollback_resources(&resources[..=i]);
-                        if conflicting_slot == idx {
-                            return Err(RegistryError::InvalidResource {
-                                resource: Resource::PortRange { base, size },
-                                reason: InvalidResourceReason::OverlappingResources,
-                            });
-                        }
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::PortRange { base, size },
-                            existing: Resource::PortRange {
-                                base: conflicting_base,
-                                size: conflicting_size,
-                            },
-                            existing_device: DeviceId::new(conflicting_slot as u32),
-                        });
-                    }
+                    self.validate_port_range(base, size, earlier_resources)?;
                 }
                 Resource::SysReg { addr, count } => {
-                    if count == 0 {
+                    self.validate_sysreg_range(addr, count, earlier_resources)?;
+                }
+                Resource::IrqLine { line, trigger } => {
+                    if earlier_resources.iter().any(
+                        |resource| matches!(resource, Resource::IrqLine { line: earlier, .. } if *earlier == line),
+                    ) {
                         return Err(RegistryError::InvalidResource {
-                            resource: Resource::SysReg { addr, count },
-                            reason: InvalidResourceReason::ZeroSized,
-                        });
-                    }
-                    if addr.checked_add(count.saturating_sub(1)).is_none() {
-                        return Err(RegistryError::InvalidResource {
-                            resource: Resource::SysReg { addr, count },
-                            reason: InvalidResourceReason::AddressOverflow,
-                        });
-                    }
-
-                    // Key collision.
-                    if let Some(existing) = self.sysreg_index.get(&addr) {
-                        let existing_count = existing.size as u32;
-                        let existing_slot = existing.slot;
-                        self.rollback_resources(&resources[..i]);
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::SysReg { addr, count },
-                            existing: Resource::SysReg {
-                                addr,
-                                count: existing_count,
-                            },
-                            existing_device: DeviceId::new(existing_slot as u32),
-                        });
-                    }
-
-                    let end = addr.saturating_add(count.saturating_sub(1));
-                    self.sysreg_index.insert(
-                        addr,
-                        RangeEntry {
-                            slot: idx,
-                            size: count as u64,
-                        },
-                    );
-
-                    // Predecessor check.
-                    if let Some((prev_addr, existing)) = self.sysreg_index.range(..addr).next_back()
-                        && prev_addr.saturating_add((existing.size as u32).saturating_sub(1))
-                            >= addr
-                    {
-                        let conflicting_addr = *prev_addr;
-                        let conflicting_count = existing.size as u32;
-                        let conflicting_slot = existing.slot;
-                        self.rollback_resources(&resources[..=i]);
-                        if conflicting_slot == idx {
-                            return Err(RegistryError::InvalidResource {
-                                resource: Resource::SysReg { addr, count },
-                                reason: InvalidResourceReason::OverlappingResources,
-                            });
-                        }
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::SysReg { addr, count },
-                            existing: Resource::SysReg {
-                                addr: conflicting_addr,
-                                count: conflicting_count,
-                            },
-                            existing_device: DeviceId::new(conflicting_slot as u32),
-                        });
-                    }
-
-                    // Successor check.
-                    if let Some(next_addr) = addr.checked_add(1)
-                        && let Some((reg_addr, existing)) =
-                            self.sysreg_index.range(next_addr..).next()
-                        && *reg_addr <= end
-                    {
-                        let conflicting_addr = *reg_addr;
-                        let conflicting_count = existing.size as u32;
-                        let conflicting_slot = existing.slot;
-                        self.rollback_resources(&resources[..=i]);
-                        if conflicting_slot == idx {
-                            return Err(RegistryError::InvalidResource {
-                                resource: Resource::SysReg { addr, count },
-                                reason: InvalidResourceReason::OverlappingResources,
-                            });
-                        }
-                        return Err(RegistryError::AddressConflict {
-                            resource: Resource::SysReg { addr, count },
-                            existing: Resource::SysReg {
-                                addr: conflicting_addr,
-                                count: conflicting_count,
-                            },
-                            existing_device: DeviceId::new(conflicting_slot as u32),
+                            resource: Resource::IrqLine { line, trigger },
+                            reason: InvalidResourceReason::DuplicateIrqLine { line },
                         });
                     }
                 }
@@ -884,16 +859,239 @@ impl AxVmDevices {
         Ok(())
     }
 
-    // ─── Lookup helpers ────────────────────────────────────────────
-
-    fn lookup_mmio(&self, addr: u64) -> Option<usize> {
-        let (&base, entry) = self.mmio_index.range(..=addr).next_back()?;
-        (addr < base.wrapping_add(entry.size)).then_some(entry.slot)
+    fn validate_mmio_range(
+        &self,
+        base: u64,
+        size: u64,
+        earlier_resources: &[Resource],
+    ) -> Result<(), RegistryError> {
+        let resource = Resource::MmioRange { base, size };
+        if size == 0 {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::ZeroSized,
+            });
+        }
+        let Some(end) = base.checked_add(size) else {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::AddressOverflow,
+            });
+        };
+        if earlier_resources.iter().any(|earlier| {
+            matches!(
+                *earlier,
+                Resource::MmioRange {
+                    base: earlier_base,
+                    size: earlier_size,
+                } if ranges_overlap(
+                    base,
+                    end,
+                    earlier_base,
+                    earlier_base.saturating_add(earlier_size),
+                )
+            )
+        }) {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::OverlappingResources,
+            });
+        }
+        if let Some((existing_base, existing)) = self.mmio_conflict(base, end) {
+            return Err(RegistryError::AddressConflict {
+                resource,
+                existing: Resource::MmioRange {
+                    base: existing_base,
+                    size: existing.size,
+                },
+                existing_device: DeviceId::new(existing.slot as u32),
+            });
+        }
+        Ok(())
     }
 
-    fn lookup_port(&self, addr: u16) -> Option<usize> {
+    fn validate_port_range(
+        &self,
+        base: u16,
+        size: u16,
+        earlier_resources: &[Resource],
+    ) -> Result<(), RegistryError> {
+        let resource = Resource::PortRange { base, size };
+        if size == 0 {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::ZeroSized,
+            });
+        }
+        let end = base as u64 + size as u64;
+        if end > u16::MAX as u64 + 1 {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::AddressOverflow,
+            });
+        }
+        if earlier_resources.iter().any(|earlier| {
+            matches!(
+                *earlier,
+                Resource::PortRange {
+                    base: earlier_base,
+                    size: earlier_size,
+                } if ranges_overlap(
+                    base as u64,
+                    end,
+                    earlier_base as u64,
+                    earlier_base as u64 + earlier_size as u64,
+                )
+            )
+        }) {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::OverlappingResources,
+            });
+        }
+        if let Some((existing_base, existing)) = self.port_conflict(base, end) {
+            return Err(RegistryError::AddressConflict {
+                resource,
+                existing: Resource::PortRange {
+                    base: existing_base,
+                    size: existing.size as u16,
+                },
+                existing_device: DeviceId::new(existing.slot as u32),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_sysreg_range(
+        &self,
+        addr: u32,
+        count: u32,
+        earlier_resources: &[Resource],
+    ) -> Result<(), RegistryError> {
+        let resource = Resource::SysReg { addr, count };
+        if count == 0 {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::ZeroSized,
+            });
+        }
+        let end = addr as u64 + count as u64;
+        if end > u32::MAX as u64 + 1 {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::AddressOverflow,
+            });
+        }
+        if earlier_resources.iter().any(|earlier| {
+            matches!(
+                *earlier,
+                Resource::SysReg {
+                    addr: earlier_addr,
+                    count: earlier_count,
+                } if ranges_overlap(
+                    addr as u64,
+                    end,
+                    earlier_addr as u64,
+                    earlier_addr as u64 + earlier_count as u64,
+                )
+            )
+        }) {
+            return Err(RegistryError::InvalidResource {
+                resource,
+                reason: InvalidResourceReason::OverlappingResources,
+            });
+        }
+        if let Some((existing_addr, existing)) = self.sysreg_conflict(addr, end) {
+            return Err(RegistryError::AddressConflict {
+                resource,
+                existing: Resource::SysReg {
+                    addr: existing_addr,
+                    count: existing.size as u32,
+                },
+                existing_device: DeviceId::new(existing.slot as u32),
+            });
+        }
+        Ok(())
+    }
+
+    fn mmio_conflict(&self, base: u64, end: u64) -> Option<(u64, &RangeEntry)> {
+        if let Some((&existing_base, existing)) = self.mmio_index.range(..=base).next_back()
+            && base < existing_base.saturating_add(existing.size)
+        {
+            return Some((existing_base, existing));
+        }
+        self.mmio_index
+            .range(base..)
+            .next()
+            .filter(|(existing_base, _)| **existing_base < end)
+            .map(|(&existing_base, existing)| (existing_base, existing))
+    }
+
+    fn port_conflict(&self, base: u16, end: u64) -> Option<(u16, &RangeEntry)> {
+        if let Some((&existing_base, existing)) = self.port_index.range(..=base).next_back()
+            && (base as u64) < existing_base as u64 + existing.size
+        {
+            return Some((existing_base, existing));
+        }
+        self.port_index
+            .range(base..)
+            .next()
+            .filter(|(existing_base, _)| (**existing_base as u64) < end)
+            .map(|(&existing_base, existing)| (existing_base, existing))
+    }
+
+    fn sysreg_conflict(&self, addr: u32, end: u64) -> Option<(u32, &RangeEntry)> {
+        if let Some((&existing_addr, existing)) = self.sysreg_index.range(..=addr).next_back()
+            && (addr as u64) < existing_addr as u64 + existing.size
+        {
+            return Some((existing_addr, existing));
+        }
+        self.sysreg_index
+            .range(addr..)
+            .next()
+            .filter(|(existing_addr, _)| (**existing_addr as u64) < end)
+            .map(|(&existing_addr, existing)| (existing_addr, existing))
+    }
+
+    fn insert_resources(&mut self, idx: usize, resources: &[Resource]) {
+        for resource in resources {
+            match *resource {
+                Resource::MmioRange { base, size } => {
+                    self.mmio_index.insert(base, RangeEntry { slot: idx, size });
+                }
+                Resource::PortRange { base, size } => {
+                    self.port_index.insert(
+                        base,
+                        RangeEntry {
+                            slot: idx,
+                            size: size as u64,
+                        },
+                    );
+                }
+                Resource::SysReg { addr, count } => {
+                    self.sysreg_index.insert(
+                        addr,
+                        RangeEntry {
+                            slot: idx,
+                            size: count as u64,
+                        },
+                    );
+                }
+                Resource::IrqLine { .. } => {}
+            }
+        }
+    }
+
+    // ─── Lookup helpers ────────────────────────────────────────────
+
+    fn lookup_mmio(&self, addr: u64, width: AccessWidth) -> Option<usize> {
+        let (&base, entry) = self.mmio_index.range(..=addr).next_back()?;
+        range_contains_access(base, entry.size, addr, width).then_some(entry.slot)
+    }
+
+    fn lookup_port(&self, addr: u16, width: AccessWidth) -> Option<usize> {
         let (&base, entry) = self.port_index.range(..=addr).next_back()?;
-        ((addr as u64) < (base as u64).wrapping_add(entry.size)).then_some(entry.slot)
+        range_contains_access(base as u64, entry.size, addr as u64, width).then_some(entry.slot)
     }
 
     fn lookup_sysreg(&self, addr: u32) -> Option<usize> {
@@ -914,268 +1112,214 @@ impl AxVmDevices {
         self.devices.len()
     }
 
+    /// Returns the guest-memory grant registered for a device in host tests.
+    #[cfg(feature = "host-test")]
+    pub fn dma_grant_for_test(&self, device_id: DeviceId) -> Option<DmaGrant> {
+        self.dma_grants
+            .iter()
+            .find(|(registered_id, _)| *registered_id == device_id)
+            .map(|(_, grant)| grant.clone())
+    }
+
     // ─── Iterator helpers ───────────────────────────────────────────
     //
-    // NOTE: With the unified Device trait, [`devices()`] is the
-    // canonical iterator.  Use [`Device::resources()`] or
-    // [`Device::as_any()`] for per-bus filtering in new code.
+    // NOTE: With the unified Device trait, [`devices()`] is the canonical
+    // iterator. Use [`Device::resources()`] or typed service registries for
+    // per-bus filtering in new code.
 
     /// Iterates over devices that require periodic polling.
     pub fn iter_pollable_dev(&self) -> impl Iterator<Item = &Arc<dyn PollableDeviceOps>> {
         self.pollable_devices.iter()
     }
 
-    // ─── x86 IOAPIC / PIT / Serial ──────────────────────────────────
-    #[cfg(target_arch = "x86_64")]
-    pub fn x86_ioapic_vector_for_gsi(&self, gsi: usize) -> Option<u8> {
-        self.x86_ioapic
-            .as_ref()
-            .and_then(|ioapic| ioapic.vector_for_gsi(gsi))
-    }
-
-    /// Assert an x86 IOAPIC GSI and return the interrupt to inject.
-    #[cfg(target_arch = "x86_64")]
-    pub fn x86_ioapic_assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt> {
-        self.x86_ioapic
-            .as_ref()
-            .and_then(|ioapic| ioapic.assert_gsi(gsi))
-    }
-
-    /// Broadcast an x86 local APIC EOI to the virtual IOAPIC.
-    #[cfg(target_arch = "x86_64")]
-    pub fn x86_ioapic_end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi> {
-        self.x86_ioapic
-            .as_ref()
-            .and_then(|ioapic| ioapic.end_of_interrupt(vector))
-    }
-
-    /// Consume a pending x86 PIT channel 0 timer tick if the deadline is due.
-    #[cfg(target_arch = "x86_64")]
-    pub fn x86_pit_consume_irq0_if_due(&self, now_ns: u64) -> bool {
-        self.x86_pit
-            .as_ref()
-            .is_some_and(|pit| pit.consume_irq0_if_due(now_ns))
-    }
-
-    /// Poll x86 COM1 and return whether it has a pending RX interrupt.
-    #[cfg(target_arch = "x86_64")]
-    pub fn x86_serial_poll_irq(&self) -> bool {
-        self.x86_serial
-            .as_ref()
-            .is_some_and(|serial| serial.poll_irq())
-    }
-
-    /// Add a QEMU fw_cfg MMIO device to the device list.
-    pub fn add_fw_cfg_dev(&mut self, dev: Arc<FwCfg>) -> AxResult {
-        self.register(
-            MmioDeviceAdapter::from_arc(dev.clone()) as Arc<dyn Device + Send + Sync + 'static>
-        )
-        .map_err(|e| ax_err_type!(InvalidInput, format!("register fw_cfg: {e:?}")))?;
-        self.fw_cfg = Some(dev);
-        Ok(())
-    }
-
-    /// Returns the fw_cfg device that owns `addr`, if any.
-    pub fn fw_cfg_for_dma_addr(&self, addr: GuestPhysAddr) -> Option<Arc<FwCfg>> {
-        self.fw_cfg
-            .as_ref()
-            .filter(|fw_cfg| fw_cfg.is_dma_address(addr))
-            .cloned()
-    }
-
-    /// Assert a LoongArch PCH-PIC input and return the routed EIOINTC vector.
-    #[cfg(target_arch = "loongarch64")]
-    pub fn loongarch_pch_pic_assert_irq(&self, irq: usize) -> Option<Option<usize>> {
-        self.loongarch_pch_pic
-            .as_ref()
-            .map(|pch_pic| pch_pic.set_irq_level(irq, true))
-    }
-
-    /// Drains LoongArch PCH-PIC output-line events generated by MMIO writes.
-    #[cfg(target_arch = "loongarch64")]
-    pub fn drain_loongarch_pch_pic_events(&self, f: impl FnMut(PchPicOutputEvent)) {
-        if let Some(pch_pic) = &self.loongarch_pch_pic {
-            pch_pic.drain_output_events(f);
-        }
-    }
-
-    // ─── Find helpers ───────────────────────────────────────────────
-
-    /// Find specific MMIO device by ipa.
-    /// Returns a reference to the underlying adapter which can be downcast
-    /// via `as_any()`.
-    pub fn find_mmio_dev(&self, ipa: GuestPhysAddr) -> Option<Arc<dyn Device>> {
-        let access = BusAccess {
-            kind: BusKind::Mmio,
-            is_read: true,
-            addr: ipa.as_usize() as u64,
-            width: AccessWidth::Dword,
-            data: 0,
-        };
-        self.lookup(&access).ok()
-    }
-
-    /// Find specific system register device by address.
-    pub fn find_sys_reg_dev(&self, sys_reg_addr: SysRegAddr) -> Option<Arc<dyn Device>> {
-        let access = BusAccess {
-            kind: BusKind::SysReg,
-            is_read: true,
-            addr: sys_reg_addr.0 as u64,
-            width: AccessWidth::Qword,
-            data: 0,
-        };
-        self.lookup(&access).ok()
-    }
-
-    /// Find specific port device by port number.
-    pub fn find_port_dev(&self, port: Port) -> Option<Arc<dyn Device>> {
-        let access = BusAccess {
-            kind: BusKind::Port,
-            is_read: true,
-            addr: port.0 as u64,
-            width: AccessWidth::Byte,
-            data: 0,
-        };
-        self.lookup(&access).ok()
-    }
-
-    // ─── Hot-path dispatch handlers ─────────────────────────────────
-
-    /// Handle the MMIO read by GuestPhysAddr and data width.
-    pub fn handle_mmio_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
-        let access = BusAccess {
-            kind: BusKind::Mmio,
-            is_read: true,
-            addr: addr.as_usize() as u64,
-            width,
-            data: 0,
-        };
-        match self.dispatch(&access) {
-            Ok(BusResponse::Read { value }) => Ok(value as usize),
-            Ok(BusResponse::Write) => {
-                Err(ax_err_type!(BadState, "expected read response, got write"))
-            }
-            Err(err) => {
-                error!("emu_device mmio read failed: {err:?} at {addr:#x} width {width:?}");
-                Err(ax_err_type!(BadState, format!("mmio read: {err:?}")))
-            }
-        }
-    }
-
-    /// Handle the MMIO write by GuestPhysAddr, data width and the value need to write.
-    pub fn handle_mmio_write(
+    /// Polls asynchronous DMA devices with a guest-memory port scoped to each
+    /// individual callback.
+    pub fn poll_dma_devices(
         &self,
-        addr: GuestPhysAddr,
-        width: AccessWidth,
-        val: usize,
-    ) -> AxResult {
-        let access = BusAccess {
-            kind: BusKind::Mmio,
-            is_read: false,
-            addr: addr.as_usize() as u64,
-            width,
-            data: val as u64,
-        };
-        if let Err(err) = self.dispatch(&access) {
-            error!("emu_device mmio write failed: {err:?} at {addr:#x} width {width:?}");
-            return Err(ax_err_type!(BadState, format!("mmio write: {err:?}")));
-        }
-        Ok(())
-    }
-
-    /// Handle the system register read by SysRegAddr and data width.
-    pub fn handle_sys_reg_read(&self, addr: SysRegAddr, width: AccessWidth) -> AxResult<usize> {
-        let access = BusAccess {
-            kind: BusKind::SysReg,
-            is_read: true,
-            addr: addr.0 as u64,
-            width,
-            data: 0,
-        };
-        match self.dispatch(&access) {
-            Ok(BusResponse::Read { value }) => Ok(value as usize),
-            Ok(BusResponse::Write) => {
-                Err(ax_err_type!(BadState, "expected read response, got write"))
-            }
-            Err(err) => {
-                error!(
-                    "emu_device sys_reg read failed: {err:?} at {:#x} width {width:?}",
-                    addr.0
-                );
-                Err(ax_err_type!(BadState, format!("sysreg read: {err:?}")))
-            }
+        now_ns: u64,
+        memory: &mut dyn GuestMemoryAccess,
+        mut observe: impl FnMut(DeviceManagerResult),
+    ) {
+        for registered in &self.dma_pollable_devices {
+            let mut poll = || {
+                let mut context = RuntimeDeviceContext {
+                    device_id: registered.device_id,
+                    routed_context: RoutedContextKind::Root,
+                    memory: Some(&mut *memory),
+                    dma_grants: &self.dma_grants,
+                    timer_grants: &self.timer_grants,
+                    wake_grants: &self.wake_grants,
+                    stop_grants: &self.stop_grants,
+                    routed_grants: &self.routed_grants,
+                    access_ports: &self.access_ports,
+                };
+                registered
+                    .pollable
+                    .poll_dma(now_ns, &mut context, &registered.grant)
+            };
+            let result = match &registered.pci_binding {
+                Some(binding) => binding.with_endpoint_irq_permit(registered.device_id, &mut poll),
+                None => poll(),
+            };
+            observe(result);
         }
     }
 
-    /// Handle the system register write by SysRegAddr, data width and the value need to write.
-    pub fn handle_sys_reg_write(
+    /// Returns VM-local typed device services.
+    pub const fn services(&self) -> &DeviceServices {
+        &self.services
+    }
+
+    /// Returns a registered wired interrupt-controller capability.
+    pub fn interrupt_controller(
         &self,
-        addr: SysRegAddr,
-        width: AccessWidth,
-        val: usize,
-    ) -> AxResult {
-        let access = BusAccess {
-            kind: BusKind::SysReg,
-            is_read: false,
-            addr: addr.0 as u64,
-            width,
-            data: val as u64,
-        };
-        if let Err(err) = self.dispatch(&access) {
-            error!(
-                "emu_device sys_reg write failed: {err:?} at {:#x} width {width:?}",
-                addr.0
-            );
-            return Err(ax_err_type!(BadState, format!("sysreg write: {err:?}")));
+        id: axdevice_base::InterruptControllerId,
+    ) -> DeviceManagerResult<Arc<dyn axdevice_base::VirtualInterruptController>> {
+        self.planned.interrupts.wired_controller(id)
+    }
+
+    /// Returns a registered message interrupt-controller capability.
+    pub fn message_interrupt_controller(
+        &self,
+        id: axdevice_base::InterruptControllerId,
+    ) -> DeviceManagerResult<Arc<dyn axdevice_base::MessageInterruptController>> {
+        self.planned.interrupts.message_controller(id)
+    }
+
+    /// Resets lifecycle-capable devices in registration order.
+    pub fn reset_lifecycle_devices(&self) -> DeviceManagerResult {
+        for lifecycle in &self.lifecycle_devices {
+            lifecycle.reset()?;
         }
         Ok(())
     }
 
-    /// Handle the port read by port number and data width.
-    pub fn handle_port_read(&self, port: Port, width: AccessWidth) -> AxResult<usize> {
-        let access = BusAccess {
-            kind: BusKind::Port,
-            is_read: true,
-            addr: port.0 as u64,
-            width,
-            data: 0,
+    /// Suspends lifecycle-capable devices in reverse registration order.
+    pub fn suspend_lifecycle_devices(&self) -> DeviceManagerResult {
+        for lifecycle in self.lifecycle_devices.iter().rev() {
+            lifecycle.suspend()?;
+        }
+        Ok(())
+    }
+
+    /// Resumes lifecycle-capable devices in registration order.
+    pub fn resume_lifecycle_devices(&self) -> DeviceManagerResult {
+        for lifecycle in &self.lifecycle_devices {
+            lifecycle.resume()?;
+        }
+        Ok(())
+    }
+
+    // ─── Hot-path dispatch ──────────────────────────────────────────
+
+    /// Reads from the device selected by `access`.
+    ///
+    /// A missing mapping is returned as `None`, allowing architecture fault
+    /// handlers to continue with their non-device policy without a second
+    /// interval lookup.
+    pub fn try_read(&self, access: &DeviceAccess) -> DeviceManagerResult<Option<u64>> {
+        let Some(index) = self
+            .lookup_access(access)
+            .map_err(|source| access_error("read", access, source))?
+        else {
+            return Ok(None);
         };
-        match self.dispatch(&access) {
-            Ok(BusResponse::Read { value }) => Ok(value as usize),
-            Ok(BusResponse::Write) => {
-                Err(ax_err_type!(BadState, "expected read response, got write"))
+        let mut context = self.context_for(index, None);
+        self.devices[index]
+            .read(access, &mut context)
+            .map(Some)
+            .map_err(|source| access_error("read", access, source))
+    }
+
+    /// Writes to the device selected by `access`.
+    ///
+    /// `memory` is an optional VM-owned guest-memory port. Devices still need
+    /// their matching [`DmaGrant`] before the context delegates to this port.
+    pub fn try_write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        memory: Option<&mut dyn GuestMemoryAccess>,
+    ) -> DeviceManagerResult<bool> {
+        let Some(index) = self
+            .lookup_access(access)
+            .map_err(|source| access_error("write", access, source))?
+        else {
+            return Ok(false);
+        };
+        let mut context = self.context_for(index, memory);
+        self.devices[index]
+            .write(access, value, &mut context)
+            .map(|()| true)
+            .map_err(|source| access_error("write", access, source))
+    }
+
+    fn lookup_access(&self, access: &DeviceAccess) -> DeviceResult<Option<usize>> {
+        match access.bus() {
+            BusKind::Mmio => Ok(self.lookup_mmio(access.address(), access.width())),
+            BusKind::Port => {
+                let port =
+                    u16::try_from(access.address()).map_err(|_| DeviceError::OutOfRange {
+                        addr: access.address(),
+                    })?;
+                Ok(self.lookup_port(port, access.width()))
             }
-            Err(err) => {
-                error!(
-                    "emu_device port read failed: {err:?} at {:#x} width {width:?}",
-                    port.0
-                );
-                Err(ax_err_type!(BadState, format!("port read: {err:?}")))
+            BusKind::SysReg => {
+                let register =
+                    u32::try_from(access.address()).map_err(|_| DeviceError::OutOfRange {
+                        addr: access.address(),
+                    })?;
+                Ok(self.lookup_sysreg(register))
             }
         }
     }
 
-    /// Handle the port write by port number, data width and the value need to write.
-    pub fn handle_port_write(&self, port: Port, width: AccessWidth, val: usize) -> AxResult {
-        let access = BusAccess {
-            kind: BusKind::Port,
-            is_read: false,
-            addr: port.0 as u64,
-            width,
-            data: val as u64,
-        };
-        if let Err(err) = self.dispatch(&access) {
-            error!(
-                "emu_device port write failed: {err:?} at {:#x} width {width:?}",
-                port.0
-            );
-            return Err(ax_err_type!(BadState, format!("port write: {err:?}")));
+    fn context_for<'runtime, 'memory>(
+        &'runtime self,
+        index: usize,
+        memory: Option<&'memory mut dyn GuestMemoryAccess>,
+    ) -> RuntimeDeviceContext<'runtime, 'memory> {
+        RuntimeDeviceContext {
+            device_id: DeviceId::new(index as u32),
+            routed_context: RoutedContextKind::Root,
+            memory,
+            dma_grants: &self.dma_grants,
+            timer_grants: &self.timer_grants,
+            wake_grants: &self.wake_grants,
+            stop_grants: &self.stop_grants,
+            routed_grants: &self.routed_grants,
+            access_ports: &self.access_ports,
         }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_routed_grant_for_test<T>(
+        &mut self,
+        index: usize,
+        grant: RoutedDeviceGrant,
+        callback: impl FnOnce(&mut dyn DeviceContext) -> T,
+    ) -> T {
+        self.routed_grants.push(grant);
+        let mut context = self.context_for(index, None);
+        callback(&mut context)
     }
 }
 
-impl Default for AxVmDevices {
+fn access_error(
+    operation: &'static str,
+    access: &DeviceAccess,
+    source: DeviceError,
+) -> DeviceManagerError {
+    DeviceManagerError::Access {
+        operation,
+        bus: access.bus(),
+        addr: access.address(),
+        width: access.width(),
+        source,
+    }
+}
+
+impl Default for DeviceRuntime {
     fn default() -> Self {
         Self::empty()
     }
@@ -1185,74 +1329,431 @@ impl Default for AxVmDevices {
 // Trait implementations
 // ---------------------------------------------------------------------------
 
-impl DeviceRegistry for AxVmDevices {
+impl DeviceRegistry for DeviceRuntime {
     fn register(&mut self, device: Arc<dyn Device>) -> Result<DeviceId, RegistryError> {
+        if self.sealed {
+            return Err(RegistryError::InvalidState {
+                operation: "register device",
+                detail: "device runtime topology is sealed".into(),
+            });
+        }
         let idx = self.devices.len();
-        self.insert_resources(idx, device.resources())?;
+        self.validate_resources(device.resources())?;
+        self.insert_resources(idx, device.resources());
         self.devices.push(device);
-        info!("AxVmDevices: registered device id={}", idx);
+        info!("DeviceRuntime: registered device id={}", idx);
         Ok(DeviceId::new(idx as u32))
-    }
-}
-
-impl BusRouter for AxVmDevices {
-    fn dispatch(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-        let idx = match access.kind {
-            BusKind::Mmio => self.lookup_mmio(access.addr),
-            BusKind::Port => {
-                let port = u16::try_from(access.addr)
-                    .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
-                self.lookup_port(port)
-            }
-            BusKind::SysReg => {
-                let reg = u32::try_from(access.addr)
-                    .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
-                self.lookup_sysreg(reg)
-            }
-        }
-        .ok_or(DeviceError::NotFound)?;
-
-        let device = &self.devices[idx];
-        device.handle(access)
-    }
-
-    fn lookup(&self, access: &BusAccess) -> Result<Arc<dyn Device>, DeviceError> {
-        let idx = match access.kind {
-            BusKind::Mmio => self.lookup_mmio(access.addr),
-            BusKind::Port => {
-                let port = u16::try_from(access.addr)
-                    .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
-                self.lookup_port(port)
-            }
-            BusKind::SysReg => {
-                let reg = u32::try_from(access.addr)
-                    .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
-                self.lookup_sysreg(reg)
-            }
-        }
-        .ok_or(DeviceError::NotFound)?;
-
-        Ok(Arc::clone(&self.devices[idx]))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use core::any::Any;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use axdevice_base::{
-        AccessWidth, BusAccess, BusKind, BusResponse, BusRouter, Device, DeviceError,
-        DeviceRegistry, InvalidResourceReason, Port, RegistryError, Resource, SysRegAddr,
+        AccessWidth, BusKind, Device, DeviceAccess, DeviceContext, DeviceError, DeviceId,
+        DeviceRegistry, DeviceResult, DeviceVcpuId, DmaGrant, GuestMemoryAccess,
+        InvalidResourceReason, NoopDeviceContext, RegistryError, Resource, RoutedAdmissionEpoch,
+        RoutedBindingGeneration, RoutedDeviceGrant, StopGrant, TimerGrant, WakeGrant,
     };
     use axvm_types::GuestPhysAddr;
 
-    use super::AxVmDevices;
+    use super::{
+        DeviceRuntime, RuntimeAccessPorts, StopAccessPort, TimerAccessPort, WakeAccessPort,
+    };
+    use crate::{
+        ConfigOffset, DeviceBundle, DeviceLifecycle, DeviceManagerError, DeviceManagerResult,
+        DeviceNodeId, DeviceRegistration, DmaPollableDeviceOps, PciBarIndex, PciClass,
+        PciEndpointContext, PciEndpointIdentity, PciFunction, PciMemoryBar, PciRootBinding,
+        PciRootState, PciTopologyBuilder, ServiceCardinality, ServiceKey,
+    };
 
     struct D {
         resources: alloc::vec::Vec<Resource>,
         n: &'static str,
     }
+
+    struct TestMemory {
+        reads: usize,
+        writes: usize,
+    }
+
+    impl GuestMemoryAccess for TestMemory {
+        fn read(&mut self, _addr: GuestPhysAddr, data: &mut [u8]) -> DeviceResult {
+            self.reads += 1;
+            data.fill(0x5a);
+            Ok(())
+        }
+
+        fn write(&mut self, _addr: GuestPhysAddr, _data: &[u8]) -> DeviceResult {
+            self.writes += 1;
+            Ok(())
+        }
+    }
+
+    struct RoutedDmaEndpoint {
+        grant: DmaGrant,
+        expected_device: DeviceId,
+        writes: AtomicUsize,
+    }
+
+    impl Device for RoutedDmaEndpoint {
+        fn name(&self) -> &str {
+            "routed-dma-endpoint"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &[]
+        }
+
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            Ok(0)
+        }
+
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    impl PciFunction for RoutedDmaEndpoint {
+        fn reset(&self, _command: crate::PciCommandState) -> DeviceResult {
+            Ok(())
+        }
+
+        fn read_bar(
+            &self,
+            _access: crate::PciBarAccess,
+            _context: &mut dyn PciEndpointContext,
+        ) -> DeviceResult<u64> {
+            Ok(0)
+        }
+
+        fn write_bar(
+            &self,
+            _access: crate::PciBarAccess,
+            _value: u64,
+            context: &mut dyn PciEndpointContext,
+        ) -> DeviceResult {
+            assert_eq!(context.device_id(), self.expected_device);
+            let mut input = [0u8; 1];
+            context.read_guest_memory(
+                &self.grant,
+                GuestPhysAddr::from_usize(0x1000),
+                &mut input,
+            )?;
+            context.write_guest_memory(&self.grant, GuestPhysAddr::from_usize(0x2000), &input)?;
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn routed_context_rechecks_target_grants_and_preserves_memory_lifetime() {
+        let mut runtime = DeviceRuntime::empty();
+        let target = DeviceId::new(7);
+        let dma = DmaGrant::new();
+        let routed = RoutedDeviceGrant::new(
+            target,
+            RoutedBindingGeneration::new(1),
+            RoutedAdmissionEpoch::new(1),
+            true,
+        );
+        runtime.routed_grants.push(routed.clone());
+        runtime.dma_grants.push((target, dma.clone()));
+        let mut memory = TestMemory {
+            reads: 0,
+            writes: 0,
+        };
+        let mut context = runtime.context_for(0, Some(&mut memory));
+        let mut bytes = [0; 2];
+        let mut callback = |nested: &mut dyn DeviceContext| {
+            let mut nested_callback = |_next: &mut dyn DeviceContext| Ok(());
+            assert!(matches!(
+                nested.with_routed_device(&routed, &mut nested_callback),
+                Err(DeviceError::Unsupported { .. })
+            ));
+            nested.read_guest_memory(&dma, GuestPhysAddr::from_usize(0x1000), &mut bytes)
+        };
+        context.with_routed_device(&routed, &mut callback).unwrap();
+        assert_eq!(bytes, [0x5a; 2]);
+        assert_eq!(memory.reads, 1);
+    }
+
+    #[test]
+    fn routed_context_keeps_an_admitted_grant_alive_until_scope_drop() {
+        let mut runtime = DeviceRuntime::empty();
+        let target = DeviceId::new(7);
+        let ordinary = RoutedDeviceGrant::new(
+            target,
+            RoutedBindingGeneration::new(1),
+            RoutedAdmissionEpoch::new(1),
+            true,
+        );
+        runtime.routed_grants.push(ordinary.clone());
+        let (admitted, scope) = ordinary
+            .clone()
+            .admit()
+            .expect("open ordinary grant can be admitted");
+        let retained = admitted.clone();
+        ordinary.close_admission();
+        assert!(ordinary.clone().admit().is_none());
+        let dma_disabled = admitted.with_dma_enabled(false);
+        let next_epoch = admitted.with_admission_epoch(RoutedAdmissionEpoch::new(2));
+        assert!(!dma_disabled.dma_enabled());
+        assert!(dma_disabled.admission_is_open());
+        assert!(!next_epoch.admission_is_open());
+
+        let mut context = runtime.context_for(0, None);
+        let mut callback = |_nested: &mut dyn DeviceContext| Ok(());
+        context
+            .with_routed_device(&admitted, &mut callback)
+            .expect("an already admitted callback survives global close");
+        assert!(matches!(
+            context.with_routed_device(&ordinary, &mut callback),
+            Err(DeviceError::Unsupported { .. })
+        ));
+
+        drop(scope);
+        assert!(matches!(
+            context.with_routed_device(&retained, &mut callback),
+            Err(DeviceError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn routed_context_denies_dma_when_the_root_bme_snapshot_is_clear() {
+        let mut runtime = DeviceRuntime::empty();
+        let target = DeviceId::new(7);
+        let dma = DmaGrant::new();
+        let routed = RoutedDeviceGrant::new(
+            target,
+            RoutedBindingGeneration::new(1),
+            RoutedAdmissionEpoch::new(1),
+            false,
+        );
+        runtime.routed_grants.push(routed.clone());
+        runtime.dma_grants.push((DeviceId::new(0), dma.clone()));
+        runtime.dma_grants.push((target, dma.clone()));
+        let mut memory = TestMemory {
+            reads: 0,
+            writes: 0,
+        };
+        let bytes = {
+            let mut context = runtime.context_for(0, Some(&mut memory));
+            let mut bytes = [0; 2];
+            let mut callback = |nested: &mut dyn DeviceContext| {
+                nested.read_guest_memory(&dma, GuestPhysAddr::from_usize(0x1000), &mut bytes)
+            };
+            assert!(matches!(
+                context.with_routed_device(&routed, &mut callback),
+                Err(DeviceError::Unsupported { .. })
+            ));
+            // Denying DMA for the nested route must not consume the outer
+            // context's ordinary guest-memory port.
+            context
+                .read_guest_memory(&dma, GuestPhysAddr::from_usize(0x1000), &mut bytes)
+                .unwrap();
+            bytes
+        };
+        assert_eq!(bytes, [0x5a; 2]);
+        assert_eq!(memory.reads, 1);
+    }
+
+    #[test]
+    fn noop_context_explicitly_denies_routed_entry() {
+        let mut context = NoopDeviceContext::new(DeviceId::new(0));
+        let grant = RoutedDeviceGrant::new(
+            DeviceId::new(1),
+            RoutedBindingGeneration::new(1),
+            RoutedAdmissionEpoch::new(1),
+            true,
+        );
+        let mut callback = |_nested: &mut dyn DeviceContext| Ok(());
+        assert!(matches!(
+            context.with_routed_device(&grant, &mut callback),
+            Err(DeviceError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn bar_dispatch_enters_endpoint_context_with_bidirectional_dma() {
+        let function_id = DeviceNodeId::new("routed-dma-function").unwrap();
+        let function_spec = crate::PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+        )
+        .with_bar(PciMemoryBar::new(PciBarIndex::new(0).unwrap(), 0x100).unwrap())
+        .unwrap();
+        let mut topology_builder = PciTopologyBuilder::new();
+        topology_builder.add_function(function_spec).unwrap();
+        let topology = Arc::new(topology_builder.resolve(0x4000..0x8000).unwrap());
+        let function = topology.function(&function_id).unwrap();
+        let bar = function.bar(PciBarIndex::new(0).unwrap()).unwrap();
+        let bdf = function.bdf();
+        let bar_address = bar.address();
+        let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("routed-dma-host").unwrap(),
+            root.clone(),
+        ));
+        let target = DeviceId::new(7);
+        let dma = DmaGrant::new();
+        let endpoint = Arc::new(RoutedDmaEndpoint {
+            grant: dma.clone(),
+            expected_device: target,
+            writes: AtomicUsize::new(0),
+        });
+        let mut runtime = DeviceRuntime::empty();
+        runtime.dma_grants.push((target, dma));
+        let _binding_lease = binding
+            .bind_registered(
+                &function_id,
+                target,
+                endpoint.clone(),
+                &mut runtime.routed_grants,
+            )
+            .unwrap();
+
+        root.write_config(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            0x0002,
+        )
+        .unwrap();
+        let mut memory = TestMemory {
+            reads: 0,
+            writes: 0,
+        };
+        {
+            let mut context = runtime.context_for(0, Some(&mut memory));
+            assert!(matches!(
+                binding.write_bar_with_context(bar_address, AccessWidth::Byte, 0x10, &mut context,),
+                Err(DeviceError::Unsupported { .. })
+            ));
+        }
+        assert_eq!(memory.reads, 0);
+        assert_eq!(memory.writes, 0);
+
+        root.write_config(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            0x0006,
+        )
+        .unwrap();
+        {
+            let mut context = runtime.context_for(0, Some(&mut memory));
+            binding
+                .write_bar_with_context(bar_address, AccessWidth::Byte, 0x10, &mut context)
+                .unwrap();
+        }
+        assert_eq!(memory.reads, 1);
+        assert_eq!(memory.writes, 1);
+        assert_eq!(endpoint.writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reset_reopens_runtime_dispatch_with_a_fresh_epoch() {
+        let function_id = DeviceNodeId::new("reset-routed-dma-function").unwrap();
+        let function_spec = crate::PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+        )
+        .with_bar(PciMemoryBar::new(PciBarIndex::new(0).unwrap(), 0x100).unwrap())
+        .unwrap();
+        let mut topology_builder = PciTopologyBuilder::new();
+        topology_builder.add_function(function_spec).unwrap();
+        let topology = Arc::new(topology_builder.resolve(0x4000..0x8000).unwrap());
+        let function = topology.function(&function_id).unwrap();
+        let bar_address = function
+            .bar(PciBarIndex::new(0).unwrap())
+            .unwrap()
+            .address();
+        let bdf = function.bdf();
+        let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("reset-routed-dma-host").unwrap(),
+            root.clone(),
+        ));
+        let target = DeviceId::new(7);
+        let dma = DmaGrant::new();
+        let endpoint = Arc::new(RoutedDmaEndpoint {
+            grant: dma.clone(),
+            expected_device: target,
+            writes: AtomicUsize::new(0),
+        });
+        let mut runtime = DeviceRuntime::empty();
+        runtime.dma_grants.push((target, dma));
+        let _binding_lease = binding
+            .bind_registered(
+                &function_id,
+                target,
+                endpoint.clone(),
+                &mut runtime.routed_grants,
+            )
+            .unwrap();
+        let old_grant = runtime.routed_grants[0].clone();
+
+        root.write_config(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            0x0006,
+        )
+        .unwrap();
+        let mut memory = TestMemory {
+            reads: 0,
+            writes: 0,
+        };
+        {
+            let mut context = runtime.context_for(0, Some(&mut memory));
+            binding
+                .write_bar_with_context(bar_address, AccessWidth::Byte, 0x10, &mut context)
+                .unwrap();
+        }
+        assert_eq!(endpoint.writes.load(Ordering::Relaxed), 1);
+
+        binding.reset_lifecycle().unwrap();
+        assert!(!old_grant.admission_is_open());
+
+        let mut stale_context = runtime.context_for(0, Some(&mut memory));
+        let mut stale_callback = |_nested: &mut dyn DeviceContext| Ok(());
+        assert!(matches!(
+            stale_context.with_routed_device(&old_grant, &mut stale_callback),
+            Err(DeviceError::Unsupported { .. })
+        ));
+
+        // Reset restores the root command register too, so the fresh route
+        // must be exercised through the normal config and BAR dispatch path.
+        root.write_config(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            0x0006,
+        )
+        .unwrap();
+        {
+            let mut context = runtime.context_for(0, Some(&mut memory));
+            binding
+                .write_bar_with_context(bar_address, AccessWidth::Byte, 0x20, &mut context)
+                .unwrap();
+        }
+        assert_eq!(endpoint.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(memory.reads, 2);
+        assert_eq!(memory.writes, 2);
+    }
+
     impl D {
         fn new_mmio(a: u64, s: u64, n: &'static str) -> Self {
             Self {
@@ -1266,13 +1767,245 @@ mod tests {
                 n,
             }
         }
-        fn new_sysreg(addr: u32, n: &'static str) -> Self {
-            Self {
-                resources: alloc::vec![Resource::SysReg { addr, count: 1 }],
-                n,
-            }
+    }
+
+    struct AccessAwareDevice {
+        resources: alloc::vec::Vec<Resource>,
+        expected_vcpu: DeviceVcpuId,
+    }
+
+    struct GuestMemoryRequestDevice {
+        resources: alloc::vec::Vec<Resource>,
+        dma_grant: DmaGrant,
+    }
+
+    enum SensitiveGrantKind {
+        Timer,
+        Wake,
+        Stop,
+    }
+
+    struct SensitiveGrantRequestDevice {
+        resources: alloc::vec::Vec<Resource>,
+        kind: SensitiveGrantKind,
+        timer_grant: TimerGrant,
+        wake_grant: WakeGrant,
+        stop_grant: StopGrant,
+    }
+
+    struct CountingTimerPort(Arc<AtomicUsize>);
+
+    impl TimerAccessPort for CountingTimerPort {
+        fn schedule_timer(&self, _device_id: DeviceId, deadline_ns: u64) -> DeviceManagerResult {
+            assert_eq!(deadline_ns, 42);
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
+
+    struct CountingWakePort(Arc<AtomicUsize>);
+
+    impl WakeAccessPort for CountingWakePort {
+        fn wake_vcpu(&self, _device_id: DeviceId, vcpu_id: usize) -> DeviceManagerResult {
+            assert_eq!(vcpu_id, 0);
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct CountingStopPort(Arc<AtomicUsize>);
+
+    impl StopAccessPort for CountingStopPort {
+        fn request_vm_stop(&self, _device_id: DeviceId, reason: &str) -> DeviceManagerResult {
+            assert_eq!(reason, "test stop request");
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    struct ServiceBackedIoApic {
+        resources: alloc::vec::Vec<Resource>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl Device for ServiceBackedIoApic {
+        fn name(&self) -> &str {
+            "service-backed-ioapic"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &self.resources
+        }
+
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> Result<u64, DeviceError> {
+            Ok(0)
+        }
+
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> Result<(), DeviceError> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl crate::X86IoApicDeviceOps for ServiceBackedIoApic {
+        fn vector_for_gsi(&self, gsi: usize) -> Option<u8> {
+            (gsi == 4).then_some(0x44)
+        }
+
+        fn assert_gsi(&self, _gsi: usize) -> Option<x86_vlapic::IoApicInterrupt> {
+            None
+        }
+
+        fn set_gsi_level(
+            &self,
+            _gsi: usize,
+            _asserted: bool,
+        ) -> Option<x86_vlapic::IoApicInterrupt> {
+            None
+        }
+
+        fn end_of_interrupt(&self, _vector: u8) -> Option<x86_vlapic::IoApicEoi> {
+            None
+        }
+    }
+
+    impl Device for AccessAwareDevice {
+        fn name(&self) -> &str {
+            "access-aware"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &self.resources
+        }
+
+        fn read(
+            &self,
+            access: &DeviceAccess,
+            context: &mut dyn DeviceContext,
+        ) -> Result<u64, DeviceError> {
+            assert_eq!(context.device_id(), DeviceId::new(0));
+            assert_eq!(access.source_vcpu(), self.expected_vcpu);
+            Ok(0xfeed)
+        }
+
+        fn write(
+            &self,
+            access: &DeviceAccess,
+            _value: u64,
+            context: &mut dyn DeviceContext,
+        ) -> Result<(), DeviceError> {
+            assert_eq!(context.device_id(), DeviceId::new(0));
+            assert_eq!(access.source_vcpu(), self.expected_vcpu);
+            Ok(())
+        }
+    }
+
+    impl Device for GuestMemoryRequestDevice {
+        fn name(&self) -> &str {
+            "guest-memory-request"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &self.resources
+        }
+
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> Result<u64, DeviceError> {
+            Err(DeviceError::WriteOnly)
+        }
+
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            context: &mut dyn DeviceContext,
+        ) -> Result<(), DeviceError> {
+            let mut byte = [0u8; 1];
+            context.read_guest_memory(&self.dma_grant, GuestPhysAddr::from_usize(0), &mut byte)?;
+            Ok(())
+        }
+    }
+
+    impl Device for SensitiveGrantRequestDevice {
+        fn name(&self) -> &str {
+            "sensitive-grant-request"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &self.resources
+        }
+
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> Result<u64, DeviceError> {
+            Err(DeviceError::WriteOnly)
+        }
+
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            context: &mut dyn DeviceContext,
+        ) -> Result<(), DeviceError> {
+            match self.kind {
+                SensitiveGrantKind::Timer => context.schedule_timer(&self.timer_grant, 42)?,
+                SensitiveGrantKind::Wake => context.wake_vcpu(&self.wake_grant, 0)?,
+                SensitiveGrantKind::Stop => {
+                    context.request_vm_stop(&self.stop_grant, "test stop request")?
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct TestMemoryPort;
+
+    impl GuestMemoryAccess for TestMemoryPort {
+        fn read(&mut self, _addr: GuestPhysAddr, _data: &mut [u8]) -> Result<(), DeviceError> {
+            Ok(())
+        }
+
+        fn write(&mut self, _addr: GuestPhysAddr, _data: &[u8]) -> Result<(), DeviceError> {
+            Ok(())
+        }
+    }
+
+    struct TestDmaPoller {
+        grant: DmaGrant,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl DmaPollableDeviceOps for TestDmaPoller {
+        fn poll_dma(
+            &self,
+            _now_ns: u64,
+            context: &mut dyn DeviceContext,
+            _registered_grant: &DmaGrant,
+        ) -> DeviceManagerResult {
+            let mut byte = [0u8; 1];
+            context
+                .read_guest_memory(&self.grant, GuestPhysAddr::from_usize(0), &mut byte)
+                .map_err(DeviceManagerError::Device)?;
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     impl Device for D {
         fn name(&self) -> &str {
             self.n
@@ -1280,341 +2013,518 @@ mod tests {
         fn resources(&self) -> &[Resource] {
             &self.resources
         }
-        fn handle(&self, _a: &BusAccess) -> Result<BusResponse, DeviceError> {
-            Ok(BusResponse::Read { value: 0 })
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    #[test]
-    fn test_register_dispatch() {
-        let mut m = AxVmDevices::empty();
-        m.register(Arc::new(D::new_mmio(0x1000, 0x100, "d")))
-            .unwrap();
-        assert!(
-            m.dispatch(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: true,
-                addr: 0x1050,
-                width: AccessWidth::Dword,
-                data: 0
-            })
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_overlap() {
-        let mut m = AxVmDevices::empty();
-        m.register(Arc::new(D::new_mmio(0x1000, 0x200, "a")))
-            .unwrap();
-        assert!(matches!(
-            m.register(Arc::new(D::new_mmio(0x1100, 0x100, "b"))),
-            Err(RegistryError::AddressConflict { .. })
-        ));
-    }
-
-    #[test]
-    fn test_not_found() {
-        assert!(matches!(
-            AxVmDevices::empty().dispatch(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: true,
-                addr: 0xdead,
-                width: AccessWidth::Dword,
-                data: 0
-            }),
-            Err(DeviceError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn test_port_sysreg() {
-        let mut m = AxVmDevices::empty();
-        m.register(Arc::new(D::new_port(0x80, 4, "p"))).unwrap();
-        m.register(Arc::new(D::new_sysreg(0xC000, "s"))).unwrap();
-        assert!(
-            m.dispatch(&BusAccess {
-                kind: BusKind::Port,
-                is_read: true,
-                addr: 0x80,
-                width: AccessWidth::Byte,
-                data: 0
-            })
-            .is_ok()
-        );
-        assert!(
-            m.dispatch(&BusAccess {
-                kind: BusKind::SysReg,
-                is_read: true,
-                addr: 0xC000,
-                width: AccessWidth::Qword,
-                data: 0
-            })
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_same_device_overlapping_mmio_rejected() {
-        // Same device declaring [0x1000, 0x1200) and [0x1100, 0x1300)
-        struct OverlapDevice;
-        impl Device for OverlapDevice {
-            fn name(&self) -> &str {
-                "overlap"
-            }
-            fn resources(&self) -> &[Resource] {
-                static R: [Resource; 2] = [
-                    Resource::MmioRange {
-                        base: 0x1000,
-                        size: 0x200,
-                    },
-                    Resource::MmioRange {
-                        base: 0x1100,
-                        size: 0x200,
-                    },
-                ];
-                &R
-            }
-            fn handle(&self, _: &BusAccess) -> Result<BusResponse, DeviceError> {
-                Ok(BusResponse::Read { value: 0 })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> Result<u64, DeviceError> {
+            Ok(0)
         }
 
-        let mut m = AxVmDevices::empty();
-        let result = m.register(Arc::new(OverlapDevice));
-        assert!(matches!(
-            result,
-            Err(RegistryError::InvalidResource {
-                reason: InvalidResourceReason::OverlappingResources,
-                ..
-            })
-        ));
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> Result<(), DeviceError> {
+            Ok(())
+        }
     }
 
-    #[test]
-    fn test_same_device_nested_mmio_rejected() {
-        // Same device declaring [0x1000, 0x2000) and [0x1800, 0x1900) —
-        // smaller range is fully inside larger range.
-        struct NestedDevice;
-        impl Device for NestedDevice {
-            fn name(&self) -> &str {
-                "nested"
-            }
-            fn resources(&self) -> &[Resource] {
-                static R: [Resource; 2] = [
-                    Resource::MmioRange {
-                        base: 0x1000,
-                        size: 0x1000,
-                    },
-                    Resource::MmioRange {
-                        base: 0x1800,
-                        size: 0x100,
-                    },
-                ];
-                &R
-            }
-            fn handle(&self, _: &BusAccess) -> Result<BusResponse, DeviceError> {
-                Ok(BusResponse::Read { value: 0 })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+    trait BundleService: Send + Sync {
+        fn value(&self) -> usize;
+    }
+
+    struct BundleServiceKey;
+
+    impl ServiceKey for BundleServiceKey {
+        type Service = dyn BundleService;
+
+        const NAME: &'static str = "bundle-service";
+        const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+    }
+
+    struct BundleServiceProvider(usize);
+
+    impl BundleService for BundleServiceProvider {
+        fn value(&self) -> usize {
+            self.0
+        }
+    }
+
+    struct CountingLifecycle {
+        reset_calls: AtomicUsize,
+        suspend_calls: AtomicUsize,
+        resume_calls: AtomicUsize,
+    }
+
+    impl DeviceLifecycle for CountingLifecycle {
+        fn reset(&self) -> DeviceManagerResult {
+            self.reset_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
-        let mut m = AxVmDevices::empty();
-        let result = m.register(Arc::new(NestedDevice));
-        assert!(matches!(
-            result,
-            Err(RegistryError::InvalidResource {
-                reason: InvalidResourceReason::OverlappingResources,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn test_same_device_mmio_port_same_addr_allowed() {
-        // Same numeric address on different buses is allowed.
-        struct DualBusDevice;
-        impl Device for DualBusDevice {
-            fn name(&self) -> &str {
-                "dual-bus"
-            }
-            fn resources(&self) -> &[Resource] {
-                static R: [Resource; 2] = [
-                    Resource::MmioRange {
-                        base: 0x1000,
-                        size: 0x100,
-                    },
-                    Resource::PortRange {
-                        base: 0x1000,
-                        size: 0x10,
-                    },
-                ];
-                &R
-            }
-            fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-                if access.is_read {
-                    Ok(BusResponse::Read { value: 0 })
-                } else {
-                    Ok(BusResponse::Write)
-                }
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn suspend(&self) -> DeviceManagerResult {
+            self.suspend_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
-        let mut m = AxVmDevices::empty();
-        assert!(m.register(Arc::new(DualBusDevice)).is_ok());
-    }
-
-    #[test]
-    fn test_sysreg_max_single_register_valid() {
-        // addr = u32::MAX, count = 1 is the highest valid single-register
-        // range and should not be rejected as overflow.
-        struct MaxSysRegDevice;
-        impl Device for MaxSysRegDevice {
-            fn name(&self) -> &str {
-                "max-sysreg"
-            }
-            fn resources(&self) -> &[Resource] {
-                static R: [Resource; 1] = [Resource::SysReg {
-                    addr: u32::MAX,
-                    count: 1,
-                }];
-                &R
-            }
-            fn handle(&self, _: &BusAccess) -> Result<BusResponse, DeviceError> {
-                Ok(BusResponse::Read { value: 0 })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn resume(&self) -> DeviceManagerResult {
+            self.resume_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
-
-        let mut m = AxVmDevices::empty();
-        assert!(m.register(Arc::new(MaxSysRegDevice)).is_ok());
     }
 
     #[test]
-    fn test_read_request_rejects_write_response() {
-        // A device that incorrectly returns BusResponse::Write for a read
-        // should cause the handle_*_read methods to return an error.
-        // The device declares a resource on each bus so that the lookup
-        // actually finds it instead of returning NotFound.
-        struct WriteOnlyDevice;
-        impl Device for WriteOnlyDevice {
-            fn name(&self) -> &str {
-                "write-only"
-            }
-            fn resources(&self) -> &[Resource] {
-                static R: [Resource; 3] = [
-                    Resource::MmioRange {
-                        base: 0x1000,
-                        size: 0x100,
-                    },
-                    Resource::PortRange {
-                        base: 0x1000,
-                        size: 0x10,
-                    },
-                    Resource::SysReg {
-                        addr: 0x1000,
-                        count: 1,
-                    },
-                ];
-                &R
-            }
-            fn handle(&self, _access: &BusAccess) -> Result<BusResponse, DeviceError> {
-                Ok(BusResponse::Write)
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let mut m = AxVmDevices::empty();
-        m.register(Arc::new(WriteOnlyDevice)).unwrap();
-
-        // handle_mmio_read should detect the mismatched response.
-        let result = m.handle_mmio_read(GuestPhysAddr::from(0x1000), AccessWidth::Dword);
-        assert!(result.is_err());
-
-        // handle_sys_reg_read should also detect it.
-        let result = m.handle_sys_reg_read(SysRegAddr::new(0x1000), AccessWidth::Qword);
-        assert!(result.is_err());
-
-        // handle_port_read should also detect it.
-        let result = m.handle_port_read(Port::new(0x1000), AccessWidth::Byte);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_write_request_returns_write_response() {
-        struct RwDevice;
-        impl Device for RwDevice {
-            fn name(&self) -> &str {
-                "rw"
-            }
-            fn resources(&self) -> &[Resource] {
-                static R: [Resource; 1] = [Resource::MmioRange {
-                    base: 0x1000,
+    fn vcpu_mmio_dispatch_propagates_the_explicit_accessor() {
+        let mut devices = DeviceRuntime::empty();
+        let vcpu_id = DeviceVcpuId::new(7);
+        devices
+            .register(Arc::new(AccessAwareDevice {
+                resources: alloc::vec![Resource::MmioRange {
+                    base: 0x4000,
                     size: 0x100,
-                }];
-                &R
-            }
-            fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-                if access.is_read {
-                    Ok(BusResponse::Read { value: 0 })
-                } else {
-                    Ok(BusResponse::Write)
-                }
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let mut m = AxVmDevices::empty();
-        m.register(Arc::new(RwDevice)).unwrap();
-        let resp = m
-            .dispatch(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: false,
-                addr: 0x1000,
-                width: AccessWidth::Dword,
-                data: 0x42,
-            })
+                }],
+                expected_vcpu: vcpu_id,
+            }))
             .unwrap();
-        assert!(matches!(resp, BusResponse::Write));
+
+        assert_eq!(
+            devices
+                .try_read(&DeviceAccess::new(
+                    vcpu_id,
+                    BusKind::Mmio,
+                    0x4000,
+                    AccessWidth::Dword,
+                ))
+                .unwrap(),
+            Some(0xfeed_u64)
+        );
     }
 
     #[test]
-    fn test_port_max_address_valid() {
-        let mut m = AxVmDevices::empty();
-        m.register(Arc::new(D::new_port(0xffff, 1, "max-port")))
+    fn vcpu_port_dispatch_propagates_the_explicit_accessor() {
+        let mut devices = DeviceRuntime::empty();
+        let vcpu_id = DeviceVcpuId::new(7);
+        devices
+            .register(Arc::new(AccessAwareDevice {
+                resources: alloc::vec![Resource::PortRange {
+                    base: 0x4000,
+                    size: 0x100,
+                }],
+                expected_vcpu: vcpu_id,
+            }))
             .unwrap();
-        assert!(
-            m.dispatch(&BusAccess {
-                kind: BusKind::Port,
-                is_read: true,
-                addr: 0xffff,
-                width: AccessWidth::Byte,
-                data: 0
-            })
-            .is_ok()
+
+        assert_eq!(
+            devices
+                .try_read(&DeviceAccess::new(
+                    vcpu_id,
+                    BusKind::Port,
+                    0x4000,
+                    AccessWidth::Dword,
+                ))
+                .unwrap(),
+            Some(0xfeed_u64)
         );
+    }
+
+    #[test]
+    fn vcpu_sysreg_dispatch_propagates_the_explicit_accessor() {
+        let mut devices = DeviceRuntime::empty();
+        let vcpu_id = DeviceVcpuId::new(7);
+        devices
+            .register(Arc::new(AccessAwareDevice {
+                resources: alloc::vec![Resource::SysReg {
+                    addr: 0x4000,
+                    count: 1,
+                }],
+                expected_vcpu: vcpu_id,
+            }))
+            .unwrap();
+
+        assert_eq!(
+            devices
+                .try_read(&DeviceAccess::new(
+                    vcpu_id,
+                    BusKind::SysReg,
+                    0x4000,
+                    AccessWidth::Qword,
+                ))
+                .unwrap(),
+            Some(0xfeed_u64)
+        );
+    }
+
+    #[test]
+    fn memory_port_is_denied_to_devices_without_dma_grant() {
+        let mut devices = DeviceRuntime::empty();
+        devices
+            .register(Arc::new(GuestMemoryRequestDevice {
+                resources: alloc::vec![Resource::MmioRange {
+                    base: 0x5000,
+                    size: 0x100,
+                }],
+                dma_grant: DmaGrant::new(),
+            }))
+            .unwrap();
+        let mut memory = TestMemoryPort;
+
+        let error = devices
+            .try_write(
+                &DeviceAccess::new(
+                    DeviceVcpuId::new(0),
+                    BusKind::Mmio,
+                    0x5000,
+                    AccessWidth::Dword,
+                ),
+                0,
+                Some(&mut memory),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeviceManagerError::Access {
+                source: DeviceError::Unsupported { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bundle_declared_memory_device_receives_memory_port() {
+        let mut devices = DeviceRuntime::empty();
+        let dma_grant = DmaGrant::new();
+        devices
+            .register_bundle(DeviceBundle::new().with_guest_memory_device_grant(
+                Arc::new(GuestMemoryRequestDevice {
+                    resources: alloc::vec![Resource::MmioRange {
+                        base: 0x6000,
+                        size: 0x100,
+                    }],
+                    dma_grant: dma_grant.clone(),
+                }),
+                dma_grant,
+            ))
+            .unwrap();
+        let mut memory = TestMemoryPort;
+
+        assert!(
+            devices
+                .try_write(
+                    &DeviceAccess::new(
+                        DeviceVcpuId::new(0),
+                        BusKind::Mmio,
+                        0x6000,
+                        AccessWidth::Dword,
+                    ),
+                    0,
+                    Some(&mut memory),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dma_polling_scopes_memory_to_the_registered_device_and_grant() {
+        let mut devices = DeviceRuntime::empty();
+        let grant = DmaGrant::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+        devices
+            .register_bundle({
+                let mut bundle = DeviceBundle::new();
+                bundle.add_dma_pollable_device(
+                    Arc::new(D::new_mmio(0x7000, 0x100, "dma-poll-device")),
+                    Arc::new(TestDmaPoller {
+                        grant: grant.clone(),
+                        polls: polls.clone(),
+                    }),
+                    grant,
+                );
+                bundle
+            })
+            .unwrap();
+        let mut memory = TestMemoryPort;
+        let mut result = None;
+
+        devices.poll_dma_devices(123, &mut memory, |poll_result| result = Some(poll_result));
+
+        assert!(result.unwrap().is_ok());
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dma_polling_rejects_a_different_grant_token() {
+        let mut devices = DeviceRuntime::empty();
+        let registered_grant = DmaGrant::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+        devices
+            .register_bundle({
+                let mut bundle = DeviceBundle::new();
+                bundle.add_dma_pollable_device(
+                    Arc::new(D::new_mmio(0x7100, 0x100, "wrong-dma-grant")),
+                    Arc::new(TestDmaPoller {
+                        grant: DmaGrant::new(),
+                        polls: polls.clone(),
+                    }),
+                    registered_grant,
+                );
+                bundle
+            })
+            .unwrap();
+        let mut memory = TestMemoryPort;
+        let mut result = None;
+
+        devices.poll_dma_devices(123, &mut memory, |poll_result| result = Some(poll_result));
+
+        assert!(result.unwrap().is_err());
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
+
+    fn dispatch_sensitive_grant_probe(
+        devices: &DeviceRuntime,
+        base: u64,
+    ) -> Result<(), DeviceError> {
+        devices
+            .try_write(
+                &DeviceAccess::new(
+                    DeviceVcpuId::new(0),
+                    BusKind::Mmio,
+                    base,
+                    AccessWidth::Dword,
+                ),
+                0,
+                None,
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn timer_wake_and_stop_grants_are_checked_by_device_id_and_token() {
+        let timer_grant = TimerGrant::new();
+        let wake_grant = WakeGrant::new();
+        let stop_grant = StopGrant::new();
+
+        let mut denied = DeviceRuntime::empty();
+        denied
+            .register(Arc::new(SensitiveGrantRequestDevice {
+                resources: alloc::vec![Resource::MmioRange {
+                    base: 0x8000,
+                    size: 0x100,
+                }],
+                kind: SensitiveGrantKind::Timer,
+                timer_grant: timer_grant.clone(),
+                wake_grant: WakeGrant::new(),
+                stop_grant: StopGrant::new(),
+            }))
+            .unwrap();
+        let error = dispatch_sensitive_grant_probe(&denied, 0x8000).unwrap_err();
+        assert!(matches!(
+            error,
+            DeviceError::Unsupported { detail, .. } if detail.contains("no timer grant")
+        ));
+
+        let mut granted = DeviceRuntime::empty();
+        let mut bundle = DeviceBundle::new();
+        let timer_index = bundle.add_device(Arc::new(SensitiveGrantRequestDevice {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0x8100,
+                size: 0x100,
+            }],
+            kind: SensitiveGrantKind::Timer,
+            timer_grant: timer_grant.clone(),
+            wake_grant: WakeGrant::new(),
+            stop_grant: StopGrant::new(),
+        }));
+        bundle.grant_timer_to_device(timer_index, timer_grant);
+        let wake_index = bundle.add_device(Arc::new(SensitiveGrantRequestDevice {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0x8200,
+                size: 0x100,
+            }],
+            kind: SensitiveGrantKind::Wake,
+            timer_grant: TimerGrant::new(),
+            wake_grant: wake_grant.clone(),
+            stop_grant: StopGrant::new(),
+        }));
+        bundle.grant_wake_to_device(wake_index, wake_grant);
+        let stop_index = bundle.add_device(Arc::new(SensitiveGrantRequestDevice {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0x8300,
+                size: 0x100,
+            }],
+            kind: SensitiveGrantKind::Stop,
+            timer_grant: TimerGrant::new(),
+            wake_grant: WakeGrant::new(),
+            stop_grant: stop_grant.clone(),
+        }));
+        bundle.grant_stop_to_device(stop_index, stop_grant);
+        granted.register_bundle(bundle).unwrap();
+
+        let timer_error = dispatch_sensitive_grant_probe(&granted, 0x8100).unwrap_err();
+        assert!(matches!(
+            timer_error,
+            DeviceError::Unsupported { detail, .. } if detail.contains("no timer port")
+        ));
+        let wake_error = dispatch_sensitive_grant_probe(&granted, 0x8200).unwrap_err();
+        assert!(matches!(
+            wake_error,
+            DeviceError::Unsupported { detail, .. } if detail.contains("no vCPU wake port")
+        ));
+        let stop_error = dispatch_sensitive_grant_probe(&granted, 0x8300).unwrap_err();
+        assert!(matches!(
+            stop_error,
+            DeviceError::Unsupported { detail, .. } if detail.contains("no VM stop port")
+        ));
+    }
+
+    #[test]
+    fn timer_wake_and_stop_grants_call_attached_runtime_ports() {
+        let timer_calls = Arc::new(AtomicUsize::new(0));
+        let wake_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let timer_grant = TimerGrant::new();
+        let wake_grant = WakeGrant::new();
+        let stop_grant = StopGrant::new();
+
+        let mut devices = DeviceRuntime::empty();
+        devices.access_ports = RuntimeAccessPorts::new()
+            .with_timer(Arc::new(CountingTimerPort(timer_calls.clone())))
+            .with_wake(Arc::new(CountingWakePort(wake_calls.clone())))
+            .with_stop(Arc::new(CountingStopPort(stop_calls.clone())));
+
+        let mut bundle = DeviceBundle::new();
+        let timer_index = bundle.add_device(Arc::new(SensitiveGrantRequestDevice {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0x8400,
+                size: 0x100,
+            }],
+            kind: SensitiveGrantKind::Timer,
+            timer_grant: timer_grant.clone(),
+            wake_grant: WakeGrant::new(),
+            stop_grant: StopGrant::new(),
+        }));
+        bundle.grant_timer_to_device(timer_index, timer_grant);
+        let wake_index = bundle.add_device(Arc::new(SensitiveGrantRequestDevice {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0x8500,
+                size: 0x100,
+            }],
+            kind: SensitiveGrantKind::Wake,
+            timer_grant: TimerGrant::new(),
+            wake_grant: wake_grant.clone(),
+            stop_grant: StopGrant::new(),
+        }));
+        bundle.grant_wake_to_device(wake_index, wake_grant);
+        let stop_index = bundle.add_device(Arc::new(SensitiveGrantRequestDevice {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0x8600,
+                size: 0x100,
+            }],
+            kind: SensitiveGrantKind::Stop,
+            timer_grant: TimerGrant::new(),
+            wake_grant: WakeGrant::new(),
+            stop_grant: stop_grant.clone(),
+        }));
+        bundle.grant_stop_to_device(stop_index, stop_grant);
+        devices.register_bundle(bundle).unwrap();
+
+        dispatch_sensitive_grant_probe(&devices, 0x8400).unwrap();
+        dispatch_sensitive_grant_probe(&devices, 0x8500).unwrap();
+        dispatch_sensitive_grant_probe(&devices, 0x8600).unwrap();
+
+        assert_eq!(timer_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(wake_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stop_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_ioapic_registration_publishes_typed_service() {
+        let mut devices = DeviceRuntime::empty();
+        let ioapic = Arc::new(ServiceBackedIoApic {
+            resources: alloc::vec![Resource::MmioRange {
+                base: 0xfec0_0000,
+                size: 0x1000,
+            }],
+        });
+        let service: Arc<dyn crate::X86IoApicDeviceOps> = ioapic.clone();
+        let bundle = DeviceBundle::from_registration(DeviceRegistration::Device(ioapic))
+            .with_service::<crate::X86IoApicServiceKey>(service)
+            .unwrap();
+        devices.register_bundle(bundle).unwrap();
+
+        assert_eq!(devices.device_count(), 1);
+        assert_eq!(
+            devices
+                .services()
+                .require::<crate::X86IoApicServiceKey>()
+                .unwrap()
+                .vector_for_gsi(4),
+            Some(0x44)
+        );
+    }
+
+    #[test]
+    fn resource_validation_rejects_same_bus_overlap_but_allows_distinct_buses() {
+        for resources in [
+            alloc::vec![
+                Resource::MmioRange {
+                    base: 0x1000,
+                    size: 0x200,
+                },
+                Resource::MmioRange {
+                    base: 0x1100,
+                    size: 0x200,
+                },
+            ],
+            alloc::vec![
+                Resource::MmioRange {
+                    base: 0x1000,
+                    size: 0x1000,
+                },
+                Resource::MmioRange {
+                    base: 0x1800,
+                    size: 0x100,
+                },
+            ],
+        ] {
+            let mut runtime = DeviceRuntime::empty();
+            assert!(matches!(
+                runtime.register(Arc::new(D {
+                    resources,
+                    n: "overlapping",
+                })),
+                Err(RegistryError::InvalidResource {
+                    reason: InvalidResourceReason::OverlappingResources,
+                    ..
+                })
+            ));
+        }
+
+        let mut runtime = DeviceRuntime::empty();
+        runtime
+            .register(Arc::new(D {
+                resources: alloc::vec![
+                    Resource::MmioRange {
+                        base: 0x1000,
+                        size: 0x100,
+                    },
+                    Resource::PortRange {
+                        base: 0x1000,
+                        size: 0x10,
+                    },
+                ],
+                n: "dual-bus",
+            }))
+            .unwrap();
     }
 
     #[test]
     fn test_zero_size_returns_invalid_resource() {
-        let mut m = AxVmDevices::empty();
+        let mut m = DeviceRuntime::empty();
         let result = m.register(Arc::new(D::new_mmio(0x1000, 0, "zero")));
         assert!(matches!(
             result,
@@ -1639,15 +2549,25 @@ mod tests {
                 }];
                 &R
             }
-            fn handle(&self, _: &BusAccess) -> Result<BusResponse, DeviceError> {
+            fn read(
+                &self,
+                _: &DeviceAccess,
+                _context: &mut dyn DeviceContext,
+            ) -> Result<u64, DeviceError> {
                 Err(DeviceError::NotFound)
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+
+            fn write(
+                &self,
+                _: &DeviceAccess,
+                _value: u64,
+                _context: &mut dyn DeviceContext,
+            ) -> Result<(), DeviceError> {
+                Err(DeviceError::NotFound)
             }
         }
 
-        let mut m = AxVmDevices::empty();
+        let mut m = DeviceRuntime::empty();
         let result = m.register(Arc::new(OverflowDevice));
         assert!(matches!(
             result,
@@ -1659,32 +2579,139 @@ mod tests {
     }
 
     #[test]
-    fn test_access_across_resource_boundary() {
-        // Access that starts inside a device's range but with a larger
-        // width still dispatches to the matching device.
-        let mut m = AxVmDevices::empty();
+    fn rejects_access_that_crosses_mmio_resource_boundary() {
+        let mut m = DeviceRuntime::empty();
         m.register(Arc::new(D::new_mmio(0x1000, 0x8, "small")))
             .unwrap();
+        let vcpu = DeviceVcpuId::new(0);
         assert!(
-            m.dispatch(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: false,
-                addr: 0x1004,
-                width: AccessWidth::Qword,
-                data: 0,
-            })
-            .is_ok()
+            !m.try_write(
+                &DeviceAccess::new(vcpu, BusKind::Mmio, 0x1004, AccessWidth::Qword),
+                0,
+                None,
+            )
+            .unwrap()
         );
         // 0x1008 == base + size — NotFound.
+        assert_eq!(
+            m.try_read(&DeviceAccess::new(
+                vcpu,
+                BusKind::Mmio,
+                0x1008,
+                AccessWidth::Dword,
+            ))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_port_access_that_crosses_resource_boundary() {
+        let mut m = DeviceRuntime::empty();
+        m.register(Arc::new(D::new_port(0x80, 2, "small-port")))
+            .unwrap();
+
+        assert_eq!(
+            m.try_read(&DeviceAccess::new(
+                DeviceVcpuId::new(0),
+                BusKind::Port,
+                0x81,
+                AccessWidth::Word,
+            ))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn register_bundle_rolls_back_devices_after_resource_conflict() {
+        let mut devices = DeviceRuntime::empty();
+        devices
+            .register(Arc::new(D::new_mmio(0x1000, 0x100, "existing")))
+            .unwrap();
+
+        let bundle = DeviceBundle::from_registration(DeviceRegistration::Device(Arc::new(
+            D::new_mmio(0x2000, 0x100, "first-bundle-device"),
+        )))
+        .with_registration(DeviceRegistration::Device(Arc::new(D::new_mmio(
+            0x1080,
+            0x100,
+            "conflicting-bundle-device",
+        ))));
+
         assert!(matches!(
-            m.dispatch(&BusAccess {
-                kind: BusKind::Mmio,
-                is_read: true,
-                addr: 0x1008,
-                width: AccessWidth::Dword,
-                data: 0
-            }),
-            Err(DeviceError::NotFound)
+            devices.register_bundle(bundle),
+            Err(crate::DeviceManagerError::Registry(
+                RegistryError::AddressConflict { .. }
+            ))
         ));
+        assert_eq!(devices.device_count(), 1);
+        assert_eq!(
+            devices
+                .try_read(&DeviceAccess::new(
+                    DeviceVcpuId::new(0),
+                    BusKind::Mmio,
+                    0x2000,
+                    AccessWidth::Dword,
+                ))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn register_bundle_rejects_conflicting_service_without_registering_device() {
+        let mut devices = DeviceRuntime::empty();
+        let first_provider: Arc<dyn BundleService> = Arc::new(BundleServiceProvider(1));
+        let mut first = DeviceBundle::new();
+        first
+            .provide_service::<BundleServiceKey>(first_provider)
+            .unwrap();
+        devices.register_bundle(first).unwrap();
+
+        let conflicting_provider: Arc<dyn BundleService> = Arc::new(BundleServiceProvider(2));
+        let mut conflicting = DeviceBundle::from_registration(DeviceRegistration::Device(
+            Arc::new(D::new_mmio(0x2000, 0x100, "must-not-register")),
+        ));
+        conflicting
+            .provide_service::<BundleServiceKey>(conflicting_provider)
+            .unwrap();
+
+        assert!(matches!(
+            devices.register_bundle(conflicting),
+            Err(crate::DeviceManagerError::ResourceConflict {
+                operation: "register device service",
+                ..
+            })
+        ));
+        assert_eq!(devices.device_count(), 0);
+        assert_eq!(
+            devices
+                .services()
+                .require::<BundleServiceKey>()
+                .unwrap()
+                .value(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_invokes_registered_lifecycle_capability() {
+        let lifecycle = Arc::new(CountingLifecycle {
+            reset_calls: AtomicUsize::new(0),
+            suspend_calls: AtomicUsize::new(0),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let bundle = DeviceBundle::new().with_lifecycle(lifecycle.clone());
+        let mut devices = DeviceRuntime::empty();
+        devices.register_bundle(bundle).unwrap();
+
+        devices.reset_lifecycle_devices().unwrap();
+        devices.suspend_lifecycle_devices().unwrap();
+        devices.resume_lifecycle_devices().unwrap();
+
+        assert_eq!(lifecycle.reset_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.suspend_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.resume_calls.load(Ordering::Relaxed), 1);
     }
 }

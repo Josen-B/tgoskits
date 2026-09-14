@@ -1,11 +1,15 @@
 use core::mem::{self, MaybeUninit};
 
-use ax_errno::{AxError, AxResult};
-use ax_runtime::hal::cpu::uspace::UserContext;
+use ax_memory_addr::PAGE_SIZE_4K;
+use ax_runtime::hal::cpu::user::UserContext;
 use bytemuck::AnyBitPattern;
-use starry_vm::vm_read_slice;
 
 use super::clone::{CloneArgs, CloneFlags};
+use crate::{
+    StarryError, StarryResult,
+    file::{ResolveAtResult, resolve_fd},
+    mm::{vm_load, vm_read_slice},
+};
 
 /// Structure passed to clone3() system call.
 #[repr(C)]
@@ -26,24 +30,37 @@ pub struct Clone3Args {
 
 const MIN_CLONE_ARGS_SIZE: usize = core::mem::size_of::<u64>() * 8;
 
-impl TryFrom<Clone3Args> for CloneArgs {
-    type Error = ax_errno::AxError;
+fn clone3_check_extra_bytes(
+    current: &crate::task::UserTaskRef,
+    args: *const u8,
+    size: usize,
+) -> StarryResult<()> {
+    let base_size = mem::size_of::<Clone3Args>();
+    if size <= base_size {
+        return Ok(());
+    }
 
-    fn try_from(args: Clone3Args) -> AxResult<Self> {
+    let extra = vm_load(current, args.wrapping_add(base_size), size - base_size)?;
+    if extra.iter().any(|byte| *byte != 0) {
+        return Err(StarryError::ArgumentListTooLong);
+    }
+    Ok(())
+}
+
+impl TryFrom<Clone3Args> for CloneArgs {
+    type Error = crate::StarryError;
+
+    fn try_from(args: Clone3Args) -> StarryResult<Self> {
         if args.set_tid != 0 || args.set_tid_size != 0 {
             warn!("sys_clone3: set_tid/set_tid_size not supported, ignoring");
         }
-        if args.cgroup != 0 {
-            warn!("sys_clone3: cgroup parameter not supported, ignoring");
-        }
-
         let flags = CloneFlags::from_bits_truncate(args.flags);
 
         if args.exit_signal > 0 && flags.intersects(CloneFlags::THREAD | CloneFlags::PARENT) {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         if flags.contains(CloneFlags::DETACHED) {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
 
         let stack = if args.stack > 0 {
@@ -68,28 +85,49 @@ impl TryFrom<Clone3Args> for CloneArgs {
     }
 }
 
-pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<isize> {
+pub fn sys_clone3(
+    current: &crate::task::UserTaskRef,
+    uctx: &UserContext,
+    args: *const u8,
+    size: usize,
+) -> crate::StarryResult<isize> {
     debug!("sys_clone3 <= args: {args:p}, size: {size}");
 
+    if size > PAGE_SIZE_4K {
+        return Err(StarryError::ArgumentListTooLong);
+    }
     if size < MIN_CLONE_ARGS_SIZE {
         warn!("sys_clone3: size {size} too small, minimum is {MIN_CLONE_ARGS_SIZE}");
-        return Err(AxError::InvalidInput);
-    }
-
-    if size > core::mem::size_of::<Clone3Args>() {
-        debug!("sys_clone3: size {size} larger than expected, using known fields only");
+        return Err(StarryError::InvalidInput);
     }
 
     let mut buffer = [0u8; core::mem::size_of::<Clone3Args>()];
     let read_len = size.min(buffer.len());
     // SAFETY: MaybeUninit<T> is compatible with T, and we're filling in the
     // buffer with bytes read from the user
-    vm_read_slice(args, unsafe {
+    vm_read_slice(current, args, unsafe {
         mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buffer[..read_len])
     })?;
     let clone3_args: Clone3Args =
-        bytemuck::try_pod_read_unaligned(&buffer).map_err(|_| AxError::InvalidInput)?;
+        bytemuck::try_pod_read_unaligned(&buffer).map_err(|_| StarryError::InvalidInput)?;
+    clone3_check_extra_bytes(current, args, size)?;
 
     let clone_args = CloneArgs::try_from(clone3_args)?;
-    clone_args.do_clone(uctx)
+    let requested_cgroup = if clone_args.flags.contains(CloneFlags::INTO_CGROUP) {
+        let cgroup_fd = i32::try_from(clone3_args.cgroup).map_err(|_| StarryError::InvalidInput)?;
+        let location = match resolve_fd(cgroup_fd)? {
+            ResolveAtResult::File(location) => location,
+            ResolveAtResult::Other(_) => return Err(StarryError::InvalidInput),
+        };
+        Some(
+            crate::pseudofs::cgroup::node_from_location(&location)
+                .ok_or(StarryError::InvalidInput)?,
+        )
+    } else {
+        if clone3_args.cgroup != 0 {
+            return Err(StarryError::InvalidInput);
+        }
+        None
+    };
+    clone_args.do_clone_in_cgroup(current, uctx, requested_cgroup)
 }

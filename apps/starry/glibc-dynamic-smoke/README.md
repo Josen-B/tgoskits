@@ -62,7 +62,7 @@ StarryOS can load glibc dynamic ELF through PT_INTERP on aarch64, riscv64, and x
 
 | 依赖 | 版本/说明 |
 |------|----------|
-| Rust toolchain | `nightly-2026-05-28` |
+| Rust toolchain | `nightly-2026-09-04` |
 | aarch64-linux-gnu-gcc | Debian 交叉编译工具链 |
 | riscv64-linux-gnu-gcc | Debian 交叉编译工具链 |
 | x86_64-linux-gnu-gcc | Debian 交叉编译工具链 |
@@ -73,6 +73,6 @@ StarryOS can load glibc dynamic ELF through PT_INTERP on aarch64, riscv64, and x
 
 | 架构 | 特殊要求 |
 |------|----------|
-| aarch64 | QEMU 需要 `-append root=/dev/sda` |
+| aarch64 | QEMU 需要 `-append root=/dev/nvme0n1` |
 | riscv64 | 不需要 `-append`，kernel 自动检测 |
 | x86_64 | 需要 `-cpu max`，`to_bin=false`，不需要 `-append` |

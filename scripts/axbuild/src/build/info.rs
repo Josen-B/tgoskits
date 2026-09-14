@@ -1,3 +1,5 @@
+use anyhow::bail;
+
 use super::*;
 
 pub(crate) fn env_truthy(env: &HashMap<String, String>, key: &str) -> bool {
@@ -46,13 +48,313 @@ pub(crate) fn toolchain_rustflags_for_features(
     flags
 }
 
-pub(crate) fn append_encoded_rustflags(cargo: &mut Cargo, flags: &[&str]) {
-    const KEY: &str = "CARGO_ENCODED_RUSTFLAGS";
-    let value = cargo.env.entry(KEY.to_string()).or_default();
-    if !value.is_empty() {
-        value.push('\x1f');
+/// Appends rustc arguments without changing Cargo's active rustflags source.
+///
+/// Environment sources stay environment sources. Target-specific config stays
+/// target-specific so linker, relocation, and platform flags continue to merge
+/// with command-specific test, coverage, or profiling arguments.
+pub(crate) fn append_cargo_rustflags(cargo: &mut Cargo, flags: &[&str]) {
+    const ENCODED_KEY: &str = "CARGO_ENCODED_RUSTFLAGS";
+    const PLAIN_KEY: &str = "RUSTFLAGS";
+    const BUILD_KEY: &str = "CARGO_BUILD_RUSTFLAGS";
+
+    if flags.is_empty() {
+        return;
     }
-    value.push_str(&flags.join("\x1f"));
+
+    // Cargo selects exactly one rustflags source. Extend the active environment
+    // source when one exists; otherwise remain in the target-specific config
+    // source so linker and platform flags continue to participate.
+    if let Some(mut value) = effective_cargo_env(cargo, ENCODED_KEY) {
+        append_encoded_rustflag_sequence(&mut value, flags);
+        cargo.env.insert(ENCODED_KEY.to_string(), value);
+        return;
+    }
+
+    if let Some(value) = effective_cargo_env(cargo, PLAIN_KEY) {
+        let mut active_flags = value.split_whitespace().map(ToOwned::to_owned).collect();
+        append_rustflag_sequence(&mut active_flags, flags);
+        cargo.env.remove(PLAIN_KEY);
+        cargo
+            .env
+            .insert(ENCODED_KEY.to_string(), active_flags.join("\x1f"));
+        return;
+    }
+
+    // Some host-side preparation tests and tools intentionally leave target
+    // resolution to a later stage. Without a concrete target, a target config
+    // key would be invalid; retain the legacy encoded-environment fallback.
+    if cargo.target.is_empty() {
+        let mut value = String::new();
+        append_encoded_rustflag_sequence(&mut value, flags);
+        cargo.env.insert(ENCODED_KEY.to_string(), value);
+        return;
+    }
+
+    let target_key = cargo_target_key(cargo);
+    let target_scope = RustflagsScope::Target(&target_key);
+    if append_inline_rustflags(cargo, target_scope, flags) {
+        return;
+    }
+
+    let target_env = cargo_target_rustflags_env(&target_key);
+    if append_plain_env_rustflags(cargo, &target_env, target_scope, flags) {
+        return;
+    }
+
+    if let Some(active) = extra_config_rustflags(cargo, target_scope) {
+        append_config_rustflags_overlay(cargo, target_scope, Some(active), flags);
+        return;
+    }
+
+    if append_plain_env_rustflags(cargo, BUILD_KEY, RustflagsScope::Build, flags) {
+        return;
+    }
+
+    let build_scope = RustflagsScope::Build;
+    if append_inline_rustflags(cargo, build_scope, flags) {
+        return;
+    }
+
+    if let Some(active) = extra_config_rustflags(cargo, build_scope) {
+        append_config_rustflags_overlay(cargo, build_scope, Some(active), flags);
+        return;
+    }
+
+    append_config_rustflags_overlay(cargo, target_scope, None, flags);
+}
+
+fn effective_cargo_env(cargo: &Cargo, key: &str) -> Option<String> {
+    cargo
+        .env
+        .get(key)
+        .cloned()
+        .or_else(|| std::env::var(key).ok())
+}
+
+fn cargo_target_key(cargo: &Cargo) -> String {
+    Path::new(&cargo.target)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(&cargo.target)
+        .to_string()
+}
+
+fn cargo_target_rustflags_env(target_key: &str) -> String {
+    let target_key = target_key
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("CARGO_TARGET_{target_key}_RUSTFLAGS")
+}
+
+fn append_plain_env_rustflags(
+    cargo: &mut Cargo,
+    key: &str,
+    scope: RustflagsScope<'_>,
+    flags: &[&str],
+) -> bool {
+    let Some(value) = effective_cargo_env(cargo, key) else {
+        return false;
+    };
+    let mut active_flags = value.split_whitespace().map(ToOwned::to_owned).collect();
+    if !append_rustflag_sequence(&mut active_flags, flags) {
+        return true;
+    }
+    if flags
+        .iter()
+        .any(|flag| flag.is_empty() || flag.chars().any(char::is_whitespace))
+    {
+        // Cargo's target/build environment variables are whitespace-split.
+        // Keep a rustc argument containing spaces intact in a merging config
+        // array rather than corrupting it while rewriting the environment.
+        append_config_rustflags_overlay(cargo, scope, None, flags);
+    } else {
+        cargo.env.insert(key.to_string(), active_flags.join(" "));
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+enum RustflagsScope<'a> {
+    Target(&'a str),
+    Build,
+}
+
+impl RustflagsScope<'_> {
+    fn find(self, table: &toml::Table) -> Option<&toml::Value> {
+        match self {
+            Self::Target(target_key) => table
+                .get("target")?
+                .as_table()?
+                .get(target_key)?
+                .as_table()?
+                .get("rustflags"),
+            Self::Build => table.get("build")?.as_table()?.get("rustflags"),
+        }
+    }
+
+    fn assignment_key(self) -> String {
+        match self {
+            Self::Target(target_key) => {
+                let target_key = toml::Value::String(target_key.to_string());
+                format!("target.{target_key}.rustflags")
+            }
+            Self::Build => "build.rustflags".to_string(),
+        }
+    }
+}
+
+fn append_inline_rustflags(cargo: &mut Cargo, scope: RustflagsScope<'_>, flags: &[&str]) -> bool {
+    for index in (0..cargo.args.len()).rev() {
+        if let Some(assignment) = cargo.args[index].strip_prefix("--config=") {
+            let Some(updated) = append_rustflags_assignment(assignment, scope, flags) else {
+                continue;
+            };
+            cargo.args[index] = format!("--config={updated}");
+            return true;
+        }
+
+        if index == 0 || cargo.args[index - 1] != "--config" {
+            continue;
+        }
+        let Some(updated) = append_rustflags_assignment(&cargo.args[index], scope, flags) else {
+            continue;
+        };
+        cargo.args[index] = updated;
+        return true;
+    }
+
+    false
+}
+
+fn append_rustflags_assignment(
+    assignment: &str,
+    scope: RustflagsScope<'_>,
+    flags: &[&str],
+) -> Option<String> {
+    let (raw_key, _) = assignment.split_once('=')?;
+    let table = toml::from_str::<toml::Table>(assignment).ok()?;
+    let mut rustflags = RustflagsValue::parse(scope.find(&table)?)?;
+    append_rustflag_sequence(&mut rustflags.flags, flags);
+    let value = rustflags.render();
+    Some(format!("{}={value}", raw_key.trim()))
+}
+
+#[derive(Clone, Copy)]
+enum RustflagsFormat {
+    Array,
+    String,
+}
+
+struct RustflagsValue {
+    flags: Vec<String>,
+    format: RustflagsFormat,
+}
+
+impl RustflagsValue {
+    fn parse(value: &toml::Value) -> Option<Self> {
+        match value {
+            toml::Value::Array(rustflags) => Some(Self {
+                flags: rustflags
+                    .iter()
+                    .map(|flag| flag.as_str().map(ToOwned::to_owned))
+                    .collect::<Option<Vec<_>>>()?,
+                format: RustflagsFormat::Array,
+            }),
+            toml::Value::String(rustflags) => Some(Self {
+                flags: rustflags
+                    .split_whitespace()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                format: RustflagsFormat::String,
+            }),
+            _ => None,
+        }
+    }
+
+    fn render(self) -> toml::Value {
+        match self.format {
+            RustflagsFormat::Array => {
+                toml::Value::Array(self.flags.into_iter().map(toml::Value::String).collect())
+            }
+            RustflagsFormat::String => toml::Value::String(self.flags.join(" ")),
+        }
+    }
+}
+
+fn extra_config_rustflags(cargo: &Cargo, scope: RustflagsScope<'_>) -> Option<RustflagsValue> {
+    let config = cargo.extra_config.as_deref()?;
+    if config.starts_with("http://") || config.starts_with("https://") {
+        return None;
+    }
+    let source = fs::read_to_string(config).ok()?;
+    let table = toml::from_str::<toml::Table>(&source).ok()?;
+    RustflagsValue::parse(scope.find(&table)?)
+}
+
+fn append_config_rustflags_overlay(
+    cargo: &mut Cargo,
+    scope: RustflagsScope<'_>,
+    active: Option<RustflagsValue>,
+    flags: &[&str],
+) {
+    let value = match active {
+        Some(mut active) => {
+            if !append_rustflag_sequence(&mut active.flags, flags) {
+                return;
+            }
+            match active.format {
+                // Cargo merges rustflags arrays from multiple config layers,
+                // so repeat only the new sequence in the command-line layer.
+                RustflagsFormat::Array => RustflagsValue {
+                    flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
+                    format: RustflagsFormat::Array,
+                }
+                .render(),
+                // Strings replace rather than merge; carry the active value
+                // forward when adding the command-line override.
+                RustflagsFormat::String => active.render(),
+            }
+        }
+        None => RustflagsValue {
+            flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
+            format: RustflagsFormat::Array,
+        }
+        .render(),
+    };
+    cargo.args.push("--config".to_string());
+    cargo
+        .args
+        .push(format!("{}={value}", scope.assignment_key()));
+}
+
+fn append_encoded_rustflag_sequence(value: &mut String, flags: &[&str]) {
+    let mut active_flags = if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split('\x1f').map(ToOwned::to_owned).collect()
+    };
+    if append_rustflag_sequence(&mut active_flags, flags) {
+        *value = active_flags.join("\x1f");
+    }
+}
+
+fn append_rustflag_sequence(active_flags: &mut Vec<String>, flags: &[&str]) -> bool {
+    if active_flags
+        .windows(flags.len())
+        .any(|window| window.iter().map(String::as_str).eq(flags.iter().copied()))
+    {
+        return false;
+    }
+    active_flags.extend(flags.iter().map(|flag| (*flag).to_string()));
+    true
 }
 
 /// Whether the build config enables target backtrace support (frame pointers / unwind).
@@ -76,15 +378,36 @@ pub(crate) const ARCEOS_LINKER_SCRIPT: &str = "linker.x";
 pub(super) const STD_TARGET_DIR: &str = "std";
 pub(super) const AXSTD_STD_PACKAGE: &str = "ax-std";
 
+/// Link contract for freestanding kernels built without Rust `std`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StdFeaturePrefixFamily {
-    AxStd,
+pub(crate) enum BareKernelLinkMode {
+    /// Use the target's default relocation and linker policy.
+    Default,
+    /// Produce a position-independent executable with the kernel linker script.
+    Pie,
 }
 
-impl StdFeaturePrefixFamily {
-    fn prefix(self) -> &'static str {
+impl BareKernelLinkMode {
+    fn rustflags(self, target: &str) -> Vec<String> {
         match self {
-            Self::AxStd => "ax-std/",
+            Self::Default => Vec::new(),
+            Self::Pie => {
+                let mut flags = vec![
+                    "-Crelocation-model=pic".to_string(),
+                    "-Clink-args=-pie".to_string(),
+                ];
+                if target.starts_with("riscv64") {
+                    flags.push("-Clink-args=--no-relax".to_string());
+                }
+                flags.extend([
+                    "-Clink-args=--gc-sections".to_string(),
+                    "-Clink-args=-znorelro".to_string(),
+                    "-Clink-args=-znostart-stop-gc".to_string(),
+                    "-Clink-args=-Tlinker.x".to_string(),
+                    "-Clink-args=-u _head".to_string(),
+                ]);
+                flags
+            }
         }
     }
 }
@@ -132,12 +455,9 @@ impl BuildInfo {
         target: String,
         args: Vec<String>,
     ) -> Cargo {
-        self.into_base_cargo_config_with_to_bin(
-            package,
-            target.clone(),
-            args,
-            default_to_bin_for_target(&target),
-        )
+        // Keep the Cargo artifact as ELF by default. BIN conversion is an
+        // explicit runner/config concern and must not be inferred from target.
+        self.into_base_cargo_config_with_to_bin(package, target, args, false)
     }
 
     pub(crate) fn into_base_cargo_config_with_to_bin(
@@ -184,7 +504,15 @@ impl BuildInfo {
         metadata: &Metadata,
     ) -> anyhow::Result<Cargo> {
         self.validated_max_cpu_num()?;
-        self.resolve_std_features_with_metadata(package, target, metadata);
+        self.validate_features()?;
+        self.resolve_std_features();
+        // `max_cpu_num` is an explicit build setting. Propagate SMP only when
+        // the caller requested more than one CPU; package metadata never adds
+        // features implicitly.
+        if self.max_cpu_num.is_some_and(|max_cpu_num| max_cpu_num > 1) {
+            self.features.push("smp".to_string());
+            self.resolve_std_features();
+        }
         let std_target = std_build_target_for(target)?;
         let fake_lib_dir = std_fake_lib_dir(&std_target.target_name)?;
         let wrapper = std_linker_wrapper_path(&std_target.target_name, &fake_lib_dir)?;
@@ -194,22 +522,14 @@ impl BuildInfo {
             std_target.cargo_args,
         );
         cargo.env.extend(std_target.env);
-        prepare_std_build_env_for_package(
-            &mut cargo.env,
-            package,
-            target,
-            &cargo.features,
-            metadata,
-        )?;
+        // The std target wrapper needs the original kernel target. This is
+        // build context, not a Cargo feature or platform selection.
+        cargo
+            .env
+            .insert("AX_TARGET".to_string(), target.to_string());
         let app_features = package_feature_names(package, metadata)?;
         let axstd_features = package_feature_names(AXSTD_STD_PACKAGE, metadata)?;
-        inject_arceos_feature_for_std_build(&mut cargo.features, &app_features);
-        pass_std_build_nested_features(
-            &mut cargo.env,
-            &mut cargo.features,
-            &app_features,
-            &axstd_features,
-        );
+        pass_std_build_nested_features(&mut cargo.features, &app_features, &axstd_features);
         cargo.pre_build_cmds.push(
             std_fake_lib_prebuild_script_path(&std_target.target_name, &fake_lib_dir, &cargo.env)?
                 .display()
@@ -221,8 +541,74 @@ impl BuildInfo {
                 .display()
                 .to_string(),
         );
-        cargo.to_bin = true;
         Ok(cargo)
+    }
+
+    /// Builds a Rust-`std` kernel through the musl PIE target and linker wrapper.
+    pub(crate) fn into_prepared_std_cargo_config_with_metadata(
+        self,
+        package: &str,
+        target: &str,
+        metadata: &Metadata,
+    ) -> anyhow::Result<Cargo> {
+        self.into_prepared_base_cargo_config_with_metadata(package, target, metadata)
+    }
+
+    /// Builds a freestanding kernel against only `core` and `alloc`.
+    pub(crate) fn into_prepared_no_std_cargo_config_with_metadata(
+        mut self,
+        package: &str,
+        target: &str,
+        metadata: &Metadata,
+        link_mode: BareKernelLinkMode,
+    ) -> anyhow::Result<Cargo> {
+        self.validated_max_cpu_num()?;
+        self.validate_features()?;
+        self.reject_freestanding_std_compat()?;
+        self.enable_package_smp_feature(package, metadata)?;
+
+        let mut rustflags = toolchain_rustflags_for_features(&self.env, &self.features);
+        rustflags.extend(link_mode.rustflags(target));
+        let bare_target = freestanding_build_target_for(target);
+        let args = Self::build_cargo_args(target, &rustflags);
+        let mut cargo =
+            self.into_base_cargo_config_with_log(package.to_string(), bare_target.target, args);
+        cargo.env.extend(bare_target.env);
+        cargo
+            .env
+            .insert("AX_TARGET".to_string(), target.to_string());
+        cargo.to_bin = bare_target_requires_bin(target);
+        Ok(cargo)
+    }
+
+    fn reject_freestanding_std_compat(&self) -> anyhow::Result<()> {
+        if let Some(feature) = self
+            .features
+            .iter()
+            .find(|feature| feature.rsplit('/').next() == Some("std-compat"))
+        {
+            bail!("freestanding no_std build cannot enable `{feature}`");
+        }
+        Ok(())
+    }
+
+    fn enable_package_smp_feature(
+        &mut self,
+        package: &str,
+        metadata: &Metadata,
+    ) -> anyhow::Result<()> {
+        if !self.max_cpu_num.is_some_and(|max_cpu_num| max_cpu_num > 1) {
+            return Ok(());
+        }
+        if package_feature_names(package, metadata)?
+            .iter()
+            .any(|feature| feature == "smp")
+        {
+            self.features.push("smp".to_string());
+            self.features.sort();
+            self.features.dedup();
+        }
+        Ok(())
     }
 
     pub(super) fn resolve_std_features(&mut self) {
@@ -230,117 +616,57 @@ impl BuildInfo {
             .features
             .iter()
             .map(|feature| normalize_std_feature(feature))
-            .filter(|feature| !is_removed_dynamic_platform_feature(feature))
             .collect();
         self.features.sort();
         self.features.dedup();
     }
 
-    pub(super) fn resolve_std_features_with_metadata(
-        &mut self,
-        package: &str,
-        target: &str,
-        metadata: &Metadata,
-    ) {
-        let _ = target;
-        self.features
-            .extend(std_package_metadata_features(package, metadata));
-        self.resolve_std_features();
-
+    pub(crate) fn resolve_c_app_features(&mut self) -> anyhow::Result<()> {
+        self.validate_features()?;
+        // `max_cpu_num` is an explicit C build setting; expose the matching ax-std
+        // capability only when the caller requested more than one CPU.
         if self.max_cpu_num.is_some_and(|max_cpu_num| max_cpu_num > 1) {
-            self.features.push("smp".to_string());
+            self.features.push("ax-std/smp".to_string());
         }
-        self.features.push("smp".to_string());
-
-        self.resolve_std_features();
-    }
-
-    pub(crate) fn resolve_features_with_metadata(
-        &mut self,
-        package: &str,
-        target: &str,
-        metadata: &Metadata,
-    ) {
-        self.resolve_features_with_prefix_family(
-            package,
-            target,
-            detect_std_feature_prefix_family(package, metadata),
-            Some(metadata),
-        );
-    }
-
-    pub(super) fn resolve_features_with_prefix_family(
-        &mut self,
-        package: &str,
-        target: &str,
-        prefix_family: anyhow::Result<StdFeaturePrefixFamily>,
-        metadata: Option<&Metadata>,
-    ) {
-        let prefix_family = self.resolve_std_feature_prefix_family(package, prefix_family);
-        let _ = (target, metadata);
-
-        self.features
-            .retain(|feature| !matches!(feature.as_str(), "plat-dyn" | "ax-std/plat-dyn"));
-
-        if self.max_cpu_num.is_some_and(|max_cpu_num| max_cpu_num > 1) {
-            self.features.push(format!("{}smp", prefix_family.prefix()));
-        }
-
         self.features.sort();
         self.features.dedup();
+        Ok(())
     }
 
-    fn resolve_std_feature_prefix_family(
-        &self,
-        package: &str,
-        prefix_family: anyhow::Result<StdFeaturePrefixFamily>,
-    ) -> StdFeaturePrefixFamily {
-        match prefix_family {
-            Ok(prefix_family) => prefix_family,
-            Err(err) => {
-                if let Some(prefix_family) = feature_family_from_existing_features(&self.features) {
-                    return prefix_family;
-                }
-                warn!(
-                    "failed to detect direct ax dependency for package {}: {}, defaulting to \
-                     ax-std feature prefix",
-                    package, err
-                );
-                StdFeaturePrefixFamily::AxStd
-            }
+    /// Reject compatibility aliases and removed platform controls instead of silently changing
+    /// the build contract selected by the caller.
+    pub(crate) fn validate_features(&self) -> anyhow::Result<()> {
+        let selects_mode = |mode: &str| {
+            self.features
+                .iter()
+                .any(|feature| feature.rsplit('/').next() == Some(mode))
+        };
+        if selects_mode("uspace") && selects_mode("tls") {
+            bail!(
+                "features `uspace` and `tls` select incompatible CPU-local register ownership \
+                 modes"
+            );
         }
+        for feature in &self.features {
+            self.validate_feature(feature)?;
+        }
+        Ok(())
     }
 
-    pub(crate) fn normalize_legacy_feature_aliases(&mut self) -> bool {
-        let mut changed = false;
-
-        for feature in &mut self.features {
-            let normalized = normalize_legacy_feature_alias(feature);
-            if *feature != normalized {
-                *feature = normalized;
-                changed = true;
-            }
+    pub(crate) fn validate_feature(&self, feature: &str) -> anyhow::Result<()> {
+        if feature == "axstd" || feature.starts_with("axstd/") {
+            bail!(
+                "feature `{feature}` uses the removed `axstd` alias; use the declared Cargo \
+                 feature name instead"
+            );
         }
-
-        if changed {
-            self.features.sort();
-            self.features.dedup();
+        if is_removed_dynamic_platform_feature(feature) {
+            bail!(
+                "feature `{feature}` is no longer supported; dynamic platform selection is \
+                 automatic, remove the feature from the selected configuration"
+            );
         }
-
-        changed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_features(&mut self, package: &str, target: &str) {
-        match workspace_metadata() {
-            Ok(metadata) => self.resolve_features_with_metadata(package, target, &metadata),
-            Err(err) => self.resolve_features_with_prefix_family(
-                package,
-                target,
-                Err(err.context("failed to load workspace metadata")),
-                None,
-            ),
-        }
+        Ok(())
     }
 
     pub(crate) fn validated_max_cpu_num(&self) -> anyhow::Result<Option<usize>> {
@@ -352,16 +678,23 @@ impl BuildInfo {
     }
 
     pub(crate) fn build_cargo_args(target: &str, extra_rustflags: &[String]) -> Vec<String> {
-        let mut args = vec!["-Z".to_string(), "build-std=core,alloc".to_string()];
+        let bare_target = freestanding_build_target_for(target);
+        let mut args = bare_target.cargo_args;
+        args.extend(Self::rustflags_cargo_args(
+            &bare_target.target,
+            extra_rustflags,
+        ));
+        args
+    }
+
+    fn rustflags_cargo_args(target: &str, extra_rustflags: &[String]) -> Vec<String> {
+        let mut args = Vec::new();
         let target_key = Path::new(target)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or(target);
 
-        let mut rustflags = extra_rustflags.to_vec();
-        if target_key.starts_with("loongarch64-") {
-            rustflags.push("-Ctarget-feature=-ual".to_string());
-        }
+        let rustflags = extra_rustflags.to_vec();
 
         if !rustflags.is_empty() {
             args.push("--config".to_string());
@@ -374,12 +707,16 @@ impl BuildInfo {
     }
 }
 
+fn bare_target_requires_bin(target: &str) -> bool {
+    target.starts_with("aarch64-") || target.starts_with("riscv64")
+}
+
 impl Default for BuildInfo {
     fn default() -> Self {
         Self {
             env: HashMap::new(),
             log: LogLevel::Warn,
-            features: vec!["ax-std".to_string()],
+            features: Vec::new(),
             max_cpu_num: None,
         }
     }

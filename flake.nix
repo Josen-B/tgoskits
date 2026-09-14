@@ -55,6 +55,7 @@
               curl
               dosfstools
               e2fsprogs
+              fakeroot
               file
               git
               gnumake
@@ -86,7 +87,7 @@
             ++ optionalPackageByPath [ "qemu-user-static" ]
             ++ optionalPackageByPath [ "xorriso" ];
 
-          crossPackages =
+          crossCompilers =
             optionalPackageByPath [
               "pkgsCross"
               "aarch64-multiplatform-musl"
@@ -112,45 +113,116 @@
               "cc"
             ];
 
-          mkTgoskitsShell =
+          mkCrossCompilerAliases =
             {
               name,
-              extraPackages ? [ ],
+              packagePath,
+              sourcePrefix,
+              aliasPrefix,
             }:
-            pkgs.mkShell {
-              inherit name;
+            let
+              crossCompiler = lib.attrByPath packagePath null pkgs;
+              tools = [
+                "ar"
+                "c++"
+                "cc"
+                "cpp"
+                "g++"
+                "gcc"
+                "ld"
+                "nm"
+                "objcopy"
+                "objdump"
+                "ranlib"
+                "readelf"
+                "strip"
+              ];
+              aliases = map (
+                tool:
+                pkgs.writeShellScriptBin "${aliasPrefix}-${tool}" ''
+                  exec "${crossCompiler}/bin/${sourcePrefix}-${tool}" \
+                    ${
+                      lib.optionalString (builtins.elem tool [
+                        "c++"
+                        "cc"
+                        "g++"
+                        "gcc"
+                      ]) "-fno-stack-protector"
+                    } "$@"
+                ''
+              ) tools;
+            in
+            lib.optional (crossCompiler != null) (
+              pkgs.symlinkJoin {
+                inherit name;
+                paths = aliases;
+              }
+            );
 
-              packages = commonPackages ++ extraPackages;
-
-              LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
-
-              shellHook = ''
-                export project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
-                # export RUSTUP_HOME="$project_root/.rustup"
-                export CARGO_HOME="$project_root/.cargo"
-                export PATH="$CARGO_HOME/bin:$PATH"
-
-                # mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_HOME/bin"
-                mkdir -p "$CARGO_HOME" "$CARGO_HOME/bin"
-
-                echo "TGOSKits dev shell"
-                # echo "  RUSTUP_HOME=$RUSTUP_HOME"
-                echo "  CARGO_HOME=$CARGO_HOME"
-                echo "  Rust toolchain: rust-overlay from rust-toolchain.toml"
-
-                exec fish
-              '';
+          crossCompilerAliases =
+            mkCrossCompilerAliases {
+              name = "x86_64-linux-musl-toolchain-aliases";
+              packagePath = [
+                "pkgsCross"
+                "musl64"
+                "stdenv"
+                "cc"
+              ];
+              sourcePrefix = "x86_64-unknown-linux-musl";
+              aliasPrefix = "x86_64-linux-musl";
+            }
+            ++ mkCrossCompilerAliases {
+              name = "aarch64-linux-musl-toolchain-aliases";
+              packagePath = [
+                "pkgsCross"
+                "aarch64-multiplatform-musl"
+                "stdenv"
+                "cc"
+              ];
+              sourcePrefix = "aarch64-unknown-linux-musl";
+              aliasPrefix = "aarch64-linux-musl";
             };
+
+          # Keep cross compilers out of `packages`: their setup hooks would otherwise
+          # override host compiler variables used by native Rust builds.
+          crossCompilerPath = lib.makeBinPath (crossCompilerAliases ++ crossCompilers);
         in
         {
-          devShells.default = mkTgoskitsShell {
+          devShells.default = pkgs.mkShell {
             name = "tgoskits-dev";
-          };
 
-          devShells.full = mkTgoskitsShell {
-            name = "tgoskits-dev-full";
-            extraPackages = crossPackages;
+            packages = commonPackages;
+
+            LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+
+            shellHook = ''
+              export project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+              # Keep crate metadata in-tree, but never let ~/.rustup or the
+              # system rustup shims win. rust-toolchain.toml is a rustup
+              # override; /run/current-system/sw/bin/cargo will otherwise
+              # compile with ~/.rustup/toolchains/nightly-2026-07-15 and its
+              # GC'd Nix lld wrapper.
+              export CARGO_HOME="$project_root/.cargo"
+              mkdir -p "$CARGO_HOME" "$CARGO_HOME/bin"
+              export CARGO="${rustToolchain}/bin/cargo"
+              export RUSTC="${rustToolchain}/bin/rustc"
+              unset RUSTUP_TOOLCHAIN
+              export PATH="${lib.makeBinPath [ rustToolchain ]}:$CARGO_HOME/bin:${crossCompilerPath}:$PATH"
+              hash -r 2>/dev/null || true
+
+              unset CC CXX AR RANLIB
+              unset CC_x86_64_unknown_linux_gnu
+              unset CXX_x86_64_unknown_linux_gnu
+              unset AR_x86_64_unknown_linux_gnu
+              unset RANLIB_x86_64_unknown_linux_gnu
+
+              echo "TGOSKits dev shell"
+              echo "  CARGO_HOME=$CARGO_HOME"
+              echo "  CARGO=$CARGO"
+              echo "  Rust toolchain: rust-overlay from rust-toolchain.toml"
+              echo "  Cross compilers: available by target-prefixed command name"
+            '';
           };
 
           formatter = pkgs.nixfmt;

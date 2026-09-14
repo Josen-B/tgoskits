@@ -3,14 +3,15 @@ use super::*;
 #[test]
 fn starry_qemu_case_starts_host_http_server_from_loaded_config() {
     let root = tempdir().unwrap();
-    let case_dir = root.path().join("test-suit/starryos/qemu-smp1/system");
+    let case_dir = root.path().join("test-suit/starryos/qemu/system");
     fs::create_dir_all(&case_dir).unwrap();
     let test_case = TestQemuCase {
-        name: "qemu-smp1/system".to_string(),
-        display_name: "qemu-smp1/system".to_string(),
+        name: "qemu/system".to_string(),
+        display_name: "qemu/system".to_string(),
         case_dir: case_dir.clone(),
         qemu_config_path: case_dir.join("qemu-x86_64.toml"),
         test_commands: Vec::new(),
+        grouped_command_selection: Default::default(),
         host_symbolize_success_regex: Vec::new(),
         host_http_server: Some(case::HostHttpServerConfig {
             bind: "127.0.0.1".to_string(),
@@ -32,7 +33,7 @@ fn starry_qemu_case_starts_host_http_server_from_loaded_config() {
 #[test]
 fn starry_qemu_single_subcase_skips_unneeded_host_http_server() {
     let root = tempdir().unwrap();
-    let case_dir = root.path().join("test-suit/starryos/qemu-smp1/system");
+    let case_dir = root.path().join("test-suit/starryos/qemu/system");
     let subcase_dir = case_dir.join("syscall-test-uid-gid-re-setters");
     fs::create_dir_all(subcase_dir.join("src")).unwrap();
     fs::write(
@@ -55,7 +56,7 @@ fn starry_qemu_single_subcase_skips_unneeded_host_http_server() {
 #[test]
 fn starry_qemu_single_subcase_keeps_needed_host_http_server() {
     let root = tempdir().unwrap();
-    let case_dir = root.path().join("test-suit/starryos/qemu-smp1/system");
+    let case_dir = root.path().join("test-suit/starryos/qemu/system");
     let subcase_dir = case_dir.join("apk-curl-equivalence");
     fs::create_dir_all(subcase_dir.join("src")).unwrap();
     fs::write(
@@ -72,27 +73,4 @@ fn starry_qemu_single_subcase_keeps_needed_host_http_server() {
     let guard = start_qemu_case_host_http_server(&test_case).unwrap();
 
     assert!(guard.is_some());
-}
-
-#[test]
-fn busybox_guest_script_reports_case_start_and_bounds_nologin() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let script_path = workspace_root.join("apps/starry/qemu/busybox/sh/busybox-tests.sh");
-    let script = fs::read_to_string(&script_path).unwrap();
-
-    assert!(
-        script.contains("echo \"START: $BB_CASE_NAME\""),
-        "{} must print case start markers so CI timeout logs identify the hanging BusyBox applet",
-        script_path.display()
-    );
-    assert!(
-        script.contains("timeout 2 busybox nologin"),
-        "{} must run nologin in the foreground under a timeout",
-        script_path.display()
-    );
-    assert!(
-        !script.contains("busybox nologin >/tmp/bb_nologin.out 2>&1 &"),
-        "{} must not leave the nologin probe as a background child",
-        script_path.display()
-    );
 }

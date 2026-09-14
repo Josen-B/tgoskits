@@ -1,17 +1,28 @@
 //! Internal host capability traits used by the AxVM runtime.
 
-extern crate alloc;
+use std::time::Duration;
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "loongarch64"
-))]
-use alloc::boxed::Box;
-use core::time::Duration;
-
-use ax_errno::AxResult;
 use axvm_types::{HostPhysAddr, HostVirtAddr};
+
+use crate::AxVmResult;
+
+/// Action returned by a restartable task-context host timer.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostTimerAction {
+    Complete,
+    Rearm(Duration),
+}
+
+/// Action returned by an explicitly hard-IRQ-safe host timer.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostHardTimerAction {
+    Complete,
+    #[cfg(target_arch = "aarch64")]
+    Disarm,
+    Rearm(Duration),
+}
 
 /// Host memory allocation and address translation.
 pub trait HostMemory {
@@ -38,37 +49,62 @@ pub trait HostMemory {
     fn virt_to_phys(&self, vaddr: HostVirtAddr) -> HostPhysAddr;
 }
 
-/// Host time and timer operations.
+/// Host monotonic time source.
 pub trait HostTime {
-    /// Timer cancellation token.
-    type CancelToken: Copy + Send + Sync + 'static;
-
-    /// Convert nanoseconds to hardware ticks.
-    #[cfg(target_arch = "x86_64")]
-    fn nanos_to_ticks(&self, nanos: u64) -> u64;
-
     /// Read monotonic host time.
     fn monotonic_time(&self) -> Duration;
+}
 
-    /// Program the host one-shot timer.
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn set_oneshot_timer(&self, deadline_ns: u64);
+/// Completion state of non-blocking host timer cancellation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostTimerCancelOutcome {
+    /// Registration removed and payload reclaimed.
+    Cancelled,
+    /// Accepted, but callback execution or reclamation is still in flight.
+    CancellationDeferred,
+    /// No live registration remains.
+    AlreadyCompleted,
+}
 
-    /// Register a VM timer callback.
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "loongarch64"
-    ))]
+/// Typed host deadline capability used by AxVM architectural and device timers.
+pub trait HostTimer {
+    type TimerHandle: Copy + Send + Sync + 'static;
+    type HardTimerHandle: Copy + Send + Sync + Into<Self::TimerHandle> + 'static;
+
     fn register_timer(
         &self,
-        deadline_ns: u64,
+        deadline: Duration,
         callback: Box<dyn FnOnce(Duration) + Send + 'static>,
-    ) -> Self::CancelToken;
+    ) -> AxVmResult<Self::TimerHandle>;
 
-    /// Cancel a VM timer callback.
-    #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-    fn cancel_timer(&self, token: Self::CancelToken);
+    #[cfg(target_arch = "x86_64")]
+    fn register_restartable_timer(
+        &self,
+        deadline: Duration,
+        callback: Box<dyn FnMut(Duration) -> HostTimerAction + Send + 'static>,
+    ) -> AxVmResult<Self::TimerHandle>;
+
+    /// Registers one stable callback that may run in hard IRQ context.
+    ///
+    /// # Safety
+    ///
+    /// The callback must be bounded, allocation-free, non-sleeping, and use
+    /// only IRQ-safe pre-bound capabilities. It may not perform destruction or
+    /// registry lookup.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    unsafe fn register_hard_restartable_timer(
+        &self,
+        deadline: Duration,
+        callback: Box<dyn FnMut(Duration) -> HostHardTimerAction + Send + 'static>,
+    ) -> AxVmResult<Self::HardTimerHandle>;
+
+    #[cfg(target_arch = "aarch64")]
+    fn arm_hard_timer(&self, handle: Self::HardTimerHandle, deadline: Duration) -> AxVmResult;
+
+    #[cfg(target_arch = "aarch64")]
+    fn disarm_hard_timer(&self, handle: Self::HardTimerHandle) -> AxVmResult;
+
+    fn cancel_timer(&self, handle: Self::TimerHandle) -> AxVmResult<HostTimerCancelOutcome>;
 }
 
 /// Host CPU topology and affinity operations.
@@ -83,24 +119,14 @@ pub trait HostCpu {
     fn this_cpu_id(&self) -> usize;
 }
 
-/// Host console operations.
-#[cfg(target_arch = "x86_64")]
-pub trait HostConsole {
-    /// Write raw bytes to host console.
-    fn write_bytes(&self, bytes: &[u8]);
-
-    /// Read raw bytes from host console.
-    fn read_bytes(&self, bytes: &mut [u8]) -> usize;
-}
-
 /// Host platform lifecycle and virtualization controls.
 pub trait HostPlatform {
     /// Check whether hardware virtualization is available.
     fn has_hardware_support(&self) -> bool;
 
     /// Enable virtualization on the current host CPU.
-    fn enable_virtualization_on_current_cpu(&self) -> AxResult;
+    fn enable_virtualization_on_current_cpu(&self) -> AxVmResult;
 
     /// Enable virtualization on every usable host CPU.
-    fn enable_virtualization_on_all_cpus(&self) -> AxResult;
+    fn enable_virtualization_on_all_cpus(&self) -> AxVmResult;
 }

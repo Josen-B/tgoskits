@@ -6,9 +6,9 @@ use std::{
 
 use futures::task::AtomicWaker;
 use libusb1_sys::{
-    libusb_cancel_transfer, libusb_control_transfer_get_data, libusb_fill_bulk_transfer,
-    libusb_fill_control_setup, libusb_fill_control_transfer, libusb_fill_iso_transfer,
-    libusb_submit_transfer, libusb_transfer,
+    libusb_cancel_transfer, libusb_clear_halt, libusb_control_transfer_get_data,
+    libusb_fill_bulk_transfer, libusb_fill_control_setup, libusb_fill_control_transfer,
+    libusb_fill_iso_transfer, libusb_submit_transfer, libusb_transfer,
 };
 use log::trace;
 use usb_if::{
@@ -19,7 +19,7 @@ use usb_if::{
 
 use super::{device::DeviceHandle, err::transfer_status_to_result};
 use crate::backend::ty::{
-    ep::{EndpointOp, transfer_to_completion},
+    ep::{EndpointOp, EndpointResetFuture, transfer_to_completion},
     transfer::{Transfer, TransferKind},
 };
 
@@ -36,6 +36,10 @@ impl EndpointImpl {
             address,
             transfers: HashMap::new(),
         }
+    }
+
+    pub(super) fn pending_request_ids(&self) -> Vec<RequestId> {
+        self.transfers.keys().copied().map(RequestId::new).collect()
     }
 
     fn make_transfer(
@@ -201,8 +205,7 @@ impl EndpointOp for EndpointImpl {
         let id = trans.id();
         let ptr = trans.transfer;
         self.transfers.insert(id, trans);
-        let submit_result = usb!(libusb_submit_transfer(ptr))
-            .map_err(|e| TransferError::Other(anyhow!("Failed to submit transfer: {e:?}")));
+        let submit_result = usb!(libusb_submit_transfer(ptr)).map_err(TransferError::from);
 
         if submit_result.is_err() {
             self.transfers.remove(&id);
@@ -242,11 +245,29 @@ impl EndpointOp for EndpointImpl {
         let res = unsafe { libusb_cancel_transfer(trans.transfer) };
         if res == libusb1_sys::constants::LIBUSB_SUCCESS {
             Ok(())
+        } else if res == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+            Err(TransferError::Disconnected)
         } else {
             Err(TransferError::Other(anyhow!(
                 "Failed to cancel transfer: libusb error {res}"
             )))
         }
+    }
+
+    fn reset(&mut self) -> EndpointResetFuture {
+        let result = if self.transfers.is_empty() {
+            let status = unsafe { libusb_clear_halt(self.dev.raw(), self.address) };
+            if status == libusb1_sys::constants::LIBUSB_SUCCESS {
+                Ok(())
+            } else {
+                Err(TransferError::Other(anyhow!(
+                    "Failed to reset endpoint: libusb error {status}"
+                )))
+            }
+        } else {
+            Err(TransferError::QueueFull)
+        };
+        Box::pin(async move { result })
     }
 }
 

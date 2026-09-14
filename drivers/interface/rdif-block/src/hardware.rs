@@ -1,0 +1,338 @@
+use alloc::{boxed::Box, vec::Vec};
+use core::time::Duration;
+
+use crate::{
+    BlkError, CompletedRequest, DeviceInfo, HardIrqHandler, OwnedRequestBatch, QueueInfo, RequestId,
+};
+
+/// Heap-owned hardware queue transferred to one runtime maintenance task.
+pub type BHardwareQueue = Box<dyn HardwareQueue>;
+
+/// Heap-owned block controller state machine.
+pub type BBlockController = Box<dyn BlockController>;
+
+/// Receives terminal requests after hardware has relinquished DMA ownership.
+pub trait CompletionSink {
+    /// Accepts one terminal request and its completed DMA backing.
+    fn complete(&mut self, request: CompletedRequest);
+}
+
+/// Receives driver-assigned identifiers for requests accepted from one batch.
+///
+/// Calls must follow the same order in which requests were removed from the
+/// front of [`OwnedRequestBatch`].
+pub trait SubmissionSink {
+    /// Records one request whose ownership has moved to the hardware queue.
+    fn accepted(&mut self, id: RequestId);
+}
+
+/// Reason a queue stopped consuming the current submission batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchSubmitDisposition {
+    /// Every request offered within the queue's batch limit was accepted.
+    Continue,
+    /// Queue resources are exhausted; remaining requests stay runtime-owned.
+    QueueFull,
+    /// The queue can no longer submit requests safely.
+    Fatal(BlkError),
+}
+
+/// Result of one native queue batch operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchSubmitResult {
+    accepted: usize,
+    disposition: BatchSubmitDisposition,
+}
+
+impl BatchSubmitResult {
+    /// Creates a batch result.
+    pub const fn new(accepted: usize, disposition: BatchSubmitDisposition) -> Self {
+        Self {
+            accepted,
+            disposition,
+        }
+    }
+
+    /// Returns how many requests were removed from the batch.
+    pub const fn accepted(self) -> usize {
+        self.accepted
+    }
+
+    /// Returns why submission stopped.
+    pub const fn disposition(self) -> BatchSubmitDisposition {
+        self.disposition
+    }
+}
+
+/// A hardware submission/completion queue with one task-context owner.
+///
+/// The runtime must move a queue to exactly one maintenance task. Hard IRQ
+/// handlers never hold or call this object.
+pub trait HardwareQueue: Send + 'static {
+    /// Returns the stable driver-local queue identifier.
+    fn id(&self) -> usize;
+
+    /// Returns immutable device and queue constraints.
+    fn info(&self) -> QueueInfo;
+
+    /// Stages an ordered prefix of validated requests for hardware submission.
+    ///
+    /// For each removed request, the driver must synchronously report its
+    /// request identifier to `sink`. Every request not accepted must remain in
+    /// `requests` in its original order. This method does not require staged
+    /// descriptors to be visible to hardware until [`Self::commit_submissions`].
+    fn submit_batch_owned(
+        &mut self,
+        requests: &mut OwnedRequestBatch,
+        sink: &mut dyn SubmissionSink,
+    ) -> BatchSubmitResult;
+
+    /// Publishes every descriptor staged by the preceding batch operation.
+    ///
+    /// The runtime calls this exactly once when that operation accepted at
+    /// least one request, including partial and fatal results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if staged ownership cannot be published safely.
+    fn commit_submissions(&mut self) -> Result<(), BlkError>;
+
+    /// Drains completions after the runtime receives an acknowledged IRQ event.
+    ///
+    /// This method must not be called as a periodic or submit-side poll. Every
+    /// request delivered to `sink` is terminal and includes returned DMA
+    /// ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the completion queue cannot be consumed safely.
+    fn drain_completions(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError>;
+
+    /// Returns the delay requested for register-only queue progress.
+    ///
+    /// The runtime owns the timer and the shared transition deadline. This is
+    /// distinct from completion drain: expiry may advance only register and
+    /// protocol bookkeeping state and must never inspect a hardware
+    /// completion source.
+    fn register_retry_after(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Advances register-only queue state after a runtime-owned timer expires.
+    ///
+    /// `sink` receives requests whose hardware completion was acknowledged by
+    /// an earlier IRQ but whose protocol state could only become terminal
+    /// after this register transition. Implementations must not inspect a
+    /// hardware completion source from this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue cannot safely continue initialization
+    /// or recovery. Implementations may request another retry through
+    /// [`Self::register_retry_after`].
+    fn advance_register_retry(&mut self, _sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
+        Err(BlkError::NotSupported)
+    }
+
+    /// Quiesces the queue and returns every request whose DMA is safe to reuse.
+    ///
+    /// Backing still reachable by hardware must not be reported as completed.
+    /// If this method returns an error, the queue may still own DMA-visible
+    /// backing, so the caller must keep the entire queue alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when hardware cannot be quiesced completely.
+    fn shutdown(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError>;
+}
+
+/// Driver-private controller event published by a hard IRQ handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlEvent {
+    source_id: usize,
+    bits: u64,
+}
+
+impl ControlEvent {
+    /// Creates an event for one controller IRQ source.
+    pub const fn new(source_id: usize, bits: u64) -> Self {
+        Self { source_id, bits }
+    }
+
+    /// Returns the controller-local IRQ source identifier.
+    pub const fn source_id(self) -> usize {
+        self.source_id
+    }
+
+    /// Returns the opaque driver-private event bits.
+    pub const fn bits(self) -> u64 {
+        self.bits
+    }
+
+    /// Returns whether the event carries no driver-private state.
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+}
+
+/// Input that advances a [`BlockController`] lifecycle state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerEvent {
+    /// Starts the bootstrap controller and requests at least one I/O queue.
+    Start { target_queues: usize },
+    /// Retries a register-only transition before the shared deadline.
+    RegisterRetry,
+    /// Delivers state acknowledged by a hard IRQ handler.
+    Irq(ControlEvent),
+    /// Requests additional hardware queues after SMP becomes fully online.
+    OnlineSmp { target_queues: usize },
+    /// Rearms a source previously returned as masked.
+    Rearm { source_id: usize },
+    /// Masks device interrupt generation before registrations are disabled.
+    QuiesceIrqs,
+    /// Reports a queue whose request deadline expired without an IRQ.
+    Watchdog { queue_id: usize },
+    /// Stops DMA after IRQs and queue mutation are quiesced.
+    ///
+    /// The controller may return [`ControllerState::RegisterPending`] until
+    /// hardware confirms its terminal register state. Queue memory must remain
+    /// alive until the transition reaches [`ControllerState::Shutdown`].
+    Shutdown,
+}
+
+/// Observable controller progress after one state-machine transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerState {
+    /// A register-only transition should be retried after the requested delay.
+    ///
+    /// The runtime owns the shared transition deadline and sleeps on its
+    /// notification object until this delay expires. Acknowledged IRQ and
+    /// shutdown events take priority over the retry.
+    RegisterPending { retry_after: Duration },
+    /// Further progress requires a matching acknowledged IRQ event.
+    WaitingForIrq,
+    /// The requested bootstrap or SMP queue target is operational.
+    Ready,
+    /// The controller has stopped and owns no active hardware queue.
+    Shutdown,
+}
+
+/// IRQ endpoint emitted by a controller transition.
+pub struct IrqEndpoint {
+    source_id: usize,
+    queue_mask: crate::IrqQueueMask,
+    handler: Box<dyn HardIrqHandler>,
+}
+
+impl IrqEndpoint {
+    /// Creates a complete routing snapshot for one physical IRQ source.
+    ///
+    /// Emitting the same `source_id` again replaces its installed endpoint.
+    /// The driver must keep that source masked until the runtime advances
+    /// [`ControllerEvent::Rearm`] after publishing the replacement.
+    pub fn new(
+        source_id: usize,
+        queue_mask: crate::IrqQueueMask,
+        handler: Box<dyn HardIrqHandler>,
+    ) -> Self {
+        Self {
+            source_id,
+            queue_mask,
+            handler,
+        }
+    }
+
+    /// Returns the controller-local IRQ source identifier.
+    pub const fn source_id(&self) -> usize {
+        self.source_id
+    }
+
+    /// Returns the hardware queues activated by this fixed endpoint.
+    pub const fn queue_mask(&self) -> crate::IrqQueueMask {
+        self.queue_mask
+    }
+
+    /// Transfers the handler into the runtime IRQ registration token.
+    pub fn into_handler(self) -> Box<dyn HardIrqHandler> {
+        self.handler
+    }
+}
+
+/// Resources and state emitted by one controller transition.
+pub struct ControllerUpdate {
+    state: ControllerState,
+    queues: Vec<BHardwareQueue>,
+    irq_endpoints: Vec<IrqEndpoint>,
+    device_info: Option<DeviceInfo>,
+}
+
+impl ControllerUpdate {
+    /// Creates an update without newly emitted resources.
+    pub const fn state(state: ControllerState) -> Self {
+        Self {
+            state,
+            queues: Vec::new(),
+            irq_endpoints: Vec::new(),
+            device_info: None,
+        }
+    }
+
+    /// Creates an update containing newly owned queues and IRQ endpoints.
+    pub fn with_resources(
+        state: ControllerState,
+        queues: Vec<BHardwareQueue>,
+        irq_endpoints: Vec<IrqEndpoint>,
+    ) -> Self {
+        Self {
+            state,
+            queues,
+            irq_endpoints,
+            device_info: None,
+        }
+    }
+
+    /// Attaches device geometry discovered during controller initialization.
+    pub const fn with_device_info(mut self, info: DeviceInfo) -> Self {
+        self.device_info = Some(info);
+        self
+    }
+
+    /// Returns the controller state after the transition.
+    pub const fn controller_state(&self) -> ControllerState {
+        self.state
+    }
+
+    /// Transfers newly created hardware queues to the runtime.
+    pub fn take_queues(&mut self) -> Vec<BHardwareQueue> {
+        core::mem::take(&mut self.queues)
+    }
+
+    /// Transfers newly created IRQ endpoints to registration tokens.
+    pub fn take_irq_endpoints(&mut self) -> Vec<IrqEndpoint> {
+        core::mem::take(&mut self.irq_endpoints)
+    }
+
+    /// Takes newly discovered device geometry, if this transition produced it.
+    pub fn take_device_info(&mut self) -> Option<DeviceInfo> {
+        self.device_info.take()
+    }
+}
+
+/// Portable block-controller lifecycle and queue factory boundary.
+pub trait BlockController: crate::DriverGeneric {
+    /// Returns immutable namespace information for the exposed block device.
+    fn device_info(&self) -> DeviceInfo;
+
+    /// Returns the maximum number of I/O queues this configured controller can
+    /// expose. Runtime CPU and IRQ-vector limits may reduce the requested count.
+    fn max_io_queues(&self) -> usize;
+
+    /// Advances controller initialization, scaling, rearm, or shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transition is invalid, the requested resources
+    /// cannot be created, or hardware reports a terminal failure. Callers must
+    /// unwind every resource emitted by earlier successful transitions.
+    fn advance(&mut self, event: ControllerEvent) -> Result<ControllerUpdate, BlkError>;
+}

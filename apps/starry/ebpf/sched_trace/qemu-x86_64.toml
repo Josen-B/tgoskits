@@ -3,7 +3,7 @@ args = [
     "-m",
     "512M",
     "-device",
-    "virtio-blk-pci,drive=disk0",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
     "-drive",
     "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
     "-device",
@@ -13,8 +13,10 @@ args = [
 ]
 uefi = false
 to_bin = false
-shell_prefix = "root@starry:"
-shell_init_cmd = "/usr/bin/sched_trace"
-success_regex = ["(?m)^SCHED_TRACE_PASS"]
 fail_regex = ['(?i)\bpanic(?:ked)?\b', "(?m)^SCHED_TRACE_FAIL"]
 timeout = 240
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "/usr/bin/sched_trace"
+success_regex = ["(?m)^SCHED_TRACE_PASS"]

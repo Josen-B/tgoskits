@@ -14,14 +14,20 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 
 use super::{
     case as case_assets,
-    case::{CaseAssetConfig, TestQemuCase, TestQemuSubcase, TestQemuSubcaseKind},
+    case::{
+        CaseAssetConfig, GroupedCommandSelection, TestQemuCase, TestQemuSubcase,
+        TestQemuSubcaseKind,
+    },
     timing,
 };
-use crate::{context::CrossCompileSpec, support::process::ProcessExt};
+use crate::{
+    context::CrossCompileSpec,
+    support::process::{ProcessExt, find_host_binary_candidates},
+};
 
 const CASE_C_DIR_NAME: &str = "c";
 const CASE_PREBUILD_SCRIPT_NAME: &str = "prebuild.sh";
@@ -56,7 +62,7 @@ mod rust;
 mod toolchain;
 mod wrappers;
 
-pub(crate) use c::{case_c_source_dir, prepare_c_case_assets_sync};
+pub(crate) use c::{case_c_source_dir, prepare_c_case_assets_sync, prepare_c_case_overlay_sync};
 use c::{
     case_rust_prebuild_script_path, grouped_c_root_project_path,
     grouped_c_subcase_prebuild_script_path, grouped_c_subcase_source_dir,
@@ -71,12 +77,14 @@ pub(crate) use grouped_c::prepare_grouped_case_assets_sync;
 use prebuild::{build_prebuild_command, build_prebuild_command_with_work_dir};
 use python::write_musl_loader_search_path;
 pub(crate) use python::{case_python_source_dir, prepare_python_case_assets_sync};
-pub(crate) use rust::{case_rust_source_dir, prepare_rust_case_assets_sync};
+pub(crate) use rust::{
+    case_rust_source_dir, prepare_rust_case_assets_sync, prepare_rust_case_overlay_sync,
+};
+pub(crate) use toolchain::find_cross_tool_qemu;
 use toolchain::{cross_compile_spec, write_cmake_toolchain_file, write_cross_bin_wrappers};
 use wrappers::{
-    apply_case_script_envs, case_script_envs, ensure_guest_tool_exists,
-    find_host_binary_candidates, guest_library_path, qemu_user_binary_names,
-    write_guest_command_wrappers, write_guest_exec_wrapper,
+    apply_case_script_envs, case_script_envs, ensure_guest_tool_exists, guest_library_path,
+    qemu_user_binary_names, write_guest_command_wrappers, write_guest_exec_wrapper,
 };
 
 #[cfg(test)]

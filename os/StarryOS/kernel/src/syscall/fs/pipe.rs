@@ -1,11 +1,13 @@
 use core::ffi::c_int;
 
-use ax_errno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK};
-use starry_vm::VmMutPtr;
 
-use crate::file::{FileLike, Pipe, close_file_like};
+use crate::{
+    StarryError,
+    file::{FileLike, Pipe, close_file_like},
+    mm::VmMutPtr,
+};
 
 bitflags! {
     /// Flags for the `pipe2` syscall.
@@ -18,10 +20,14 @@ bitflags! {
     }
 }
 
-pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
+pub fn sys_pipe2(
+    current: &crate::task::UserTaskRef,
+    fds: *mut [c_int; 2],
+    flags: u32,
+) -> crate::StarryResult<isize> {
     let flags = PipeFlags::from_bits(flags).ok_or_else(|| {
         warn!("sys_pipe2 <= unrecognized flags: {flags}");
-        AxError::InvalidInput
+        StarryError::InvalidInput
     })?;
 
     let cloexec = flags.contains(PipeFlags::CLOEXEC);
@@ -35,7 +41,7 @@ pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
         .add_to_fd_table(cloexec)
         .inspect_err(|_| close_file_like(read_fd).unwrap())?;
 
-    if let Err(err) = fds.vm_write([read_fd, write_fd]) {
+    if let Err(err) = fds.vm_write(current, [read_fd, write_fd]) {
         close_file_like(read_fd).ok();
         close_file_like(write_fd).ok();
         return Err(err.into());

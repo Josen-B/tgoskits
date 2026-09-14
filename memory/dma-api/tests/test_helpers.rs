@@ -3,7 +3,10 @@ use std::{
     collections::HashMap,
     num::NonZeroUsize,
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use dma_api::*;
@@ -64,6 +67,13 @@ pub struct TrackingDmaOp {
     next_dma_addr: Arc<Mutex<u64>>,
     forced_dma_addr: Arc<Mutex<Option<u64>>>,
     map_allocations: Arc<Mutex<HashMap<usize, core::alloc::Layout>>>,
+    fail_coherent_release: Arc<AtomicBool>,
+}
+
+impl Default for TrackingDmaOp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrackingDmaOp {
@@ -73,6 +83,7 @@ impl TrackingDmaOp {
             next_dma_addr: Arc::new(Mutex::new(0x1000)),
             forced_dma_addr: Arc::new(Mutex::new(None)),
             map_allocations: Arc::new(Mutex::new(HashMap::new())),
+            fail_coherent_release: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,6 +94,10 @@ impl TrackingDmaOp {
 
     pub fn force_next_dma_addr(&self, dma_addr: u64) {
         *self.forced_dma_addr.lock().unwrap() = Some(dma_addr);
+    }
+
+    pub fn fail_coherent_release(&self) {
+        self.fail_coherent_release.store(true, Ordering::SeqCst);
     }
 
     pub fn operations(&self) -> Vec<DmaOperation> {
@@ -152,7 +167,7 @@ impl TrackingDmaOp {
         let ptr = unsafe { alloc_zeroed(layout) };
         let cpu_addr = NonNull::new(ptr)?;
         let dma_addr = self.alloc_dma_addr(layout, constraints);
-        Some(unsafe { DmaAllocHandle::new(cpu_addr, dma_addr.into(), layout) })
+        Some(unsafe { DmaAllocHandle::new(cpu_addr, cpu_addr, dma_addr.into(), layout) })
     }
 }
 
@@ -203,14 +218,18 @@ impl DmaOp for TrackingDmaOp {
         unsafe { self.alloc_handle(constraints, layout) }
     }
 
-    unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) {
+    unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
         self.operations
             .lock()
             .unwrap()
             .push(DmaOperation::DeallocCoherent {
                 size: handle.size(),
             });
+        if self.fail_coherent_release.load(Ordering::SeqCst) {
+            return Err(DmaError::CoherentReleaseFailed);
+        }
         unsafe { dealloc(handle.as_ptr().as_ptr(), handle.layout()) };
+        Ok(())
     }
 
     unsafe fn map_streaming(
@@ -307,6 +326,7 @@ impl DmaOp for TrackingDmaOp {
         offset: usize,
         size: usize,
         direction: DmaDirection,
+        _coherency: DmaCoherency,
     ) {
         self.operations
             .lock()
@@ -332,6 +352,7 @@ impl DmaOp for TrackingDmaOp {
         offset: usize,
         size: usize,
         direction: DmaDirection,
+        _coherency: DmaCoherency,
     ) {
         self.operations
             .lock()

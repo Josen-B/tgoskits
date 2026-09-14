@@ -22,47 +22,65 @@
 //!
 //! The crate contains the following key components:
 //!
-//! - [`BaseDeviceOps`]: The core trait that all emulated devices must implement.
-//! - [`EmuDeviceType`]: Enumeration representing the type of emulator devices
-//!   (re-exported from `axvmconfig` crate).
-//! - [`EmulatedDeviceConfig`]: Configuration structure for device initialization.
-//! - Trait aliases for specific device types:
-//!   - [`BaseMmioDeviceOps`]: For MMIO (Memory-Mapped I/O) devices.
-//!   - [`BaseSysRegDeviceOps`]: For system register devices.
-//!   - [`BasePortDeviceOps`]: For port I/O devices.
+//! - [`Device`]: The unified V3 device trait used by the runtime hot path.
+//! - [`DeviceAccess`]: Immutable metadata for one guest device access.
+//! - [`DeviceContext`]: Access-scoped runtime capabilities passed to devices.
+//! - [`Resource`]: Static device resource declarations used for registration
+//!   validation and bus dispatch.
+//! - [`VirtualInterruptController`], [`WiredIrqInput`], and [`IrqLine`]:
+//!   architecture-neutral interrupt connections used by device factories.
 //!
 //! # Usage
 //!
-//! To implement a custom emulated device, you need to implement the [`BaseDeviceOps`]
-//! trait with the appropriate address range type:
+//! New emulated devices should implement [`Device`] directly and receive all
+//! sensitive runtime abilities through [`DeviceContext`].
 //!
 //! ```rust,ignore
-//! use axdevice_base::{BaseDeviceOps, EmuDeviceType};
-//! use axaddrspace::{GuestPhysAddrRange, device::AccessWidth};
-//! use ax_errno::AxResult;
+//! use axdevice_base::{
+//!     AccessWidth, BusKind, Device, DeviceAccess, DeviceContext, DeviceError,
+//!     DeviceVcpuId, Resource,
+//! };
 //!
 //! struct MyDevice {
 //!     base_addr: usize,
 //!     size: usize,
+//!     resources: [Resource; 1],
 //! }
 //!
-//! impl BaseDeviceOps<GuestPhysAddrRange> for MyDevice {
-//!     fn emu_type(&self) -> EmuDeviceType {
-//!         EmuDeviceType::Dummy
+//! impl Device for MyDevice {
+//!     fn name(&self) -> &str {
+//!         "my-device"
 //!     }
 //!
-//!     fn address_range(&self) -> GuestPhysAddrRange {
-//!         (self.base_addr..self.base_addr + self.size).try_into().unwrap()
+//!     fn resources(&self) -> &[Resource] {
+//!         &self.resources
 //!     }
 //!
-//!     fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
-//!         // Handle read operation
-//!         Ok(0)
+//!     fn read(
+//!         &self,
+//!         access: &DeviceAccess,
+//!         _context: &mut dyn DeviceContext,
+//!     ) -> Result<u64, DeviceError> {
+//!         match access.bus() {
+//!             BusKind::Mmio => Ok(0),
+//!             _ => Err(DeviceError::OutOfRange {
+//!                 addr: access.address(),
+//!             }),
+//!         }
 //!     }
 //!
-//!     fn handle_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
-//!         // Handle write operation
-//!         Ok(())
+//!     fn write(
+//!         &self,
+//!         access: &DeviceAccess,
+//!         _value: u64,
+//!         _context: &mut dyn DeviceContext,
+//!     ) -> Result<(), DeviceError> {
+//!         match access.bus() {
+//!             BusKind::Mmio => Ok(()),
+//!             _ => Err(DeviceError::OutOfRange {
+//!                 addr: access.address(),
+//!             }),
+//!         }
 //!     }
 //! }
 //! ```
@@ -73,7 +91,6 @@
 //! by default.
 
 #![no_std]
-#![feature(trait_alias)]
 // trait_upcasting has been stabilized in Rust 1.86, but we still need a while to update the minimum
 // Rust version of Axvisor.
 #![allow(stable_features)]
@@ -86,269 +103,22 @@ extern crate alloc;
 
 mod device;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
-use core::any::Any;
+use alloc::{string::String, sync::Arc};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub use ax_errno::AxResult;
-pub use axvm_types::{
-    EmulatedDeviceType as EmuDeviceType, GuestPhysAddr, GuestPhysAddrRange, InterruptTriggerMode,
-    IrqLineId,
-};
+pub use axvm_types::{GuestPhysAddr, GuestPhysAddrRange, InterruptTriggerMode, IrqLineId};
 
 pub use crate::device::{
-    AccessWidth, BusAccess, BusKind, BusResponse, DeviceAddr, DeviceAddrRange, DeviceError, Port,
-    PortRange, SysRegAddr, SysRegAddrRange,
+    AccessWidth, BusKind, DeviceAccess, DeviceAddr, DeviceAddrRange, DeviceError, DeviceResult,
+    Port, PortRange, SysRegAddr, SysRegAddrRange,
 };
-
-/// Represents the configuration of an emulated device for a virtual machine.
-///
-/// This structure holds all the necessary information to initialize and configure
-/// an emulated device, including its memory mapping, interrupt configuration, and
-/// device-specific parameters.
-///
-/// # Fields
-///
-/// - `name`: A human-readable identifier for the device.
-/// - `base_ipa`: The starting address in guest physical address space.
-/// - `length`: The size of the device's address space in bytes.
-/// - `irq_id`: The interrupt line number for device interrupts.
-/// - `emu_type`: Numeric identifier for the device type.
-/// - `cfg_list`: Device-specific configuration parameters.
-///
-/// # Example
-///
-/// ```rust
-/// use axdevice_base::EmulatedDeviceConfig;
-///
-/// let config = EmulatedDeviceConfig {
-///     name: "uart0".into(),
-///     base_ipa: 0x0900_0000,
-///     length: 0x1000,
-///     irq_id: 33,
-///     emu_type: 1,
-///     cfg_list: vec![115200], // baud rate
-/// };
-/// ```
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EmulatedDeviceConfig {
-    /// The name of the device.
-    ///
-    /// This is a human-readable identifier used for logging, debugging, and
-    /// device tree generation. It should be unique within a virtual machine.
-    pub name: String,
-
-    /// The base IPA (Intermediate Physical Address) of the device.
-    ///
-    /// This is the starting address in the guest's physical address space
-    /// where the device's registers are mapped. The guest OS will use this
-    /// address to access the device.
-    pub base_ipa: usize,
-
-    /// The length of the device's address space in bytes.
-    ///
-    /// This defines the size of the memory region that the device occupies.
-    /// Any access within `[base_ipa, base_ipa + length)` will be routed to
-    /// this device.
-    pub length: usize,
-
-    /// The IRQ (Interrupt Request) ID of the device.
-    ///
-    /// This is the interrupt line number that the device uses to signal
-    /// events to the guest. The value should correspond to a valid interrupt
-    /// ID in the virtual interrupt controller.
-    pub irq_id: usize,
-
-    /// The type of emulated device.
-    ///
-    /// This numeric value identifies the device type and is used by the
-    /// device manager to instantiate the correct device implementation.
-    /// See [`EmuDeviceType`] for predefined device types.
-    pub emu_type: usize,
-
-    /// Device-specific configuration parameters.
-    ///
-    /// This is a list of configuration values whose meaning depends on the
-    /// specific device type. For example, a UART device might use this to
-    /// specify baud rate, while a virtio device might use it for queue sizes.
-    pub cfg_list: Vec<usize>,
-}
-
-/// The core trait that all emulated devices must implement.
-///
-/// This trait defines the common interface for all virtual devices in the hypervisor.
-/// It provides methods for device identification, address range querying, and
-/// handling read/write operations from the guest.
-///
-/// # Type Parameters
-///
-/// - `R`: The address range type that the device uses. This determines the
-///   addressing scheme (MMIO, port I/O, system registers, etc.).
-///
-/// # Implementation Notes
-///
-/// - All implementations must also implement [`Any`] to support runtime type checking.
-/// - The `handle_read` and `handle_write` methods are called by the hypervisor's
-///   trap handler when the guest accesses the device's address range.
-/// - Implementations should handle concurrent access appropriately if the device
-///   can be accessed from multiple vCPUs.
-///
-/// # Example
-///
-/// See the crate-level documentation for a complete implementation example.
-pub trait BaseDeviceOps<R: DeviceAddrRange>: Any {
-    /// Returns the type of the emulated device.
-    ///
-    /// This is used by the device manager to identify the device type and
-    /// perform type-specific operations.
-    fn emu_type(&self) -> EmuDeviceType;
-
-    /// Returns the address range that this device occupies.
-    ///
-    /// The returned range is used by the hypervisor to route guest memory
-    /// accesses to the appropriate device handler.
-    fn address_range(&self) -> R;
-
-    /// Handles a read operation on the emulated device.
-    ///
-    /// # Arguments
-    ///
-    /// - `addr`: The address within the device's range being read.
-    /// - `width`: The access width (byte, halfword, word, or doubleword).
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(value)`: The value read from the device register.
-    /// - `Err(error)`: An error if the read operation failed.
-    ///
-    /// # Notes
-    ///
-    /// Implementations should respect the `width` parameter and only return
-    /// data of the appropriate size. The returned value should be zero-extended
-    /// if necessary.
-    fn handle_read(&self, addr: R::Addr, width: AccessWidth) -> AxResult<usize>;
-
-    /// Handles a write operation on the emulated device.
-    ///
-    /// # Arguments
-    ///
-    /// - `addr`: The address within the device's range being written.
-    /// - `width`: The access width (byte, halfword, word, or doubleword).
-    /// - `val`: The value to write to the device register.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())`: The write operation completed successfully.
-    /// - `Err(error)`: An error if the write operation failed.
-    ///
-    /// # Notes
-    ///
-    /// Implementations should only use the lower bits of `val` corresponding
-    /// to the specified `width`.
-    fn handle_write(&self, addr: R::Addr, width: AccessWidth, val: usize) -> AxResult;
-}
-
-/// Attempts to downcast a device to a specific type and apply a function to it.
-///
-/// This function is useful when you have a trait object (`Arc<dyn BaseDeviceOps<R>>`)
-/// and need to access type-specific methods or data of the underlying concrete type.
-///
-/// # Type Parameters
-///
-/// - `T`: The concrete device type to downcast to. Must implement `BaseDeviceOps<R>`.
-/// - `R`: The address range type.
-/// - `U`: The return type of the mapping function.
-/// - `F`: The function to apply if the downcast succeeds.
-///
-/// # Arguments
-///
-/// - `device`: A reference to the device trait object.
-/// - `f`: A function to call with a reference to the concrete device type.
-///
-/// # Returns
-///
-/// - `Some(result)`: If the device is of type `T`, returns the result of `f`.
-/// - `None`: If the device is not of type `T`.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use axdevice_base::{BaseDeviceOps, map_device_of_type};
-/// use alloc::sync::Arc;
-///
-/// struct UartDevice {
-///     baud_rate: u32,
-/// }
-///
-/// impl UartDevice {
-///     fn get_baud_rate(&self) -> u32 {
-///         self.baud_rate
-///     }
-/// }
-///
-/// // ... implement BaseDeviceOps for UartDevice ...
-///
-/// fn check_uart_config(device: &Arc<dyn BaseMmioDeviceOps>) {
-///     if let Some(baud_rate) = map_device_of_type(device, |uart: &UartDevice| {
-///         uart.get_baud_rate()
-///     }) {
-///         println!("UART baud rate: {}", baud_rate);
-///     }
-/// }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "Use Device::as_any().downcast_ref() via MmioDeviceAdapter instead"
-)]
-pub fn map_device_of_type<T: BaseDeviceOps<R>, R: DeviceAddrRange, U, F: FnOnce(&T) -> U>(
-    device: &Arc<dyn BaseDeviceOps<R>>,
-    f: F,
-) -> Option<U> {
-    let any_arc: Arc<dyn Any> = device.clone();
-
-    any_arc.downcast_ref::<T>().map(f)
-}
-
-// Trait aliases are limited yet: https://github.com/rust-lang/rfcs/pull/3437
-
-/// Trait alias for MMIO (Memory-Mapped I/O) device operations.
-///
-/// This is a convenience alias for [`BaseDeviceOps`] with [`GuestPhysAddrRange`]
-/// as the address range type. MMIO devices are the most common type of virtual
-/// devices, where device registers are accessed through memory read/write operations.
-///
-/// # Supported Architectures
-///
-/// MMIO devices are supported on all architectures (x86_64, ARM, RISC-V).
-pub trait BaseMmioDeviceOps = BaseDeviceOps<GuestPhysAddrRange>;
-
-/// Trait alias for system register device operations.
-///
-/// This is a convenience alias for [`BaseDeviceOps`] with [`SysRegAddrRange`]
-/// as the address range type. System register devices are typically used on
-/// ARM architectures to emulate system registers accessed via MSR/MRS instructions.
-///
-/// # Supported Architectures
-///
-/// System register devices are primarily used on ARM/AArch64 architectures.
-pub trait BaseSysRegDeviceOps = BaseDeviceOps<SysRegAddrRange>;
-
-/// Trait alias for port I/O device operations.
-///
-/// This is a convenience alias for [`BaseDeviceOps`] with [`PortRange`]
-/// as the address range type. Port I/O devices are used on x86 architectures
-/// where device registers are accessed via IN/OUT instructions.
-///
-/// # Supported Architectures
-///
-/// Port I/O devices are only used on x86/x86_64 architectures.
-pub trait BasePortDeviceOps = BaseDeviceOps<PortRange>;
 
 // ---------------------------------------------------------------------------
 // New unified device-registration types (device / interrupt framework refactoring)
 // ---------------------------------------------------------------------------
 
 /// Opaque identifier assigned to a device when it is registered into a
-/// [`AxVmDevices`].
+/// [`DeviceRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceId(u32);
 
@@ -360,6 +130,26 @@ impl DeviceId {
 
     /// Returns the raw `u32` value.
     pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// VM-local identity of the vCPU that issued one trapped device access.
+///
+/// This value describes the architectural accessor, not the physical CPU that
+/// happens to execute the device callback. It remains valid when exit handling
+/// is preempted or migrates between host CPUs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceVcpuId(usize);
+
+impl DeviceVcpuId {
+    /// Creates a device-access vCPU identifier from its VM-local value.
+    pub const fn new(id: usize) -> Self {
+        Self(id)
+    }
+
+    /// Returns the VM-local numeric identifier.
+    pub const fn as_usize(self) -> usize {
         self.0
     }
 }
@@ -381,7 +171,7 @@ pub enum Arch {
 ///
 /// The device manager uses this information for address-range conflict
 /// detection and architecture-suitability checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Resource {
     /// An MMIO address window.
     MmioRange {
@@ -404,31 +194,57 @@ pub enum Resource {
         /// Number of registers in the range.
         count: u32,
     },
+    /// An exclusive IRQ line connected to the VM's interrupt fabric.
+    ///
+    /// The `line` is an architecture-neutral identifier on the virtual
+    /// interrupt controller input side (e.g. GSI, INTID, or PLIC source).
+    /// It is not a host `IrqId`, CPU trap vector, or physical IRQ.
+    ///
+    /// This stage only supports exclusive declaration. Sharing policy
+    /// will be added when a concrete device needs it.
+    IrqLine {
+        /// The interrupt line number.
+        line: u32,
+        /// The trigger mode configured for this line.
+        trigger: InterruptTriggerMode,
+    },
 }
 
 /// The reason a resource was rejected as structurally invalid during
 /// validation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum InvalidResourceReason {
     /// The resource has a size or count of zero.
+    #[error("resource size or count is zero")]
     ZeroSized,
     /// The resource's end address overflows the address space.
+    #[error("resource end address overflows")]
     AddressOverflow,
     /// The resource extends past the valid bus address range.
+    #[error("resource extends beyond the bus address range")]
     OutOfBusRange,
     /// The bus kind of the resource is not supported on the current
     /// architecture.
+    #[error("resource bus is unsupported on this architecture")]
     UnsupportedOnArchitecture,
     /// The device declared multiple resources of the same bus kind whose
     /// address ranges overlap each other, which would corrupt the
     /// dispatch index.
+    #[error("device resources overlap")]
     OverlappingResources,
+    /// The device declared the same IRQ line more than once.
+    #[error("duplicate IRQ line {line}")]
+    DuplicateIrqLine {
+        /// The duplicated line number.
+        line: u32,
+    },
 }
 
 /// Errors that can be returned when registering a device.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum RegistryError {
     /// The device declared a resource that is structurally invalid.
+    #[error("invalid device resource {resource:?}: {reason}")]
     InvalidResource {
         /// The invalid resource.
         resource: Resource,
@@ -436,6 +252,10 @@ pub enum RegistryError {
         reason: InvalidResourceReason,
     },
     /// Two devices claim overlapping address ranges.
+    #[error(
+        "device resource {resource:?} conflicts with {existing:?} owned by device \
+         {existing_device:?}"
+    )]
     AddressConflict {
         /// The resource the new device is attempting to register.
         resource: Resource,
@@ -446,6 +266,7 @@ pub enum RegistryError {
     },
     /// The device requested a bus type that the current architecture does
     /// not support (e.g. Port I/O on AArch64).
+    #[error("device bus {kind:?} is unsupported on {arch:?}")]
     BusKindNotSupported {
         /// The unsupported bus kind.
         kind: BusKind,
@@ -453,6 +274,10 @@ pub enum RegistryError {
         arch: Arch,
     },
     /// The device is not compatible with the current target architecture.
+    #[error(
+        "device {device_name} requires {required_arch:?}, but the current architecture is \
+         {current_arch:?}"
+    )]
     ArchNotSupported {
         /// Human-readable device name (for diagnostics).
         device_name: String,
@@ -461,26 +286,36 @@ pub enum RegistryError {
         /// The architecture the hypervisor is currently built for.
         current_arch: Arch,
     },
+    /// Two devices claim the same IRQ line.
+    #[error("IRQ line {line} conflicts with device {existing_device:?}")]
+    IrqLineConflict {
+        /// The IRQ line the new device is attempting to register.
+        line: u32,
+        /// The device that already owns the conflicting IRQ line.
+        existing_device: DeviceId,
+    },
+    /// The registry state does not allow the requested operation.
+    #[error("invalid device registry state for {operation}: {detail}")]
+    InvalidState {
+        /// The operation rejected by the current state.
+        operation: &'static str,
+        /// Diagnostic detail describing the current state.
+        detail: String,
+    },
 }
 
 /// The unified device trait.
 ///
 /// Every emulated device (interrupt controller, UART, virtio-blk, …)
 /// implements this trait.  The device manager calls [`resources`](Device::resources)
-/// at registration time for conflict detection and [`handle`](Device::handle)
-/// on the hot path whenever a vCPU exit is dispatched to this device.
+/// at registration time for conflict detection and [`read`](Device::read) or
+/// [`write`](Device::write) on the hot path whenever a vCPU exit is dispatched
+/// to this device.
 ///
-/// # Downcasting
-///
-/// `Device` extends [`Any`](core::any::Any) so callers can downcast to a
-/// concrete device type via [`as_any`](Device::as_any):
-///
-/// ```ignore
-/// if let Some(vgic) = device.as_any().downcast_ref::<VGicD>() {
-///     vgic.assign_irq(32, cpu_id, (0, 0, 0, cpu_id));
-/// }
-/// ```
-pub trait Device: Send + Sync + Any {
+/// Concrete collaboration between devices and architecture code should be
+/// exposed through typed services registered with the VM device runtime, not
+/// through production downcasts from `Arc<dyn Device>`.
+pub trait Device: Send + Sync {
     /// Returns a human-readable name for this device (used in logging and
     /// diagnostics).
     fn name(&self) -> &str;
@@ -493,35 +328,450 @@ pub trait Device: Send + Sync + Any {
     /// path without allocation.
     fn resources(&self) -> &[Resource];
 
-    /// Handles a single bus access.
+    /// Handles one guest read with runtime-scoped device capabilities.
+    fn read(&self, access: &DeviceAccess, context: &mut dyn DeviceContext) -> DeviceResult<u64>;
+
+    /// Handles one guest write with runtime-scoped device capabilities.
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        context: &mut dyn DeviceContext,
+    ) -> DeviceResult;
+}
+
+macro_rules! define_grant {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone)]
+        pub struct $name {
+            token: Arc<()>,
+        }
+
+        impl $name {
+            /// Creates a grant token that has no authority until a
+            /// [`DeviceRuntime`](crate::DeviceRegistry) records it for a
+            /// specific device during transactional registration.
+            pub fn new() -> Self {
+                Self { token: Arc::new(()) }
+            }
+
+            /// Returns whether two handles refer to the same grant token.
+            pub fn same_token(&self, other: &Self) -> bool {
+                Arc::ptr_eq(&self.token, &other.token)
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+    };
+}
+
+define_grant!(
+    /// Permission token for access-scoped guest-memory DMA.
+    DmaGrant
+);
+define_grant!(
+    /// Permission token for virtual timer scheduling.
+    TimerGrant
+);
+define_grant!(
+    /// Permission token for waking a vCPU from a device.
+    WakeGrant
+);
+define_grant!(
+    /// Permission token for requesting VM stop/suspend style actions.
+    StopGrant
+);
+
+/// Binding generation for one routed-device grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoutedBindingGeneration(u64);
+
+impl RoutedBindingGeneration {
+    /// Creates a binding generation value.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric generation value for diagnostics and comparisons.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// Admission epoch for one routed-device grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoutedAdmissionEpoch(u64);
+
+impl RoutedAdmissionEpoch {
+    /// Creates an admission epoch value.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric epoch value for diagnostics and comparisons.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// Runtime-created capability for entering one routed device context.
+///
+/// The constructor only creates an inert handle. The device runtime gives a
+/// handle authority by registering the exact token for one final device,
+/// binding generation, and admission epoch. The DMA flag is a root-side
+/// snapshot: it never replaces the endpoint's separately registered
+/// [`DmaGrant`].
+struct RoutedGrantAdmission {
+    open: AtomicBool,
+    epoch: AtomicU64,
+}
+
+impl RoutedGrantAdmission {
+    #[cfg(feature = "runtime-internal")]
+    fn new(epoch: RoutedAdmissionEpoch) -> Self {
+        Self {
+            open: AtomicBool::new(true),
+            epoch: AtomicU64::new(epoch.value()),
+        }
+    }
+
+    fn is_open_at(&self, epoch: RoutedAdmissionEpoch) -> bool {
+        self.epoch.load(Ordering::Acquire) == epoch.value() && self.open.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "runtime-internal")]
+    fn close(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
+    #[cfg(feature = "runtime-internal")]
+    fn reopen(&self, epoch: RoutedAdmissionEpoch) {
+        self.epoch.store(epoch.value(), Ordering::Release);
+        self.open.store(true, Ordering::Release);
+    }
+}
+
+/// Lifetime state for a grant that has already passed routed admission.
+///
+/// This state is deliberately separate from [`RoutedGrantAdmission`]. The
+/// latter controls whether a new callback may be admitted; this state keeps
+/// one callback admitted until its runtime-owned scope guard is dropped.
+struct ScopedRoutedGrantAdmission {
+    active: AtomicBool,
+}
+
+impl ScopedRoutedGrantAdmission {
+    #[cfg(feature = "runtime-internal")]
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        // Acquire observes the Release performed by the scope guard's Drop.
+        self.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "runtime-internal")]
+    fn close(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+/// Runtime-owned guard that keeps an admitted routed grant valid.
+///
+/// This type is only constructed by the device runtime after a route
+/// admission succeeds. Cloning the associated grant does not extend this
+/// guard's lifetime: every clone observes the same active bit.
+#[cfg(feature = "runtime-internal")]
+#[doc(hidden)]
+#[must_use = "the scope guard keeps an admitted routed grant valid"]
+pub struct RoutedGrantScope {
+    admission: Arc<ScopedRoutedGrantAdmission>,
+}
+
+#[cfg(feature = "runtime-internal")]
+impl Drop for RoutedGrantScope {
+    fn drop(&mut self) {
+        self.admission.close();
+    }
+}
+
+/// An inert or scope-bound handle for temporarily entering one runtime-routed
+/// device.
+#[derive(Clone)]
+pub struct RoutedDeviceGrant {
+    device_id: DeviceId,
+    binding_generation: RoutedBindingGeneration,
+    admission_epoch: RoutedAdmissionEpoch,
+    dma_enabled: bool,
+    token: Arc<()>,
+    admission: Arc<RoutedGrantAdmission>,
+    scoped_admission: Option<Arc<ScopedRoutedGrantAdmission>>,
+}
+
+impl RoutedDeviceGrant {
+    /// Creates an inert routed-device handle for a binding snapshot.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn new(
+        device_id: DeviceId,
+        binding_generation: RoutedBindingGeneration,
+        admission_epoch: RoutedAdmissionEpoch,
+        dma_enabled: bool,
+    ) -> Self {
+        Self {
+            device_id,
+            binding_generation,
+            admission_epoch,
+            dma_enabled,
+            token: Arc::new(()),
+            admission: Arc::new(RoutedGrantAdmission::new(admission_epoch)),
+            scoped_admission: None,
+        }
+    }
+
+    /// Returns the final device identity selected by this route.
+    pub const fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns the binding generation selected by this route.
+    pub const fn binding_generation(&self) -> RoutedBindingGeneration {
+        self.binding_generation
+    }
+
+    /// Returns the admission epoch selected by this route.
+    pub const fn admission_epoch(&self) -> RoutedAdmissionEpoch {
+        self.admission_epoch
+    }
+
+    /// Returns the root's bus-master-enable snapshot.
+    pub const fn dma_enabled(&self) -> bool {
+        self.dma_enabled
+    }
+
+    /// Returns whether two handles carry the same routing authority.
+    pub fn same_token(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.token, &other.token)
+    }
+
+    /// Returns whether this snapshot may enter a routed device context.
     ///
-    /// This is the hot-path entry point called from [`BusRouter::dispatch`].
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError>;
-
-    /// Returns a reference to `self` as `&dyn Any` for downcasting.
-    fn as_any(&self) -> &dyn Any;
-
-    /// Resets the device to its power-on state.
-    #[allow(unused_variables)]
-    fn reset(&mut self) -> Result<(), DeviceError> {
-        Ok(())
+    /// Ordinary snapshots require their shared admission epoch to remain
+    /// open. A snapshot produced by the runtime's admission conversion
+    /// instead remains valid until its scope guard is dropped, so closing the
+    /// shared admission does not revoke an already admitted callback.
+    pub fn admission_is_open(&self) -> bool {
+        self.scoped_admission.as_ref().map_or_else(
+            || self.admission.is_open_at(self.admission_epoch),
+            |admission| admission.is_active(),
+        )
     }
 
-    /// Puts the device into a low-power or suspended state.
-    #[allow(unused_variables)]
-    fn suspend(&mut self) -> Result<(), DeviceError> {
-        Ok(())
+    /// Converts an already validated, currently admitted grant into a
+    /// scope-bound grant.
+    ///
+    /// The caller must retain the returned guard for the full callback
+    /// lifetime. Dropping it invalidates this grant and all of its clones.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn admit(mut self) -> Option<(Self, RoutedGrantScope)> {
+        if self.scoped_admission.is_some() || !self.admission.is_open_at(self.admission_epoch) {
+            return None;
+        }
+        let admission = Arc::new(ScopedRoutedGrantAdmission::new());
+        self.scoped_admission = Some(admission.clone());
+        Some((self, RoutedGrantScope { admission }))
     }
 
-    /// Restores the device from a suspended state.
-    #[allow(unused_variables)]
-    fn resume(&mut self) -> Result<(), DeviceError> {
-        Ok(())
+    /// Closes validation for this grant's current epoch.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn close_admission(&self) {
+        self.admission.close();
+    }
+
+    /// Creates the next admission-epoch snapshot without changing binding
+    /// generation or routing identity.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn with_admission_epoch(&self, admission_epoch: RoutedAdmissionEpoch) -> Self {
+        Self {
+            device_id: self.device_id,
+            binding_generation: self.binding_generation,
+            admission_epoch,
+            dma_enabled: self.dma_enabled,
+            token: self.token.clone(),
+            admission: self.admission.clone(),
+            scoped_admission: None,
+        }
+    }
+
+    /// Reopens this grant's shared admission at a fresh epoch.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn reopen_admission(&self, admission_epoch: RoutedAdmissionEpoch) {
+        self.admission.reopen(admission_epoch);
+    }
+
+    /// Copies this route with a freshly captured bus-master-enable snapshot.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn with_dma_enabled(&self, dma_enabled: bool) -> Self {
+        Self {
+            device_id: self.device_id,
+            binding_generation: self.binding_generation,
+            admission_epoch: self.admission_epoch,
+            dma_enabled,
+            token: self.token.clone(),
+            admission: self.admission.clone(),
+            scoped_admission: self.scoped_admission.clone(),
+        }
+    }
+}
+
+/// Guest-memory operations made available to a device runtime.
+///
+/// This boundary deliberately carries no device identity or grant. The
+/// runtime validates those before delegating to this VM-owned memory port.
+pub trait GuestMemoryAccess {
+    /// Reads bytes from guest physical memory.
+    fn read(&mut self, addr: GuestPhysAddr, data: &mut [u8]) -> DeviceResult;
+
+    /// Writes bytes to guest physical memory.
+    fn write(&mut self, addr: GuestPhysAddr, data: &[u8]) -> DeviceResult;
+}
+
+/// Runtime capability context scoped to one device callback.
+///
+/// The device runtime creates this context immediately before calling
+/// [`Device::read`] or [`Device::write`] and drops it before returning to the
+/// architecture exit handler. Sensitive abilities such as guest-memory DMA,
+/// timer scheduling, vCPU wake, and VM stop requests are denied by default and
+/// become available only when the current device presents the matching
+/// registration-time grant.
+pub trait DeviceContext {
+    /// Returns the identity of the device currently handling this access.
+    fn device_id(&self) -> DeviceId;
+
+    /// Enters a runtime-created routed device context.
+    ///
+    /// The default implementation is deliberately denied. Only the sealed
+    /// device runtime can validate and materialize a routed context.
+    fn with_routed_device(
+        &mut self,
+        _grant: &RoutedDeviceGrant,
+        _callback: &mut dyn FnMut(&mut dyn DeviceContext) -> DeviceResult,
+    ) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "enter routed device context",
+            detail: "this device access has no routed-device grant".into(),
+        })
+    }
+
+    /// Returns the vCPU that issued this trapped access, when applicable.
+    ///
+    /// Management-path and device-originated callbacks return `None`. Devices
+    /// with banked per-vCPU registers must reject a missing accessor instead of
+    /// consulting host CPU-local state.
+    fn accessing_vcpu(&self) -> Option<DeviceVcpuId> {
+        None
+    }
+
+    /// Reads guest memory on behalf of the currently dispatched device.
+    ///
+    /// This capability is valid only for this access and is denied by default.
+    fn read_guest_memory(
+        &mut self,
+        _grant: &DmaGrant,
+        _addr: GuestPhysAddr,
+        _data: &mut [u8],
+    ) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "read guest memory from device access",
+            detail: "this bus access has no DMA memory grant".into(),
+        })
+    }
+
+    /// Writes guest memory on behalf of the currently dispatched device.
+    fn write_guest_memory(
+        &mut self,
+        _grant: &DmaGrant,
+        _addr: GuestPhysAddr,
+        _data: &[u8],
+    ) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "write guest memory from device access",
+            detail: "this bus access has no DMA memory grant".into(),
+        })
+    }
+
+    /// Schedules a virtual timer on behalf of the current device.
+    fn schedule_timer(&mut self, _grant: &TimerGrant, _deadline_ns: u64) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "schedule timer from device access",
+            detail: "this bus access has no timer grant".into(),
+        })
+    }
+
+    /// Wakes a vCPU on behalf of the current device.
+    fn wake_vcpu(&mut self, _grant: &WakeGrant, _vcpu_id: usize) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "wake vCPU from device access",
+            detail: "this bus access has no wake grant".into(),
+        })
+    }
+
+    /// Requests that the VM stops because of a device-visible condition.
+    fn request_vm_stop(&mut self, _grant: &StopGrant, _reason: &str) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "request VM stop from device access",
+            detail: "this bus access has no stop grant".into(),
+        })
+    }
+}
+
+/// A no-permission device context for tests and adapter-only callers.
+pub struct NoopDeviceContext {
+    device_id: DeviceId,
+    accessing_vcpu: Option<DeviceVcpuId>,
+}
+
+impl NoopDeviceContext {
+    /// Creates a no-permission context for `device_id`.
+    pub const fn new(device_id: DeviceId) -> Self {
+        Self {
+            device_id,
+            accessing_vcpu: None,
+        }
+    }
+
+    /// Associates this no-permission context with a trapped vCPU access.
+    pub const fn with_vcpu(mut self, vcpu_id: DeviceVcpuId) -> Self {
+        self.accessing_vcpu = Some(vcpu_id);
+        self
+    }
+}
+
+impl DeviceContext for NoopDeviceContext {
+    fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    fn accessing_vcpu(&self) -> Option<DeviceVcpuId> {
+        self.accessing_vcpu
     }
 }
 
 /// Device registration interface — the build-time / management-path half of a
-/// [`AxVmDevices`].
+/// [`DeviceRuntime`].
 ///
 /// Used when constructing or reconfiguring a VM; not on the vCPU hot path.
 pub trait DeviceRegistry {
@@ -533,28 +783,10 @@ pub trait DeviceRegistry {
     fn register(&mut self, device: Arc<dyn Device>) -> Result<DeviceId, RegistryError>;
 }
 
-/// Bus dispatch interface — the runtime hot-path half of a
-/// [`AxVmDevices`].
-///
-/// Called on every vCPU exit that targets an emulated device (MMIO / Port /
-/// SysReg).
-pub trait BusRouter {
-    /// Looks up the device responsible for `access` and forwards the access
-    /// to it, returning the result.
-    fn dispatch(&self, access: &BusAccess) -> Result<BusResponse, DeviceError>;
-
-    /// Looks up the device responsible for `access` without handling the
-    /// access.  The caller can then inspect the device or call
-    /// [`Device::handle`] manually.
-    fn lookup(&self, access: &BusAccess) -> Result<Arc<dyn Device>, DeviceError>;
-}
-
 // ---------------------------------------------------------------------------
 // Sub-modules
 // ---------------------------------------------------------------------------
 
-mod adapter;
-mod irq;
+mod interrupt;
 
-pub use adapter::{MmioDeviceAdapter, PortDeviceAdapter, SysRegDeviceAdapter};
-pub use irq::{IrqLine, IrqSink};
+pub use interrupt::*;

@@ -1,11 +1,11 @@
-use ax_errno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK};
 use starry_signal::SignalSet;
-use starry_vm::VmPtr;
 
 use crate::{
+    StarryError, StarryResult,
     file::{FileLike, add_file_like, signalfd::Signalfd},
+    mm::VmPtr,
     syscall::signal::check_sigset_size,
 };
 
@@ -36,29 +36,27 @@ bitflags! {
 ///   `fd` must specify a valid existing signalfd file descriptor.
 /// * `mask` - Pointer to a signal set (sigset_t).
 /// * `sigsetsize` - The size (in bytes) of the mask pointed to by `mask`.
-/// * `flags` - Flags to control the operation.
+/// * `flags` - Flags used when creating a new descriptor. Linux validates but
+///   otherwise ignores these flags when updating an existing signalfd.
 pub fn sys_signalfd4(
+    current: &crate::task::UserTaskRef,
     fd: i32,
     mask: *const SignalSet,
     sigsetsize: usize,
     flags: u32,
-) -> AxResult<isize> {
+) -> StarryResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let flags = SignalfdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
-
-    if fd != -1 && flags.contains(SignalfdFlags::CLOEXEC) {
-        return Err(AxError::InvalidInput);
-    }
+    let flags = SignalfdFlags::from_bits(flags).ok_or(StarryError::InvalidInput)?;
 
     // Read the signal mask from user space before handling the request mode.
-    let mask = unsafe { mask.vm_read_uninit()?.assume_init() };
+    let mask = unsafe { mask.vm_read_uninit(current)?.assume_init() };
 
-    // If fd is not -1, we should modify the existing signalfd
+    // Linux only updates the mask for an existing signalfd. Valid creation
+    // flags do not alter its descriptor or file status flags.
     if fd != -1 {
         let signalfd = Signalfd::from_fd(fd)?;
         signalfd.update_mask(mask);
-        signalfd.set_nonblocking(flags.contains(SignalfdFlags::NONBLOCK))?;
         return Ok(fd as _);
     }
 

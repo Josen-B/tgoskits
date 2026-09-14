@@ -48,6 +48,8 @@ pub(crate) fn write_defconfig(
     snapshot.arch = Some(arch_for_target_checked(&board.target)?.to_string());
     snapshot.target = Some(board.target);
     snapshot.config = Some(snapshot_path_value(workspace_root, &build_config_path));
+    snapshot.qemu.qemu_config = None;
+    snapshot.uboot.uboot_config = None;
     snapshot.store(workspace_root)?;
 
     Ok(build_config_path)
@@ -124,35 +126,8 @@ vm_configs = []
             Some("aarch64-unknown-none-softfloat")
         );
         assert_eq!(snapshot.vmconfigs, existing_snapshot.vmconfigs);
-        assert_eq!(snapshot.qemu.qemu_config, Some(qemu_config));
-    }
-
-    #[test]
-    fn available_board_names_match_filename_order() {
-        let root = tempdir().unwrap();
-        write_board(
-            root.path(),
-            "qemu-aarch64",
-            r#"
-target = "aarch64-unknown-none-softfloat"
-features = []
-log = "Info"
-"#,
-        );
-        write_board(
-            root.path(),
-            "orangepi-5-plus",
-            r#"
-target = "aarch64-unknown-none-softfloat"
-features = ["ax-driver/rockchip-soc"]
-log = "Info"
-"#,
-        );
-
-        assert_eq!(
-            available_board_names(root.path()).unwrap(),
-            vec!["orangepi-5-plus".to_string(), "qemu-aarch64".to_string()]
-        );
+        assert_eq!(snapshot.qemu.qemu_config, None);
+        assert_eq!(snapshot.uboot.uboot_config, None);
     }
 
     #[test]

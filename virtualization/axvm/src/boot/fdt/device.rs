@@ -1,334 +1,335 @@
-// Copyright 2025 The Axvisor Team
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+use std::{string::String, vec::Vec};
 
-//! Device passthrough and dependency analysis for FDT processing.
-
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
-    vec::Vec,
+use axdevice::{
+    DeviceFirmwareProperty, FdtContributionSpec, FdtNodeSpec, ResolvedDeviceGraph,
+    ResolvedDeviceResources,
 };
+use axdevice_base::{InterruptControllerId, InterruptTrigger};
 
-use fdt_edit::{Fdt, NodeId};
+use crate::{AxVmError, AxVmResult};
 
-use crate::config::AxVMConfig;
-
-type NodeCache = BTreeMap<String, Vec<NodeId>>;
-type PhandleMap = BTreeMap<u32, (String, BTreeMap<String, u32>)>;
-
-/// Return all passthrough device paths, including descendants and phandle dependencies.
-pub fn find_all_passthrough_devices(vm_cfg: &mut AxVMConfig, fdt: &Fdt) -> Vec<String> {
-    let initial_device_count = vm_cfg.pass_through_devices().len();
-    let node_cache = build_optimized_node_cache(fdt);
-    let initial_device_names: Vec<String> = vm_cfg
-        .pass_through_devices()
-        .iter()
-        .map(|dev| dev.name.clone())
-        .collect();
-    let mut configured_device_names: BTreeSet<String> =
-        initial_device_names.iter().cloned().collect();
-    let mut additional_device_names = Vec::new();
-
-    for device_name in &initial_device_names {
-        let descendant_paths = get_descendant_nodes_by_path(&node_cache, device_name);
-        trace!(
-            "Found {} descendant paths for {}",
-            descendant_paths.len(),
-            device_name
-        );
-
-        for descendant_path in descendant_paths {
-            if configured_device_names.insert(descendant_path.clone()) {
-                trace!("Found descendant device: {descendant_path}");
-                additional_device_names.push(descendant_path);
-            }
-        }
-    }
-
-    let mut dependency_device_names = Vec::new();
-    let mut devices_to_process: Vec<String> = configured_device_names.iter().cloned().collect();
-    let mut processed_devices: BTreeSet<String> = BTreeSet::new();
-    let phandle_map = build_phandle_map(fdt);
-
-    while let Some(device_node_path) = devices_to_process.pop() {
-        if !processed_devices.insert(device_node_path.clone()) {
-            continue;
-        }
-
-        let dependencies =
-            find_device_dependencies(fdt, &device_node_path, &phandle_map, &node_cache);
-        for dep_node_name in dependencies {
-            if configured_device_names.insert(dep_node_name.clone()) {
-                trace!("Found new dependency device: {dep_node_name}");
-                dependency_device_names.push(dep_node_name.clone());
-                devices_to_process.push(dep_node_name);
-            }
-        }
-    }
-
-    let excluded_device_path: Vec<String> = vm_cfg
-        .excluded_devices()
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    let mut all_excluded_devices = excluded_device_path.clone();
-    let mut processed_excluded: BTreeSet<String> = excluded_device_path.iter().cloned().collect();
-
-    for device_path in &excluded_device_path {
-        for descendant_path in get_descendant_nodes_by_path(&node_cache, device_path) {
-            if processed_excluded.insert(descendant_path.clone()) {
-                all_excluded_devices.push(descendant_path);
-            }
-        }
-    }
-    info!("Found excluded devices: {all_excluded_devices:?}");
-
-    let mut all_device_names = initial_device_names;
-    all_device_names.extend(additional_device_names);
-    all_device_names.extend(dependency_device_names);
-
-    if !all_excluded_devices.is_empty() {
-        let excluded_set: BTreeSet<String> = all_excluded_devices.into_iter().collect();
-        all_device_names.retain(|device_name| {
-            let should_keep = !excluded_set.contains(device_name);
-            if !should_keep {
-                info!("Excluding device: {device_name}");
-            }
-            should_keep
-        });
-    }
-
-    all_device_names.retain(|device_name| device_name != "/");
-
-    debug!(
-        "Passthrough devices analysis completed. Total devices: {} (added: {})",
-        all_device_names.len(),
-        all_device_names.len().saturating_sub(initial_device_count)
-    );
-    all_device_names
+/// One conventional FDT node with every resource slot resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedFdtDevice {
+    pub(crate) id: String,
+    pub(crate) node_name: String,
+    pub(crate) compatible: Vec<String>,
+    pub(crate) registers: Vec<(u64, u64)>,
+    pub(crate) interrupts: Vec<ResolvedFdtInterrupt>,
+    pub(crate) properties: Vec<ResolvedFdtProperty>,
 }
 
-pub fn build_optimized_node_cache(fdt: &Fdt) -> NodeCache {
-    let mut node_cache = BTreeMap::new();
-
-    for node_id in fdt.iter_node_ids() {
-        let node_path = fdt.path_of(node_id);
-        node_cache
-            .entry(node_path)
-            .or_insert_with(Vec::new)
-            .push(node_id);
-    }
-
-    debug!(
-        "Built simplified node cache with {} unique device paths",
-        node_cache.len()
-    );
-    node_cache
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedFdtInterrupt {
+    pub(crate) controller: InterruptControllerId,
+    pub(crate) input: u32,
+    pub(crate) trigger: InterruptTrigger,
 }
 
-fn build_phandle_map(fdt: &Fdt) -> PhandleMap {
-    let mut phandle_map = BTreeMap::new();
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedFdtProperty {
+    Empty(String),
+    U32(String, u32),
+    String(String, String),
+}
 
-    for node_id in fdt.iter_node_ids() {
-        let Some(node) = fdt.node(node_id) else {
+/// Architecture-owned FDT topology category with resolved controller identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedFdtSpecialKind {
+    InterruptController(InterruptControllerId),
+    Timer,
+    PciHostBridge,
+    Console,
+    FirmwareTransport,
+}
+
+/// One architecture-owned FDT contribution with every resource slot resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedFdtSpecial {
+    pub(crate) id: String,
+    pub(crate) kind: ResolvedFdtSpecialKind,
+    pub(crate) node_name: String,
+    pub(crate) compatible: Vec<String>,
+    pub(crate) registers: Vec<(u64, u64)>,
+    pub(crate) interrupts: Vec<ResolvedFdtInterrupt>,
+    pub(crate) properties: Vec<ResolvedFdtProperty>,
+}
+
+/// Complete FDT contribution plan selected from one resolved device graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedFdtFirmware {
+    pub(crate) devices: Vec<ResolvedFdtDevice>,
+    pub(crate) specials: Vec<ResolvedFdtSpecial>,
+}
+
+/// Checks that one console contribution describes the same serial runtime.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) fn fdt_console_matches_serial(
+    console: &ResolvedFdtSpecial,
+    serial: &crate::machine::ResolvedSerialDevice,
+    controller: InterruptControllerId,
+) -> bool {
+    use crate::machine::{GuestSerialModel, GuestSerialTransport};
+
+    let profile = serial.profile();
+    let (node_name, compatible) = match profile.model {
+        GuestSerialModel::Pl011 => ("pl011", "arm,pl011"),
+        GuestSerialModel::Uart16550 => ("serial", "ns16550a"),
+    };
+    let GuestSerialTransport::Mmio {
+        base,
+        length,
+        register_shift,
+        register_width,
+    } = profile.transport
+    else {
+        return false;
+    };
+    let Ok(base) = u64::try_from(base) else {
+        return false;
+    };
+    let Ok(length) = u64::try_from(length) else {
+        return false;
+    };
+    let Ok(input) = u32::try_from(profile.irq) else {
+        return false;
+    };
+    console.id == serial.id()
+        && console.node_name == node_name
+        && console.compatible.len() == 1
+        && console
+            .compatible
+            .first()
+            .is_some_and(|item| item == compatible)
+        && console.registers.as_slice() == [(base, length)]
+        && matches!(
+            console.interrupts.as_slice(),
+            [interrupt] if interrupt.controller == controller && interrupt.input == input
+        )
+        && console.properties.len() == 3
+        && has_u32_property(&console.properties, "clock-frequency", profile.clock_hz)
+        && has_u32_property(&console.properties, "reg-shift", u32::from(register_shift))
+        && has_u32_property(
+            &console.properties,
+            "reg-io-width",
+            u32::try_from(register_width.size())
+                .expect("a serial access width is at most eight bytes"),
+        )
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn has_u32_property(properties: &[ResolvedFdtProperty], name: &str, value: u32) -> bool {
+    properties
+        .iter()
+        .any(|property| matches!(property, ResolvedFdtProperty::U32(key, item) if key == name && *item == value))
+}
+
+/// Resolves conventional FDT contributions from the authoritative graph.
+#[cfg(test)]
+pub(crate) fn resolve_fdt_devices(
+    graph: &ResolvedDeviceGraph,
+) -> AxVmResult<Vec<ResolvedFdtDevice>> {
+    Ok(resolve_fdt_firmware(graph)?.devices)
+}
+
+/// Resolves every FDT contribution, including architecture-owned topology.
+pub(crate) fn resolve_fdt_firmware(graph: &ResolvedDeviceGraph) -> AxVmResult<ResolvedFdtFirmware> {
+    graph
+        .validate_fdt_support()
+        .map_err(|error| AxVmError::invalid_config(std::format!("{error}")))?;
+    let mut devices = Vec::new();
+    let mut specials = Vec::new();
+    for graph_node in graph.nodes() {
+        let Some(contributions) = graph_node.firmware().fdt() else {
             continue;
         };
-        let node_path = fdt.path_of(node_id);
-        let mut phandle = None;
-        let mut cells_map = BTreeMap::new();
-
-        for prop in node.properties() {
-            match prop.name() {
-                "phandle" | "linux,phandle" => phandle = prop.get_u32(),
-                "#address-cells"
-                | "#size-cells"
-                | "#clock-cells"
-                | "#reset-cells"
-                | "#gpio-cells"
-                | "#interrupt-cells"
-                | "#power-domain-cells"
-                | "#thermal-sensor-cells"
-                | "#phy-cells"
-                | "#dma-cells"
-                | "#sound-dai-cells"
-                | "#mbox-cells"
-                | "#pwm-cells"
-                | "#iommu-cells" => {
-                    if let Some(value) = prop.get_u32() {
-                        cells_map.insert(prop.name().to_string(), value);
-                    }
+        let resources = graph.resources_for(graph_node.id())?;
+        for contribution in contributions {
+            let (kind, node) = match contribution {
+                FdtContributionSpec::Conventional(node) => (None, node),
+                FdtContributionSpec::InterruptController { controller, node } => (
+                    Some(ResolvedFdtSpecialKind::InterruptController(*controller)),
+                    node,
+                ),
+                FdtContributionSpec::Timer(node) => (Some(ResolvedFdtSpecialKind::Timer), node),
+                FdtContributionSpec::PciHostBridge(node) => {
+                    (Some(ResolvedFdtSpecialKind::PciHostBridge), node)
                 }
-                _ => {}
-            }
-        }
-
-        if let Some(ph) = phandle {
-            phandle_map.insert(ph, (node_path, cells_map));
-        }
-    }
-    phandle_map
-}
-
-fn parse_phandle_property_with_cells(
-    prop_data: &[u8],
-    prop_name: &str,
-    phandle_map: &PhandleMap,
-) -> Vec<(u32, Vec<u32>)> {
-    let mut results = Vec::new();
-
-    if prop_data.is_empty() || !prop_data.len().is_multiple_of(4) {
-        return results;
-    }
-
-    let u32_values: Vec<u32> = prop_data
-        .chunks(4)
-        .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
-
-    let mut i = 0;
-    while i < u32_values.len() {
-        let potential_phandle = u32_values[i];
-        if let Some((device_name, cells_info)) = phandle_map.get(&potential_phandle) {
-            let cells_count = get_cells_count_for_property(prop_name, cells_info);
-            if i + cells_count < u32_values.len() {
-                let specifiers = u32_values[i + 1..=i + cells_count].to_vec();
-                debug!(
-                    "Parsed {prop_name} phandle reference: phandle={potential_phandle:#x}, \
-                     device={device_name}, specifiers={specifiers:?}"
-                );
-                results.push((potential_phandle, specifiers));
-                i += cells_count + 1;
-            } else {
-                break;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    results
-}
-
-fn get_cells_count_for_property(prop_name: &str, cells_info: &BTreeMap<String, u32>) -> usize {
-    let cells_property = match prop_name {
-        "clocks" | "assigned-clocks" => "#clock-cells",
-        "resets" => "#reset-cells",
-        "power-domains" => "#power-domain-cells",
-        "phys" => "#phy-cells",
-        "interrupts" | "interrupts-extended" => "#interrupt-cells",
-        "gpios" => "#gpio-cells",
-        _ if prop_name.ends_with("-gpios") || prop_name.ends_with("-gpio") => "#gpio-cells",
-        "dmas" => "#dma-cells",
-        "thermal-sensors" => "#thermal-sensor-cells",
-        "sound-dai" => "#sound-dai-cells",
-        "mboxes" => "#mbox-cells",
-        "pwms" => "#pwm-cells",
-        _ => return 0,
-    };
-
-    cells_info.get(cells_property).copied().unwrap_or(0) as usize
-}
-
-fn parse_phandle_property(
-    prop_data: &[u8],
-    prop_name: &str,
-    phandle_map: &PhandleMap,
-) -> Vec<String> {
-    parse_phandle_property_with_cells(prop_data, prop_name, phandle_map)
-        .into_iter()
-        .filter_map(|(phandle, _)| phandle_map.get(&phandle).map(|(path, _)| path.clone()))
-        .collect()
-}
-
-struct DevicePropertyClassifier;
-
-impl DevicePropertyClassifier {
-    const PHANDLE_PROPERTIES: &'static [&'static str] = &[
-        "clocks",
-        "power-domains",
-        "phys",
-        "resets",
-        "dmas",
-        "thermal-sensors",
-        "mboxes",
-        "assigned-clocks",
-        "interrupt-parent",
-        "phy-handle",
-        "msi-parent",
-        "memory-region",
-        "syscon",
-        "regmap",
-        "iommus",
-        "interconnects",
-        "nvmem-cells",
-        "sound-dai",
-        "pinctrl-0",
-        "pinctrl-1",
-        "pinctrl-2",
-        "pinctrl-3",
-        "pinctrl-4",
-    ];
-
-    fn is_phandle_property(prop_name: &str) -> bool {
-        Self::PHANDLE_PROPERTIES.contains(&prop_name)
-            || prop_name.ends_with("-supply")
-            || prop_name == "gpios"
-            || prop_name.ends_with("-gpios")
-            || prop_name.ends_with("-gpio")
-            || (prop_name.contains("cells") && !prop_name.starts_with('#') && prop_name.len() >= 4)
-    }
-}
-
-fn find_device_dependencies(
-    fdt: &Fdt,
-    device_node_path: &str,
-    phandle_map: &PhandleMap,
-    node_cache: &NodeCache,
-) -> Vec<String> {
-    let mut dependencies = Vec::new();
-
-    if let Some(nodes) = node_cache.get(device_node_path) {
-        for node_id in nodes {
-            let Some(node) = fdt.node(*node_id) else {
-                continue;
+                FdtContributionSpec::Console(node) => (Some(ResolvedFdtSpecialKind::Console), node),
+                FdtContributionSpec::FirmwareTransport(node) => {
+                    (Some(ResolvedFdtSpecialKind::FirmwareTransport), node)
+                }
             };
-            for prop in node.properties() {
-                if DevicePropertyClassifier::is_phandle_property(prop.name()) {
-                    dependencies.extend(parse_phandle_property(
-                        &prop.data,
-                        prop.name(),
-                        phandle_map,
-                    ));
-                }
+            let resolved = resolve_node(graph_node.id().as_str(), node, resources)?;
+            if let Some(kind) = kind {
+                specials.push(ResolvedFdtSpecial {
+                    id: graph_node.id().to_string(),
+                    kind,
+                    node_name: resolved.node_name,
+                    compatible: resolved.compatible,
+                    registers: resolved.registers,
+                    interrupts: resolved.interrupts,
+                    properties: resolved.properties,
+                });
+            } else {
+                devices.push(ResolvedFdtDevice {
+                    id: graph_node.id().to_string(),
+                    node_name: resolved.node_name,
+                    compatible: resolved.compatible,
+                    registers: resolved.registers,
+                    interrupts: resolved.interrupts,
+                    properties: resolved.properties,
+                });
             }
         }
     }
-
-    dependencies
+    Ok(ResolvedFdtFirmware { devices, specials })
 }
 
-fn get_descendant_nodes_by_path(node_cache: &NodeCache, parent_path: &str) -> Vec<String> {
-    let search_prefix = if parent_path == "/" {
-        "/".to_string()
-    } else {
-        parent_path.to_string() + "/"
-    };
+struct ResolvedFdtNode {
+    node_name: String,
+    compatible: Vec<String>,
+    registers: Vec<(u64, u64)>,
+    interrupts: Vec<ResolvedFdtInterrupt>,
+    properties: Vec<ResolvedFdtProperty>,
+}
 
-    node_cache
-        .keys()
-        .filter(|path| path.starts_with(&search_prefix) && path.len() > search_prefix.len())
-        .cloned()
-        .collect()
+fn resolve_node(
+    device_id: &str,
+    node: &FdtNodeSpec,
+    resources: &ResolvedDeviceResources,
+) -> AxVmResult<ResolvedFdtNode> {
+    if node.compatible().is_empty() {
+        return Err(AxVmError::invalid_config(std::format!(
+            "device {device_id} has an FDT node without compatible strings"
+        )));
+    }
+    let registers = node
+        .register_slots()
+        .iter()
+        .map(|slot| resources.mmio(slot))
+        .collect::<Result<Vec<_>, _>>()?;
+    let interrupts = node
+        .interrupt_slots()
+        .iter()
+        .map(|slot| {
+            let irq = resources.wired_irq(slot)?;
+            Ok(ResolvedFdtInterrupt {
+                controller: irq.controller(),
+                input: u32::try_from(irq.input().value()).map_err(|_| {
+                    AxVmError::invalid_config(std::format!(
+                        "device {device_id} interrupt exceeds one FDT cell"
+                    ))
+                })?,
+                trigger: irq.trigger(),
+            })
+        })
+        .collect::<AxVmResult<Vec<_>>>()?;
+    let properties = node
+        .properties()
+        .iter()
+        .map(|property| match property {
+            DeviceFirmwareProperty::Empty { name } => Ok(ResolvedFdtProperty::Empty(name.clone())),
+            DeviceFirmwareProperty::U32 { name, value } => {
+                Ok(ResolvedFdtProperty::U32(name.clone(), *value))
+            }
+            DeviceFirmwareProperty::String { name, value } => {
+                Ok(ResolvedFdtProperty::String(name.clone(), value.clone()))
+            }
+            DeviceFirmwareProperty::InterruptInput { name, slot } => {
+                let value =
+                    u32::try_from(resources.wired_irq(slot)?.input().value()).map_err(|_| {
+                        AxVmError::invalid_config(std::format!(
+                            "device {device_id} interrupt property exceeds one FDT cell"
+                        ))
+                    })?;
+                Ok(ResolvedFdtProperty::U32(name.clone(), value))
+            }
+        })
+        .collect::<AxVmResult<Vec<_>>>()?;
+    Ok(ResolvedFdtNode {
+        node_name: node.node_name().into(),
+        compatible: node.compatible().to_vec(),
+        registers,
+        interrupts,
+        properties,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axdevice::*;
+    use axdevice_base::{InterruptControllerId, InterruptTrigger};
+
+    use super::resolve_fdt_devices;
+
+    struct InvalidFirmwareTransportPropertyModel;
+
+    impl DeviceModel for InvalidFirmwareTransportPropertyModel {
+        fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
+            DeviceRequirements::new()
+                .with_mmio(
+                    ResourceSlot::new("registers")?,
+                    0x1000,
+                    0x1000,
+                    ResourceRequest::Auto,
+                )?
+                .with_wired_irq(
+                    ResourceSlot::new("irq")?,
+                    InterruptControllerId::new(0),
+                    InterruptTrigger::LevelTriggered,
+                    axdevice_base::InterruptSharing::Exclusive,
+                    ResourceRequest::Auto,
+                )
+        }
+
+        fn firmware(&self) -> DeviceFirmwareSpec {
+            DeviceFirmwareSpec::interfaces(
+                Some(std::vec![FdtContributionSpec::FirmwareTransport(
+                    FdtNodeSpec::new("fw_cfg")
+                        .with_compatible("qemu,fw-cfg-mmio")
+                        .with_register(
+                            ResourceSlot::new("registers").expect("static slot is valid")
+                        )
+                        .with_interrupt_input_property(
+                            "interrupt-input",
+                            ResourceSlot::new("misspelled-irq")
+                                .expect("static regression slot is valid"),
+                        ),
+                )]),
+                None,
+            )
+        }
+
+        fn build(
+            &self,
+            _context: &mut DeviceBuildContext<'_>,
+        ) -> DeviceManagerResult<DeviceBundle> {
+            unreachable!("firmware-resolution regression does not build devices")
+        }
+    }
+
+    #[test]
+    fn special_fdt_contribution_rejects_unknown_property_slot() {
+        let mut builder = DeviceGraphBuilder::new();
+        builder
+            .add(DeviceNodeSpec::virtual_device(
+                DeviceNodeId::new("fw-cfg").unwrap(),
+                Arc::new(InvalidFirmwareTransportPropertyModel),
+            ))
+            .unwrap();
+        let mut pools = ResourcePools::new();
+        pools.add_auto_mmio(0x1000..0x3000).unwrap();
+        pools
+            .add_auto_controller_inputs(
+                InterruptControllerId::new(0),
+                axdevice_base::ControllerInputId::new(1)..axdevice_base::ControllerInputId::new(2),
+            )
+            .unwrap();
+        let graph = builder.declare().unwrap().resolve(pools).unwrap();
+
+        assert!(resolve_fdt_devices(&graph).is_err());
+    }
 }

@@ -5,21 +5,21 @@ use alloc::{
 };
 use core::ptr::NonNull;
 
-use ax_kspin::SpinNoPreempt as Mutex;
+use ax_lazyinit::OnceLock;
+use ax_sync::SpinLock as Mutex;
 use fdt_edit::Node;
 pub use fdt_edit::{ClockRef, Fdt, InterruptRef, NodeId, NodeType, Phandle, RegInfo, Status};
 use rdif_pinctrl::{PinctrlDevice, PinctrlError};
-use spin::Once;
 
 use super::ProbeError;
 use crate::{
-    Descriptor, Device, DeviceId, PlatformDevice,
-    error::DriverError,
+    Descriptor, Device, DeviceId, DriverGeneric, FdtNodeIdentity, PlatformDevice,
+    error::{DriverError, FdtChildProviderError},
     probe::OnProbeError,
-    register::{DriverRegister, ProbeKind},
+    register::{DriverRegister, ProbeKind, ProbePriority},
 };
 
-static SYSTEM: Once<System> = Once::new();
+static SYSTEM: OnceLock<System> = OnceLock::new();
 
 pub fn init(fdt_addr: NonNull<u8>) -> Result<(), DriverError> {
     let sys = System::new(fdt_addr)?;
@@ -40,10 +40,13 @@ pub fn probe_register(
     sys.probe_register(register)
 }
 
-pub(crate) fn try_probe_register(
-    register: &DriverRegister,
+pub(crate) fn try_probe_registers_by_fdt_order(
+    registers: &[DriverRegister],
+    priority: ProbePriority,
 ) -> Option<Result<Vec<Result<(), OnProbeError>>, ProbeError>> {
-    SYSTEM.get().map(|system| system.probe_register(register))
+    SYSTEM
+        .get()
+        .map(|system| system.probe_registers_by_fdt_order(registers, priority))
 }
 
 pub(crate) fn system() -> &'static System {
@@ -56,7 +59,38 @@ pub(crate) fn try_system() -> Option<&'static System> {
 
 pub struct FdtInfo<'a> {
     pub node: NodeType<'a>,
+    device_id: DeviceId,
     phandle_2_device_id: BTreeMap<Phandle, DeviceId>,
+}
+
+/// Prepared identity for an available direct child of the currently probed FDT
+/// device.
+///
+/// Values are created only by [`FdtInfo::prepare_child`] or
+/// [`FdtInfo::available_children`], which validate the node's tree, parent, and
+/// availability before any registry state is changed.
+#[derive(Clone)]
+pub struct FdtChild {
+    node: NodeType<'static>,
+    parent_node_id: NodeId,
+    parent_device_id: DeviceId,
+    device_id: DeviceId,
+    irq_parent: Option<DeviceId>,
+    path: String,
+}
+
+impl FdtChild {
+    pub fn node(&self) -> NodeType<'_> {
+        self.node
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -769,6 +803,75 @@ pub fn child_nodes(node: NodeType<'_>) -> Vec<NodeType<'static>> {
 }
 
 impl<'a> FdtInfo<'a> {
+    /// Returns the available direct children of the currently probed node.
+    ///
+    /// Disabled children are intentionally omitted, matching normal FDT probe
+    /// and Linux available-child semantics.
+    pub fn available_children(&self) -> Vec<FdtChild> {
+        child_nodes(self.node)
+            .into_iter()
+            .filter_map(|child| match self.prepare_child(child) {
+                Ok(child) => Some(child),
+                Err(FdtChildProviderError::Disabled { .. }) => None,
+                Err(error) => {
+                    warn!(
+                        "failed to prepare direct FDT child of {}: {error}",
+                        self.node.path()
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Validates and prepares one direct child for provider publication.
+    ///
+    /// This method is side-effect free. The returned handle can be committed by
+    /// [`PlatformDevice::register_fdt_child`] or
+    /// [`PlatformDevice::register_with_fdt_child`].
+    pub fn prepare_child(&self, child: NodeType<'_>) -> Result<FdtChild, FdtChildProviderError> {
+        let child_path = child.path();
+        let Some(active_child) = system().fdt().get_by_path(&child_path) else {
+            return Err(FdtChildProviderError::ForeignNode { path: child_path });
+        };
+        if active_child.id() != child.id()
+            || !core::ptr::eq(active_child.as_node(), child.as_node())
+        {
+            return Err(FdtChildProviderError::ForeignNode { path: child_path });
+        }
+        let Some(parent) = active_child.parent() else {
+            return Err(FdtChildProviderError::NotDirectChild {
+                parent_path: self.node.path(),
+                child_path,
+            });
+        };
+        if parent.id() != self.node.id() {
+            return Err(FdtChildProviderError::NotDirectChild {
+                parent_path: self.node.path(),
+                child_path,
+            });
+        }
+        if matches!(active_child.as_node().status(), Some(Status::Disabled)) {
+            return Err(FdtChildProviderError::Disabled { path: child_path });
+        }
+
+        let device_id = system().node_to_device_id(active_child.id());
+        let node_phandle = active_child.as_node().phandle();
+        let irq_parent = active_child
+            .interrupt_parent()
+            .filter(|phandle| Some(*phandle) != node_phandle)
+            .and_then(|phandle| self.phandle_2_device_id.get(&phandle).copied());
+
+        Ok(FdtChild {
+            node: active_child,
+            parent_node_id: self.node.id(),
+            parent_device_id: self.device_id,
+            device_id,
+            irq_parent,
+            path: child_path,
+        })
+    }
+
     pub fn get_by_phandle(&self, phandle: Phandle) -> Option<NodeType<'a>> {
         system().get_by_phandle(phandle)
     }
@@ -906,6 +1009,7 @@ impl<'a> FdtInfo<'a> {
 pub fn apply_assigned_clocks(node: NodeType<'_>) -> Result<(), OnProbeError> {
     let info = FdtInfo {
         node,
+        device_id: system().node_to_device_id(node.id()),
         phandle_2_device_id: system().phandle_2_device_id.clone(),
     };
     apply_assigned_clocks_for_info(&info)
@@ -1104,8 +1208,10 @@ pub type FnOnProbe = for<'a> fn(ProbeFdt<'a>) -> Result<(), OnProbeError>;
 pub struct System {
     fdt: Fdt,
     phandle_2_device_id: BTreeMap<Phandle, DeviceId>,
+    node_2_device_id: BTreeMap<NodeId, DeviceId>,
     populated_paths: Mutex<BTreeMap<String, DeviceId>>,
     populated_nodes: Mutex<BTreeSet<NodeId>>,
+    child_owners: Mutex<BTreeMap<NodeId, DeviceId>>,
 }
 
 unsafe impl Send for System {}
@@ -1117,6 +1223,10 @@ impl System {
 
     pub fn phandle_to_device_id(&self, phandle: Phandle) -> Option<DeviceId> {
         self.phandle_2_device_id.get(&phandle).copied()
+    }
+
+    fn node_to_device_id(&self, node_id: NodeId) -> DeviceId {
+        self.node_2_device_id[&node_id]
     }
 
     pub fn path_to_device_id(&self, path: &str) -> Option<DeviceId> {
@@ -1148,25 +1258,26 @@ impl System {
         let fdt = unsafe { Fdt::from_ptr(fdt_addr.as_ptr()) }
             .map_err(|error| DriverError::Fdt(format!("{error:?}")))?;
         let mut phandle_2_device_id = BTreeMap::new();
+        let mut node_2_device_id = BTreeMap::new();
         for node in fdt.all_nodes() {
+            let device_id = DeviceId::new();
+            node_2_device_id.insert(node.id(), device_id);
             if let Some(phandle) = node.as_node().phandle() {
-                phandle_2_device_id.insert(phandle, DeviceId::new());
+                phandle_2_device_id.insert(phandle, device_id);
             }
         }
         Ok(Self {
             fdt,
             phandle_2_device_id,
+            node_2_device_id,
             populated_paths: Mutex::new(BTreeMap::new()),
             populated_nodes: Mutex::new(BTreeSet::new()),
+            child_owners: Mutex::new(BTreeMap::new()),
         })
     }
 
-    fn new_device_id(&self, phandle: Option<Phandle>) -> DeviceId {
-        if let Some(phandle) = phandle {
-            self.phandle_2_device_id[&phandle]
-        } else {
-            DeviceId::new()
-        }
+    fn device_id_for_node(&self, node_id: NodeId) -> DeviceId {
+        self.node_2_device_id[&node_id]
     }
 
     fn get_fdt_match_nodes<'a>(&'a self, register: &DriverRegister) -> Vec<ProbeFdtInfo<'a>> {
@@ -1202,11 +1313,79 @@ impl System {
         out
     }
 
+    fn get_fdt_match_nodes_by_fdt_order<'a>(
+        &'a self,
+        registers: &[DriverRegister],
+        priority: ProbePriority,
+    ) -> Vec<ProbeFdtInfo<'a>> {
+        let mut out = Vec::new();
+        for node in self.ordered_probe_nodes(priority) {
+            if matches!(node.as_node().status(), Some(Status::Disabled)) {
+                continue;
+            }
+
+            if self.populated_nodes.lock().contains(&node.id()) {
+                continue;
+            }
+
+            let node_compatibles = node.as_node().compatibles().collect::<Vec<_>>();
+            for register in registers {
+                for probe in register.probe_kinds {
+                    let &ProbeKind::Fdt {
+                        compatibles,
+                        on_probe,
+                    } = probe
+                    else {
+                        continue;
+                    };
+
+                    if node_compatibles
+                        .iter()
+                        .any(|compatible| compatibles.contains(compatible))
+                    {
+                        out.push(ProbeFdtInfo {
+                            name: register.name,
+                            node,
+                            on_probe,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn ordered_probe_nodes(&self, priority: ProbePriority) -> Vec<NodeType<'_>> {
+        let nodes = self.fdt.all_nodes().collect::<Vec<_>>();
+        if priority == ProbePriority::INTC {
+            parent_first_interrupt_controllers(nodes)
+        } else {
+            nodes
+        }
+    }
+
     fn probe_register(
         &self,
         register: &DriverRegister,
     ) -> Result<Vec<Result<(), OnProbeError>>, ProbeError> {
         let node_ls = self.get_fdt_match_nodes(register);
+        self.probe_fdt_matches(node_ls)
+    }
+
+    fn probe_registers_by_fdt_order(
+        &self,
+        registers: &[DriverRegister],
+        priority: ProbePriority,
+    ) -> Result<Vec<Result<(), OnProbeError>>, ProbeError> {
+        let node_ls = self.get_fdt_match_nodes_by_fdt_order(registers, priority);
+        self.probe_fdt_matches(node_ls)
+    }
+
+    fn probe_fdt_matches(
+        &self,
+        node_ls: Vec<ProbeFdtInfo<'_>>,
+    ) -> Result<Vec<Result<(), OnProbeError>>, ProbeError> {
         let mut out = Vec::new();
         for node_info in node_ls {
             let node_id = node_info.node.id();
@@ -1215,7 +1394,7 @@ impl System {
             }
             let node = node_info.node;
             let node_phandle = node.as_node().phandle();
-            let id = self.new_device_id(node_phandle);
+            let id = self.device_id_for_node(node_id);
 
             let irq_parent = node
                 .interrupt_parent()
@@ -1225,19 +1404,32 @@ impl System {
             let phandle_map = self.phandle_2_device_id.clone();
 
             debug!("Probe [{}]->[{}]", node.name(), node_info.name);
-            let res = apply_assigned_clocks(node)
-                .and_then(|()| apply_power_domains(node))
+            // `assigned-clocks`/`assigned-clock-rates` defaults are best-effort,
+            // matching Linux `of_clk_set_defaults`: a rate the clock provider
+            // can't set (e.g. a VOP root clock the CRU doesn't implement) must
+            // not abort the device's probe. A driver that truly requires a rate
+            // opts into strict application via `prepare_resources`. Power domains
+            // and pinctrl remain required for probe.
+            if let Err(err) = apply_assigned_clocks(node) {
+                warn!(
+                    "[{}] assigned-clocks apply failed (best-effort, continuing to probe): {err}",
+                    node.name()
+                );
+            }
+            let res = apply_power_domains(node)
                 .and_then(|()| apply_default_pinctrl(node))
                 .and_then(|()| {
                     let descriptor = Descriptor {
                         name: node_info.name,
                         device_id: id,
                         irq_parent,
+                        fdt_node: Some(FdtNodeIdentity::new(node_id, node.path())),
                     };
 
                     (node_info.on_probe)(ProbeFdt::new(
                         FdtInfo {
                             node,
+                            device_id: id,
                             phandle_2_device_id: phandle_map,
                         },
                         PlatformDevice::new(descriptor),
@@ -1253,6 +1445,186 @@ impl System {
         }
 
         Ok(out)
+    }
+}
+
+pub(crate) fn commit_child_provider<T: DriverGeneric>(
+    parent: &PlatformDevice,
+    child: FdtChild,
+    driver: T,
+) -> Result<(), FdtChildProviderError> {
+    let child_path = child.path.clone();
+    commit_child_publication(parent, child, |descriptor| {
+        crate::edit(|manager| {
+            if !manager
+                .dev_container
+                .can_insert::<T>(descriptor.device_id())
+            {
+                return Err(FdtChildProviderError::DuplicateCapability {
+                    path: child_path,
+                    interface: core::any::type_name::<T>(),
+                });
+            }
+            manager.dev_container.insert(descriptor, driver);
+            Ok(())
+        })
+    })
+}
+
+pub(crate) fn commit_parent_and_child<P: DriverGeneric, C: DriverGeneric>(
+    parent: &PlatformDevice,
+    parent_driver: P,
+    child: FdtChild,
+    child_driver: C,
+) -> Result<(), FdtChildProviderError> {
+    let child_path = child.path.clone();
+    let parent_path = parent.descriptor().fdt_node().map_or_else(
+        || parent.descriptor().name.to_string(),
+        |node| node.path().to_string(),
+    );
+    commit_child_publication(parent, child, |child_descriptor| {
+        crate::edit(|manager| {
+            if !manager
+                .dev_container
+                .can_insert::<P>(parent.descriptor().device_id())
+            {
+                return Err(FdtChildProviderError::DuplicateCapability {
+                    path: parent_path,
+                    interface: core::any::type_name::<P>(),
+                });
+            }
+            if !manager
+                .dev_container
+                .can_insert::<C>(child_descriptor.device_id())
+            {
+                return Err(FdtChildProviderError::DuplicateCapability {
+                    path: child_path,
+                    interface: core::any::type_name::<C>(),
+                });
+            }
+
+            manager
+                .dev_container
+                .insert(parent.descriptor().clone(), parent_driver);
+            manager.dev_container.insert(child_descriptor, child_driver);
+            Ok(())
+        })
+    })
+}
+
+fn commit_child_publication(
+    parent: &PlatformDevice,
+    child: FdtChild,
+    publish: impl FnOnce(Descriptor) -> Result<(), FdtChildProviderError>,
+) -> Result<(), FdtChildProviderError> {
+    let parent_device_id = parent.descriptor().device_id();
+    let Some(parent_fdt_node) = parent.descriptor().fdt_node() else {
+        return Err(FdtChildProviderError::ParentHasNoFdtIdentity {
+            device_id: parent_device_id,
+        });
+    };
+    if parent_device_id != child.parent_device_id
+        || parent_fdt_node.node_id() != child.parent_node_id
+    {
+        return Err(FdtChildProviderError::ParentMismatch {
+            path: child.path,
+            expected_parent: child.parent_device_id,
+            actual_parent: parent_device_id,
+        });
+    }
+
+    let system = system();
+    let mut child_owners = system.child_owners.lock();
+    if let Some(owner) = child_owners.get(&child.node.id()).copied() {
+        if owner != parent_device_id {
+            return Err(FdtChildProviderError::OwnershipConflict {
+                path: child.path,
+                owner,
+                requester: parent_device_id,
+            });
+        }
+    } else if system.populated_nodes.lock().contains(&child.node.id()) {
+        return Err(FdtChildProviderError::AlreadyPopulated { path: child.path });
+    }
+
+    let mut populated_paths = system.populated_paths.lock();
+    if populated_paths
+        .get(&child.path)
+        .is_some_and(|device_id| *device_id != child.device_id)
+    {
+        return Err(FdtChildProviderError::AlreadyPopulated { path: child.path });
+    }
+    let mut populated_nodes = system.populated_nodes.lock();
+
+    let descriptor = Descriptor {
+        name: parent.descriptor().name,
+        device_id: child.device_id,
+        irq_parent: child.irq_parent,
+        fdt_node: Some(FdtNodeIdentity::new(child.node.id(), child.path.clone())),
+    };
+    publish(descriptor)?;
+
+    child_owners.insert(child.node.id(), parent_device_id);
+    populated_paths.insert(child.path, child.device_id);
+    populated_nodes.insert(child.node.id());
+    Ok(())
+}
+
+fn parent_first_interrupt_controllers(nodes: Vec<NodeType<'_>>) -> Vec<NodeType<'_>> {
+    let mut pending = nodes;
+    let known_controllers = pending
+        .iter()
+        .filter(|node| is_interrupt_controller(node))
+        .filter_map(|node| node.as_node().phandle())
+        .collect::<BTreeSet<_>>();
+    let mut ready_controllers = BTreeSet::new();
+    let mut ordered = Vec::new();
+
+    while !pending.is_empty() {
+        let mut progressed = false;
+        let mut index = 0;
+        while index < pending.len() {
+            let node = &pending[index];
+            if !is_interrupt_controller(node)
+                || interrupt_parent_ready(node, &known_controllers, &ready_controllers)
+            {
+                let node = pending.remove(index);
+                if let Some(phandle) = node.as_node().phandle()
+                    && is_interrupt_controller(&node)
+                {
+                    ready_controllers.insert(phandle);
+                }
+                ordered.push(node);
+                progressed = true;
+            } else {
+                index += 1;
+            }
+        }
+
+        if !progressed {
+            ordered.append(&mut pending);
+        }
+    }
+
+    ordered
+}
+
+fn is_interrupt_controller(node: &NodeType<'_>) -> bool {
+    matches!(node, NodeType::InterruptController(_))
+}
+
+fn interrupt_parent_ready(
+    node: &NodeType<'_>,
+    known_controllers: &BTreeSet<Phandle>,
+    ready_controllers: &BTreeSet<Phandle>,
+) -> bool {
+    let node_phandle = node.as_node().phandle();
+    let parent = node
+        .interrupt_parent()
+        .filter(|parent| Some(*parent) != node_phandle);
+    match parent {
+        Some(parent) if known_controllers.contains(&parent) => ready_controllers.contains(&parent),
+        _ => true,
     }
 }
 

@@ -1,27 +1,10 @@
-use ::std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use ::std::fs;
 use tempfile::tempdir;
-use walkdir::WalkDir;
 
 use super::*;
 
-fn metadata_for_manifest(manifest_path: &Path) -> cargo_metadata::Metadata {
-    workspace_metadata_root_manifest(manifest_path).unwrap()
-}
-
 fn repo_metadata() -> cargo_metadata::Metadata {
     workspace_metadata().unwrap()
-}
-
-fn gnu_lld_pre_link_args(spec: &serde_json::Value) -> Vec<&str> {
-    spec["pre-link-args"]["gnu-lld"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|arg| arg.as_str().unwrap())
-        .collect()
 }
 
 fn temp_workspace(
@@ -51,13 +34,10 @@ fn temp_workspace(
     Ok(root)
 }
 
-mod checked_configs;
-mod config;
 mod info;
 mod metadata;
 mod platform;
 mod std_features;
 mod std_linker;
 mod std_metadata;
-mod std_targets;
 mod target_specs;

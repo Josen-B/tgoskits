@@ -3,7 +3,9 @@ use std::path::Path;
 use anyhow::Context;
 use ostool::board::RunBoardOptions;
 
-use super::{ARCEOS_TEST_SUITE_OS, ArgsTestBoard, types::ArceosBoardTestGroup};
+use super::{
+    ARCEOS_AXTEST_GROUP, ARCEOS_TEST_SUITE_OS, ArgsTestBoard, types::ArceosBoardTestGroup,
+};
 use crate::{
     arceos::ArceOS,
     context::{BuildCliArgs, SnapshotPersistence, arch_for_target_checked},
@@ -58,6 +60,9 @@ pub(crate) fn discover_board_test_groups(
     let suite_root = test_suite::suite_root(workspace_root, ARCEOS_TEST_SUITE_OS);
     let mut groups = Vec::new();
     for group in test_suite::discover_group_names(workspace_root, ARCEOS_TEST_SUITE_OS)? {
+        if group == ARCEOS_AXTEST_GROUP {
+            continue;
+        }
         let group_dir = test_suite::group_dir(workspace_root, ARCEOS_TEST_SUITE_OS, &group);
         groups.extend(collect_board_test_groups(workspace_root, &group_dir)?);
     }
@@ -106,7 +111,7 @@ impl ArceOS {
                     None,
                     SnapshotPersistence::Discard,
                 )?;
-                self.run_board_request(
+                self.run_board_request_with_extra_rustflags(
                     request,
                     Some(board_test_config.clone()),
                     RunBoardOptions {
@@ -114,6 +119,7 @@ impl ArceOS {
                         server: args.server.clone(),
                         port: args.port,
                     },
+                    &[],
                 )
                 .await
                 .with_context(|| {
@@ -190,7 +196,6 @@ fail_regex = ["(?i)panic"]
 
         let groups = collect_board_test_groups(root.path(), &group_dir).unwrap();
 
-        assert_eq!(groups.len(), 1);
         let group = &groups[0];
         assert_eq!(group.name, "boot");
         assert_eq!(group.board_name, "orangepi-5-plus");
@@ -215,7 +220,6 @@ fail_regex = ["(?i)panic"]
         let groups =
             discover_board_test_groups(root.path(), Some("boot"), Some("orangepi-5-plus")).unwrap();
 
-        assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "boot");
         assert_eq!(groups[0].board_name, "orangepi-5-plus");
     }

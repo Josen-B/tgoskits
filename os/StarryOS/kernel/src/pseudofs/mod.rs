@@ -8,21 +8,23 @@ mod dir;
 mod dyn_debug;
 mod file;
 mod fs;
+mod mqueue;
 pub(crate) mod overlay;
 pub(crate) mod proc;
+mod proc_mountinfo;
 mod sysfs;
 mod tmp;
 pub(crate) mod usbfs;
 
 use alloc::{boxed::Box, sync::Arc};
 
-use ax_errno::LinuxResult;
-use ax_fs_ng::vfs::{FS_CONTEXT, FsContext};
+use ax_fs_ng::vfs::{FsContext, current_fs_context};
 use ax_lazyinit::LazyInit;
 use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
 pub use tmp::MemoryFs;
 
 pub use self::{device::*, dir::*, file::*, fs::*};
+use crate::StarryResult;
 
 /// A callback that builds a `Arc<dyn DirNodeOps>` for a given
 /// `WeakDirEntry`.
@@ -68,22 +70,23 @@ pub fn tmp_tmpfs() -> Option<Arc<tmp::MemoryFs>> {
     TMP_TMPFS.get().map(Arc::clone)
 }
 
-fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()> {
+fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> StarryResult<()> {
     let initial_resolve = fs.resolve(path);
     if initial_resolve.is_err() {
         fs.create_dir(path, DIR_PERMISSION, 0, 0)?;
     }
     let loc = fs.resolve(path)?;
-    loc.mount(&mount_fs)?;
+    loc.mount_with_source(&mount_fs, mount_fs.name())?;
     info!("Mounted {} at {}", mount_fs.name(), path);
     Ok(())
 }
 
 /// Mount all filesystems
-pub fn mount_all() -> LinuxResult<()> {
+pub fn mount_all() -> StarryResult<()> {
     info!("Initialize pseudofs...");
 
-    let fs = FS_CONTEXT.lock();
+    let fs_context = current_fs_context();
+    let fs = fs_context.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
     let usbfs = usbfs::new_usbfs()?;
     if let Some(dev_usbfs) = usbfs {
@@ -98,7 +101,13 @@ pub fn mount_all() -> LinuxResult<()> {
     mount_at(&fs, "/tmp", tmp_fs)?;
     TMP_TMPFS.init_once(tmp_handle);
 
-    mount_at(&fs, "/proc", proc::new_procfs())?;
+    mount_at(&fs, "/dev/mqueue", mqueue::new_mqueuefs())?;
+
+    mount_at(
+        &fs,
+        "/proc",
+        proc::new_procfs(crate::task::ROOT_PID_NS.clone()),
+    )?;
 
     mount_at(&fs, "/sys", sysfs::new_sysfs())?;
     if usbfs::has_manager() {

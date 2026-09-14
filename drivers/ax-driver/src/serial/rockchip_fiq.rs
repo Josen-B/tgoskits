@@ -8,8 +8,8 @@ use some_serial::ns16550::rockchip_fiq::{
     RockchipFiqSerial,
 };
 
-use super::{PlatformSerialDevice, SerialDeviceInfo, prop_u32, serial_runtime};
-use crate::{BindingInfo, BindingIrq};
+use super::{PlatformSerialDevice, erase_uart, prop_u32};
+use crate::BindingInfo;
 
 model_register!(
     name: "rockchip fiq debugger serial",
@@ -39,8 +39,8 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     }
 
     let raw = RockchipFiqSerial::new(mmio_base, fdt_config.config);
-    let serial = serial_runtime(raw);
-    let base = serial.base_addr;
+    let serial = erase_uart(raw);
+    let base = serial.hardware.register_base;
     info!(
         "Rockchip FIQ debugger UART@{base:#x} registered successfully, serial-id={}, baudrate={}, \
          irq-mode={}",
@@ -60,17 +60,11 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     }
     let irq = binding_info.irq_cloned();
     plat_dev.register(PlatformSerialDevice::new(
-        serial.name.into(),
-        SerialDeviceInfo {
-            fdt_path: fdt_config.uart_path,
-            alias_index: Some(fdt_config.config.serial_id as usize),
-            paddr: fdt_config.reg.address as usize,
-            mapped_base: base,
-            baudrate: serial.baudrate,
-            irq,
-            binding_info,
-        },
-        serial.runtime,
+        serial,
+        fdt_config.uart_path,
+        Some(fdt_config.config.serial_id as usize),
+        fdt_config.reg.address as usize,
+        irq,
     ));
     Ok(())
 }
@@ -91,7 +85,10 @@ fn uart_binding_info(fdt: &Fdt, uart_path: &str) -> Result<BindingInfo, OnProbeE
             ))
         })?;
     Ok(BindingInfo::with_binding_irq(Some(
-        BindingIrq::fdt_interrupt_with_controller(interrupt_parent, interrupt.specifier),
+        crate::binding_resolver::binding_irq_from_fdt_interrupt(
+            interrupt_parent,
+            interrupt.specifier,
+        )?,
     )))
 }
 

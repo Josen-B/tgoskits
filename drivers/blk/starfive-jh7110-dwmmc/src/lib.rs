@@ -5,21 +5,27 @@ extern crate std;
 
 use core::ptr::NonNull;
 
-use dma_api::CompletedDma;
-use dwmmc_host::{DwMmc, DwMmcIrq, Event};
-use sdio_host2::{
-    BusOp, BusWidth, Error as Host2Error, PollRequestError, RawResponse, RequestPoll, SdioHost,
-    SignalVoltage, SubmitTransactionError, Transaction,
+use dma_api::{CompletedDma, DeviceDma};
+use dwmmc_host::{DwMmc, DwMmcIrq, Event, FifoConfig, FifoDataWidth};
+use sdmmc_host::{
+    AdvanceRequestError, BusOp, BusWidth, Error as Host2Error, ProgressCause, RawResponse,
+    RequestProgress, SdMmcHost, SignalVoltage, SubmitTransactionError, Transaction,
 };
-use sdmmc_protocol::{Error, sdio::host2::SdioHost2Irq};
+use sdmmc_protocol::{Error, sdio::host::SdMmcIrqHost};
 
-pub const JH7110_DWMMC_FIFO_OFFSET: usize = 0x200;
 pub const JH7110_STABLE_REFERENCE_CLOCK_HZ: u32 = 50_000_000;
+pub const JH7110_FIFO_DEPTH_WORDS: u16 = 32;
+pub const JH7110_FIFO_CONFIG: FifoConfig =
+    match FifoConfig::new(JH7110_FIFO_DEPTH_WORDS, FifoDataWidth::Bits32) {
+        Some(config) => config,
+        None => panic!("JH7110 FIFO capability is invalid"),
+    };
 pub const DEVICE_NAME: &str = "starfive-jh7110-mmc";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Jh7110DwMmcConfig {
     reference_clock_hz: u32,
+    fifo_config: FifoConfig,
     max_bus_width: BusWidth,
     supports_1v8: bool,
 }
@@ -28,6 +34,7 @@ impl Default for Jh7110DwMmcConfig {
     fn default() -> Self {
         Self {
             reference_clock_hz: JH7110_STABLE_REFERENCE_CLOCK_HZ,
+            fifo_config: JH7110_FIFO_CONFIG,
             max_bus_width: BusWidth::Bit4,
             supports_1v8: false,
         }
@@ -38,6 +45,7 @@ impl Jh7110DwMmcConfig {
     pub const fn new() -> Self {
         Self {
             reference_clock_hz: JH7110_STABLE_REFERENCE_CLOCK_HZ,
+            fifo_config: JH7110_FIFO_CONFIG,
             max_bus_width: BusWidth::Bit4,
             supports_1v8: false,
         }
@@ -50,6 +58,11 @@ impl Jh7110DwMmcConfig {
 
     pub const fn with_max_bus_width(mut self, max_bus_width: BusWidth) -> Self {
         self.max_bus_width = max_bus_width;
+        self
+    }
+
+    pub const fn with_fifo_config(mut self, fifo_config: FifoConfig) -> Self {
+        self.fifo_config = fifo_config;
         self
     }
 
@@ -68,6 +81,10 @@ impl Jh7110DwMmcConfig {
 
     pub const fn max_bus_width(&self) -> BusWidth {
         self.max_bus_width
+    }
+
+    pub const fn fifo_config(&self) -> FifoConfig {
+        self.fifo_config
     }
 
     pub const fn supports_1v8(&self) -> bool {
@@ -104,10 +121,12 @@ impl Jh7110DwMmc {
     pub unsafe fn new(base: NonNull<u8>, config: Jh7110DwMmcConfig) -> Self {
         let normalized_config = config
             .with_reference_clock_hz(config.reference_clock_hz())
+            .with_fifo_config(config.fifo_config())
             .with_max_bus_width(config.max_bus_width())
             .with_1v8_support(config.supports_1v8());
-        let mut inner = unsafe { DwMmc::new_with_fifo_offset(base, JH7110_DWMMC_FIFO_OFFSET) };
+        let mut inner = unsafe { DwMmc::new(base) };
         inner.set_reference_clock(normalized_config.reference_clock_hz());
+        inner.set_fifo_config(normalized_config.fifo_config());
         Self {
             inner,
             config: normalized_config,
@@ -135,13 +154,13 @@ impl Jh7110DwMmc {
     }
 }
 
-impl SdioHost for Jh7110DwMmc {
+impl SdMmcHost for Jh7110DwMmc {
     type TransactionRequest<'a>
-        = <DwMmc as SdioHost>::TransactionRequest<'a>
+        = <DwMmc as SdMmcHost>::TransactionRequest<'a>
     where
         Self: 'a;
 
-    type BusRequest = <DwMmc as SdioHost>::BusRequest;
+    type BusRequest = <DwMmc as SdMmcHost>::BusRequest;
 
     unsafe fn submit_transaction<'a>(
         &mut self,
@@ -163,14 +182,15 @@ impl SdioHost for Jh7110DwMmc {
         unsafe { self.inner.submit_transaction_owned(transaction) }
     }
 
-    fn poll_transaction<'a>(
+    fn advance_transaction<'a>(
         &mut self,
         request: &mut Self::TransactionRequest<'a>,
-    ) -> Result<RequestPoll<RawResponse>, PollRequestError>
+        cause: ProgressCause,
+    ) -> Result<RequestProgress<RawResponse>, AdvanceRequestError>
     where
         Self: 'a,
     {
-        self.inner.poll_transaction(request)
+        self.inner.advance_transaction(request, cause)
     }
 
     fn abort_transaction<'a>(
@@ -198,11 +218,12 @@ impl SdioHost for Jh7110DwMmc {
         unsafe { self.inner.submit_bus_op(op) }
     }
 
-    fn poll_bus_op(
+    fn advance_bus_op(
         &mut self,
         request: &mut Self::BusRequest,
-    ) -> Result<RequestPoll<()>, PollRequestError> {
-        self.inner.poll_bus_op(request)
+        cause: ProgressCause,
+    ) -> Result<RequestProgress<()>, AdvanceRequestError> {
+        self.inner.advance_bus_op(request, cause)
     }
 
     fn abort_bus_op(&mut self, request: &mut Self::BusRequest) -> Result<(), Host2Error> {
@@ -214,9 +235,10 @@ impl SdioHost for Jh7110DwMmc {
     }
 }
 
-impl SdioHost2Irq for Jh7110DwMmc {
+impl SdMmcIrqHost for Jh7110DwMmc {
     type Event = Event;
     type IrqHandle = DwMmcIrq;
+    type CardIrq = ();
 
     fn completion_irq_enabled(&self) -> bool {
         self.inner.completion_irq_enabled()
@@ -232,31 +254,25 @@ impl SdioHost2Irq for Jh7110DwMmc {
         Ok(())
     }
 
-    fn irq_handle(&mut self) -> Self::IrqHandle {
-        self.inner.irq_endpoint()
-    }
-}
-
-pub mod rdif {
-    pub use rdif_block::{
-        BInterface, BIrqHandler, BOwnedQueue, BQueue, BlkError, IQueue, IQueueOwned, Interface,
-        OwnedRequest, PollError, QueueHandle, Request, RequestId as RdifRequestId,
-        RequestPoll as OwnedRequestPoll, RequestStatus, SubmitError,
-    };
-    pub use sdmmc_protocol::rdif::{config::BlockConfig, device::BlockDevice, queue::BlockQueue};
-    use sdmmc_protocol::sdio::{card::SdioSdmmc, host2::SdioHost2Adapter};
-
-    use crate::{DEVICE_NAME, Jh7110DwMmc};
-
-    pub fn device(
-        card: SdioSdmmc<SdioHost2Adapter<Jh7110DwMmc>>,
-        config: BlockConfig,
-    ) -> BlockDevice<SdioHost2Adapter<Jh7110DwMmc>> {
-        BlockDevice::new(card, config)
+    fn into_parts(self) -> sdmmc_host::HostParts<Self, Self::IrqHandle, Self::CardIrq> {
+        let Jh7110DwMmc { inner, config } = self;
+        let parts = <DwMmc as SdMmcIrqHost>::into_parts(inner);
+        sdmmc_host::HostParts {
+            bus: Jh7110DwMmc {
+                inner: parts.bus,
+                config,
+            },
+            irq: parts.irq,
+            card_irq: None,
+        }
     }
 
-    pub const fn fifo_config(capacity_blocks: u64, irq_driven: bool) -> BlockConfig {
-        BlockConfig::fifo(DEVICE_NAME, capacity_blocks, irq_driven)
+    fn device_dma(&self) -> Result<&DeviceDma, Error> {
+        <DwMmc as SdMmcIrqHost>::device_dma(&self.inner)
+    }
+
+    fn progress_wait_kind(&self) -> sdmmc_protocol::sdio::HostProgressWait {
+        <DwMmc as SdMmcIrqHost>::progress_wait_kind(&self.inner)
     }
 }
 
@@ -265,8 +281,8 @@ mod tests {
     use core::ptr::NonNull;
     use std::{vec, vec::Vec};
 
-    use sdio_host2::{BusOp, BusWidth, SdioHost, SignalVoltage};
-    use sdmmc_protocol::sdio::host2::SdioHost2Irq;
+    use sdmmc_host::{BusOp, BusWidth, SdMmcHost, SignalVoltage};
+    use sdmmc_protocol::sdio::host::SdMmcIrqHost;
 
     use super::*;
 
@@ -277,28 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn default_config_keeps_jh7110_slot_constraints() {
-        let config = Jh7110DwMmcConfig::default();
-
-        assert_eq!(JH7110_DWMMC_FIFO_OFFSET, 0x200);
-        assert_eq!(JH7110_STABLE_REFERENCE_CLOCK_HZ, 50_000_000);
-        assert_eq!(DEVICE_NAME, "starfive-jh7110-mmc");
-        assert_eq!(
-            config.reference_clock_hz(),
-            JH7110_STABLE_REFERENCE_CLOCK_HZ
-        );
-        assert_eq!(config.max_bus_width(), BusWidth::Bit4);
-        assert!(!config.supports_1v8());
-    }
-
-    #[test]
-    fn constructor_applies_reference_clock_and_fifo_offset_policy() {
+    fn constructor_applies_reference_clock_policy() {
         let (_regs, mmio) = fake_mmio();
         let host = unsafe { Jh7110DwMmc::new(mmio, Jh7110DwMmcConfig::default()) };
 
         assert_eq!(
             host.inner().reference_clock(),
             JH7110_STABLE_REFERENCE_CLOCK_HZ
+        );
+        assert_eq!(host.inner().fifo_config().depth_words(), 32);
+        assert_eq!(
+            host.inner().fifo_config().data_width(),
+            FifoDataWidth::Bits32
         );
     }
 
@@ -309,33 +315,19 @@ mod tests {
 
         assert!(matches!(
             unsafe { host.submit_bus_op(BusOp::SetBusWidth(BusWidth::Bit8)) },
-            Err(sdio_host2::Error::Unsupported)
+            Err(sdmmc_host::Error::Unsupported)
         ));
         assert!(matches!(
             unsafe { host.submit_bus_op(BusOp::SetSignalVoltage(SignalVoltage::V180)) },
-            Err(sdio_host2::Error::Unsupported)
+            Err(sdmmc_host::Error::Unsupported)
         ));
     }
 
     #[test]
-    fn completion_irq_methods_delegate_to_inner_dwmmc() {
+    fn device_dma_is_explicitly_unavailable_before_configuration() {
         let (_regs, mmio) = fake_mmio();
-        let mut host = unsafe { Jh7110DwMmc::new(mmio, Jh7110DwMmcConfig::default()) };
+        let host = unsafe { Jh7110DwMmc::new(mmio, Jh7110DwMmcConfig::default()) };
 
-        assert!(!host.completion_irq_enabled());
-        host.enable_completion_irq().unwrap();
-        assert!(host.completion_irq_enabled());
-        host.disable_completion_irq().unwrap();
-        assert!(!host.completion_irq_enabled());
-    }
-
-    #[test]
-    fn rdif_fifo_config_is_irq_driven_without_dma() {
-        let config = rdif::fifo_config(16, true);
-
-        assert_eq!(config.name, DEVICE_NAME);
-        assert_eq!(config.capacity_blocks, 16);
-        assert!(config.irq_driven);
-        assert!(!config.uses_dma());
+        assert!(matches!(host.device_dma(), Err(Error::UnsupportedCommand)));
     }
 }

@@ -1,10 +1,13 @@
 //! Device address and access width definitions.
 
+use alloc::string::String;
 use core::fmt::{Debug, LowerHex};
 
 use ax_memory_addr::AddrRange;
 use axvm_types::GuestPhysAddr;
 pub use axvm_types::{AccessWidth, Port, SysRegAddr};
+
+use crate::DeviceVcpuId;
 
 /// An address-like type that can be used to access devices.
 pub trait DeviceAddr: Copy + Eq + Ord + core::fmt::Debug {}
@@ -136,7 +139,7 @@ impl LowerHex for PortRange {
 }
 
 // ---------------------------------------------------------------------------
-// Unified bus-access types
+// Device access types
 // ---------------------------------------------------------------------------
 
 /// The kind of bus a device is connected to.
@@ -150,39 +153,63 @@ pub enum BusKind {
     SysReg,
 }
 
-/// An access issued by a vCPU to a device on a bus.
-#[derive(Debug, Clone, Copy)]
-pub struct BusAccess {
-    /// The kind of bus being accessed.
-    pub kind: BusKind,
-    /// `true` if this is a read access; `false` for write.
-    pub is_read: bool,
-    /// The address being accessed.
-    pub addr: u64,
-    /// The width of the access.
-    pub width: AccessWidth,
-    /// The data to write (ignored for reads).
-    pub data: u64,
+/// Immutable metadata for one device access issued by a guest vCPU.
+///
+/// The source vCPU is an architectural identity within the VM. It must not be
+/// inferred from the host CPU or execution context handling the exit.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DeviceAccess {
+    source_vcpu: DeviceVcpuId,
+    bus: BusKind,
+    address: u64,
+    width: AccessWidth,
 }
 
-/// The result of a bus access dispatched to a device.
-#[derive(Debug, Clone, Copy)]
-pub enum BusResponse {
-    /// A read response with the value.
-    Read {
-        /// The value read from the device.
-        value: u64,
-    },
-    /// A write acknowledgment.
-    Write,
+impl DeviceAccess {
+    /// Creates complete metadata for one guest device access.
+    pub const fn new(
+        source_vcpu: DeviceVcpuId,
+        bus: BusKind,
+        address: u64,
+        width: AccessWidth,
+    ) -> Self {
+        Self {
+            source_vcpu,
+            bus,
+            address,
+            width,
+        }
+    }
+
+    /// Returns the vCPU that issued the access.
+    pub const fn source_vcpu(self) -> DeviceVcpuId {
+        self.source_vcpu
+    }
+
+    /// Returns the accessed bus.
+    pub const fn bus(self) -> BusKind {
+        self.bus
+    }
+
+    /// Returns the address in the selected bus address space.
+    pub const fn address(self) -> u64 {
+        self.address
+    }
+
+    /// Returns the access width.
+    pub const fn width(self) -> AccessWidth {
+        self.width
+    }
 }
 
 /// Errors that can occur during device access handling.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum DeviceError {
     /// No device found at the requested address.
+    #[error("no device was found for the requested bus access")]
     NotFound,
     /// The access width does not match what the register expects.
+    #[error("invalid device access width: expected {expected:?}, got {actual:?}")]
     InvalidWidth {
         /// The width the register expects.
         expected: AccessWidth,
@@ -190,16 +217,78 @@ pub enum DeviceError {
         actual: AccessWidth,
     },
     /// Attempted to write to a read-only register.
+    #[error("attempted to write a read-only device register")]
     ReadOnly,
     /// Attempted to read from a write-only register.
+    #[error("attempted to read a write-only device register")]
     WriteOnly,
     /// The address is outside the device's range.
+    #[error("device address {addr:#x} is outside the registered range")]
     OutOfRange {
         /// The address that was accessed.
         addr: u64,
     },
     /// The requested functionality is not yet implemented.
+    #[error("device operation is not implemented")]
     Unimplemented,
     /// An internal error occurred in the device implementation.
+    #[error("internal device error")]
     Internal,
+    /// An operation received an invalid argument.
+    #[error("invalid input for device operation {operation}: {detail}")]
+    InvalidInput {
+        /// The operation that rejected the input.
+        operation: &'static str,
+        /// Diagnostic detail describing the invalid input.
+        detail: String,
+    },
+    /// Device data is malformed or inconsistent.
+    #[error("invalid data for device operation {operation}: {detail}")]
+    InvalidData {
+        /// The operation that rejected the data.
+        operation: &'static str,
+        /// Diagnostic detail describing the malformed data.
+        detail: String,
+    },
+    /// Device state does not allow the requested operation.
+    #[error("invalid state for device operation {operation}: {detail}")]
+    InvalidState {
+        /// The operation that cannot run in the current state.
+        operation: &'static str,
+        /// Diagnostic detail describing the current state.
+        detail: String,
+    },
+    /// The device does not support the requested operation.
+    #[error("unsupported device operation {operation}: {detail}")]
+    Unsupported {
+        /// The unsupported operation.
+        operation: &'static str,
+        /// Diagnostic detail describing the limitation.
+        detail: String,
+    },
+    /// A device allocation failed.
+    #[error("out of memory during device operation {operation}")]
+    OutOfMemory {
+        /// The operation that attempted the allocation.
+        operation: &'static str,
+    },
+    /// A device resource is currently busy.
+    #[error("device resource {resource} is busy during {operation}")]
+    ResourceBusy {
+        /// The operation that attempted to use the resource.
+        operation: &'static str,
+        /// The busy resource.
+        resource: String,
+    },
+    /// A device backend operation failed.
+    #[error("device backend operation {operation} failed: {detail}")]
+    Backend {
+        /// The backend operation that failed.
+        operation: &'static str,
+        /// Diagnostic detail from the backend.
+        detail: String,
+    },
 }
+
+/// Result type returned by device access operations.
+pub type DeviceResult<T = ()> = Result<T, DeviceError>;

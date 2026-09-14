@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.7...axvmconfig-v0.8.8) - 2026-09-12
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.7](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.6...axvmconfig-v0.8.7) - 2026-09-09
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.6](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.5...axvmconfig-v0.8.6) - 2026-08-25
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.5](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.4...axvmconfig-v0.8.5) - 2026-08-20
+
+### Added
+
+- *(axvisor)* Implement inter-VM communication (IVC) demo and protocol enhancements ([#1834](https://github.com/rcore-os/tgoskits/pull/1834))
+
+## [0.8.4](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.3...axvmconfig-v0.8.4) - 2026-08-09
+
+### Added
+
+- *(axvisor)* build VMs from a resolved device graph ([#1718](https://github.com/rcore-os/tgoskits/pull/1718))
+
+### Other
+
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.2...axvmconfig-v0.8.3) - 2026-08-03
+
+### Other
+
+- virtualize AArch64 physical timer state ([#1770](https://github.com/rcore-os/tgoskits/pull/1770))
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.1...axvmconfig-v0.8.2) - 2026-07-23
+
+### Other
+
+- *(axvmconfig)* introduce configuration errors ([#1597](https://github.com/rcore-os/tgoskits/pull/1597))
+
 ## [0.8.1](https://github.com/rcore-os/tgoskits/compare/axvmconfig-v0.8.0...axvmconfig-v0.8.1) - 2026-07-07
 
 ### Other

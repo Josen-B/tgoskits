@@ -4,6 +4,15 @@ use crate::ArchTrait;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
+/// Hardware counter contract exposed to the platform scheduler clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CounterStability {
+    /// Every runtime CPU observes one synchronized system counter.
+    Stable,
+    /// The counter is CPU-local and requires per-CPU correction.
+    Unstable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ArchTimerMode {
@@ -52,38 +61,45 @@ pub fn aarch64_timer_mode() -> ArchTimerMode {
     unsafe { ArchTimerMode::from_raw(ARCH_TIMER_MODE) }
 }
 
-/// Enable the platform system timer so that timer IRQs can fire.
-pub fn enable() {
-    crate::arch::Arch::systimer_enable();
+#[cfg(any(target_arch = "aarch64", test))]
+pub(crate) fn resume_masked_level_oneshot(
+    program_comparator: impl FnOnce(),
+    unmask_source: impl FnOnce(),
+) {
+    program_comparator();
+    unmask_source();
 }
 
-/// Disable the platform system timer to stop timer IRQs.
-pub fn irq_disable() {
-    crate::arch::Arch::systimer_irq_disable();
+/// Keeps platform clock-event deadlines ahead of the current raw counter.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", test))]
+pub(crate) fn next_cpu_timer_deadline(now: u64, requested: u64) -> u64 {
+    requested.max(now.saturating_add(1))
 }
 
-pub fn irq_enable() {
-    crate::arch::Arch::systimer_irq_enable();
+#[cfg(any(target_arch = "riscv64", test))]
+pub(crate) mod riscv64_interval {
+    /// Returns the SBI comparator value used to disarm a one-shot timer.
+    pub(crate) const fn stopped_deadline() -> u64 {
+        u64::MAX
+    }
 }
 
-pub fn irq_is_enabled() -> bool {
-    crate::arch::Arch::systimer_irq_is_enabled()
-}
+#[cfg(any(target_arch = "loongarch64", test))]
+pub(crate) mod loongarch64_interval {
+    const ALIGNMENT: usize = 4;
+    const MIN_TICKS: usize = 4;
 
-/// Configure the system timer with the desired interval.
-pub fn set_next_event(interval: Duration) {
-    let ticks = duration_to_ticks(interval);
-    crate::arch::Arch::systimer_set_interval(ticks);
-}
+    /// Converts a relative interval to the bounded 4-tick value encoded by TCFG.
+    pub(crate) fn aligned_ticks(interval_ticks: usize) -> usize {
+        let max_aligned = usize::MAX - usize::MAX % ALIGNMENT;
+        let clamped = interval_ticks.max(MIN_TICKS).min(max_aligned);
+        (clamped + (ALIGNMENT - 1)) & !(ALIGNMENT - 1)
+    }
 
-pub fn set_next_event_in_ticks(ticks: usize) {
-    crate::arch::Arch::systimer_set_interval(ticks);
-}
-
-/// Acknowledge and clear the timer interrupt.
-/// This must be called in the timer interrupt handler.
-pub fn ack() {
-    crate::arch::Arch::systimer_ack();
+    /// Returns the largest valid one-shot interval encoded by TCFG.
+    pub(crate) const fn stopped_ticks() -> usize {
+        usize::MAX & !(ALIGNMENT - 1)
+    }
 }
 
 pub fn since_boot() -> Duration {
@@ -100,6 +116,12 @@ pub fn freq() -> usize {
 #[inline]
 pub fn ticks() -> usize {
     crate::arch::Arch::systimer_tick()
+}
+
+/// Reports whether scheduler users may sample the raw counter on any CPU.
+#[inline]
+pub fn scheduler_clock_stability() -> CounterStability {
+    crate::arch::Arch::systimer_stability()
 }
 
 /// Convert ticks to Duration.
@@ -136,6 +158,8 @@ pub fn elapsed() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use core::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -171,5 +195,41 @@ mod tests {
         assert_eq!(aarch64_timer_irq_index(ArchTimerMode::El1Phys), 1);
         assert_eq!(aarch64_timer_irq_index(ArchTimerMode::El1Virt), 2);
         assert_eq!(aarch64_timer_irq_index(ArchTimerMode::El2HypPhys), 3);
+    }
+
+    #[test]
+    fn masked_level_timer_replaces_the_comparator_before_unmask() {
+        let step = Cell::new(0);
+
+        resume_masked_level_oneshot(
+            || assert_eq!(step.replace(1), 0),
+            || assert_eq!(step.replace(2), 1),
+        );
+
+        assert_eq!(step.get(), 2);
+    }
+
+    #[test]
+    fn riscv64_stopped_deadline_disarms_comparator() {
+        assert_eq!(riscv64_interval::stopped_deadline(), u64::MAX);
+    }
+
+    #[test]
+    fn loongarch64_interval_clamps_before_rounding() {
+        assert_eq!(loongarch64_interval::aligned_ticks(1), 4);
+        assert_eq!(loongarch64_interval::aligned_ticks(5), 8);
+        assert_eq!(
+            loongarch64_interval::aligned_ticks(usize::MAX),
+            usize::MAX & !3
+        );
+        assert_eq!(loongarch64_interval::stopped_ticks(), usize::MAX & !3);
+    }
+
+    #[test]
+    fn clock_event_deadlines_remain_ahead_of_the_counter() {
+        assert_eq!(next_cpu_timer_deadline(17, 23), 23);
+        assert_eq!(next_cpu_timer_deadline(19, 8), 20);
+        assert_eq!(next_cpu_timer_deadline(19, 19), 20);
+        assert_eq!(next_cpu_timer_deadline(u64::MAX, 0), u64::MAX);
     }
 }

@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/rcore-os/tgoskits/compare/somehal-v0.11.0...somehal-v0.11.1) - 2026-09-13
+
+### Other
+
+- *(rdrive)* bind device borrows to guard lifetimes ([#2387](https://github.com/rcore-os/tgoskits/pull/2387))
+
+## [0.11.0](https://github.com/rcore-os/tgoskits/compare/somehal-v0.10.1...somehal-v0.11.0) - 2026-09-11
+
+### Other
+
+- *(ax-cpu)* [**breaking**] centralize CPU mechanisms and architecture backends ([#2363](https://github.com/rcore-os/tgoskits/pull/2363))
+
+## [0.10.1](https://github.com/rcore-os/tgoskits/compare/somehal-v0.10.0...somehal-v0.10.1) - 2026-09-09
+
+### Fixed
+
+- *(runtime)* prefer userspace over kernel TLS through build cfg ([#2339](https://github.com/rcore-os/tgoskits/pull/2339))
+
+## [0.10.0](https://github.com/rcore-os/tgoskits/compare/somehal-v0.9.2...somehal-v0.10.0) - 2026-09-09
+
+### Other
+
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+
+## [0.9.2](https://github.com/rcore-os/tgoskits/compare/somehal-v0.9.1...somehal-v0.9.2) - 2026-08-27
+
+### Added
+
+- *(loongarch-intc-driver)* extract OS-independent interrupt controllers ([#2174](https://github.com/rcore-os/tgoskits/pull/2174))
+
+## [0.9.1](https://github.com/rcore-os/tgoskits/compare/somehal-v0.9.0...somehal-v0.9.1) - 2026-08-25
+
+### Other
+
+- *(x86-apic-driver)* extract x86 interrupt controllers with rdif-intc support ([#2118](https://github.com/rcore-os/tgoskits/pull/2118))
+
+## [0.9.0](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.3...somehal-v0.9.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+- *(starry-nixos)* add Stage-2 NixOS userspace baseline ([#1923](https://github.com/rcore-os/tgoskits/pull/1923))
+
+### Fixed
+
+- *(arm-gic-driver)* handle implicit GICv2 uniprocessor targets ([#2007](https://github.com/rcore-os/tgoskits/pull/2007))
+- *(someboot)* [**breaking**] expose queryable secondary CPU startup ([#1981](https://github.com/rcore-os/tgoskits/pull/1981))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+### Changed
+
+- **Breaking:** re-export the queryable someboot secondary CPU startup handle in place of the
+  blocking `cpu_on()` API; timeout and polling policy now belong to the platform adapter.
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.2...somehal-v0.8.3) - 2026-08-09
+
+### Added
+
+- *(axvisor)* support ROCK 4D guest boot ([#1880](https://github.com/rcore-os/tgoskits/pull/1880))
+
+### Fixed
+
+- *(arm-gic-driver)* use hardware CPU targets for GICv2 routing ([#1803](https://github.com/rcore-os/tgoskits/pull/1803))
+
+### Other
+
+- *(ax-ipi)* establish typed IPI publication transport ([#1916](https://github.com/rcore-os/tgoskits/pull/1916))
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.1...somehal-v0.8.2) - 2026-08-03
+
+### Fixed
+
+- *(somehal)* make LS2K LIOINTC claim IRQ-safe ([#1831](https://github.com/rcore-os/tgoskits/pull/1831))
+
+### Other
+
+- virtualize AArch64 physical timer state ([#1770](https://github.com/rcore-os/tgoskits/pull/1770))
+- *(block)* adopt IRQ-driven multi-queue runtime ([#1768](https://github.com/rcore-os/tgoskits/pull/1768))
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.0...somehal-v0.8.1) - 2026-07-23
+
+### Added
+
+- *(axvisor)* Enhance AxLoader and Asus NUC15CRH support with fixes ([#1555](https://github.com/rcore-os/tgoskits/pull/1555))
+
+### Other
+
+- *(cpu-local)* extract per-CPU register ownership ([#1662](https://github.com/rcore-os/tgoskits/pull/1662))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/somehal-v0.7.8...somehal-v0.8.0) - 2026-07-10
+
+### Added
+
+- *(msi)* add hierarchical MSI-X irq domains ([#1526](https://github.com/rcore-os/tgoskits/pull/1526))
+
+## [0.7.8](https://github.com/rcore-os/tgoskits/compare/somehal-v0.7.7...somehal-v0.7.8) - 2026-07-08
+
+### Fixed
+
+- *(platforms)* route DMA cache sync through platform cache ops ([#1542](https://github.com/rcore-os/tgoskits/pull/1542))
+
 ## [0.7.7](https://github.com/rcore-os/tgoskits/compare/somehal-v0.7.6...somehal-v0.7.7) - 2026-07-08
 
 ### Other

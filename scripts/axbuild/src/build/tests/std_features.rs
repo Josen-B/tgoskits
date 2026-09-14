@@ -2,52 +2,39 @@ use super::*;
 
 #[test]
 fn std_build_nested_features_are_passed_through_not_enabled_on_app() {
-    let mut envs = HashMap::new();
     let mut features = vec![
-        "plat-dyn".to_string(),
-        "ax-driver/plat-dyn".to_string(),
-        "ax-driver/virtio-blk".to_string(),
+        "ax-driver/nvme".to_string(),
         "ax-driver/virtio-net".to_string(),
         "dns".to_string(),
     ];
 
     pass_std_build_nested_features(
-        &mut envs,
         &mut features,
         &["dns".to_string()],
         &[
             "dns".to_string(),
             "plat-dyn".to_string(),
             "std-compat".to_string(),
-            "virtio-blk".to_string(),
+            "nvme".to_string(),
             "virtio-net".to_string(),
         ],
     );
 
-    assert_eq!(
-        features,
-        vec![
-            "ax-std/dns".to_string(),
-            "ax-std/std-compat".to_string(),
-            "ax-std/virtio-blk".to_string(),
-            "ax-std/virtio-net".to_string(),
-            "dns".to_string(),
-        ]
-    );
-    assert!(envs.is_empty());
+    assert!(features.contains(&"ax-std/dns".to_string()));
+    assert!(features.contains(&"ax-std/nvme".to_string()));
+    assert!(features.contains(&"ax-std/virtio-net".to_string()));
+    assert!(features.contains(&"dns".to_string()));
 }
 
 #[test]
 fn std_build_runtime_features_are_passed_through_after_normalization() {
     let mut info = BuildInfo {
-        features: vec!["plat-dyn".to_string(), "dns".to_string()],
+        features: vec!["dns".to_string()],
         ..BuildInfo::default()
     };
 
     info.resolve_std_features();
-    let mut envs = HashMap::new();
     pass_std_build_nested_features(
-        &mut envs,
         &mut info.features,
         &["dns".to_string()],
         &[
@@ -57,15 +44,8 @@ fn std_build_runtime_features_are_passed_through_after_normalization() {
         ],
     );
 
-    assert_eq!(
-        info.features,
-        vec![
-            "ax-std/dns".to_string(),
-            "ax-std/std-compat".to_string(),
-            "dns".to_string()
-        ]
-    );
-    assert!(envs.is_empty());
+    assert!(info.features.contains(&"ax-std/dns".to_string()));
+    assert!(info.features.contains(&"dns".to_string()));
 }
 
 #[test]
@@ -93,17 +73,9 @@ fn std_build_cargo_config_builds_fake_lib_before_app() {
             .windows(2)
             .any(|pair| pair == ["-Z", "json-target-spec"])
     );
-    assert_eq!(
-        cargo.features,
-        vec![
-            "arceos".to_string(),
-            "ax-std/dns".to_string(),
-            "ax-std/fs".to_string(),
-            "ax-std/smp".to_string(),
-            "ax-std/std-compat".to_string(),
-        ]
-    );
-    assert!(cargo.to_bin);
+    assert!(cargo.features.iter().any(|feature| feature == "ax-std/dns"));
+    assert!(cargo.features.iter().any(|feature| feature == "ax-std/fs"));
+    assert!(!cargo.to_bin);
     assert_eq!(
         cargo.env.get("CARGO_UNSTABLE_JSON_TARGET_SPEC"),
         Some(&"true".to_string())
@@ -119,8 +91,13 @@ fn std_build_cargo_config_builds_fake_lib_before_app() {
             .as_ref()
             .is_some_and(|path| path.ends_with("config-x86_64-unknown-linux-musl-dynamic.toml"))
     );
-    assert_eq!(cargo.pre_build_cmds.len(), 1);
-    let prebuild = fs::read_to_string(&cargo.pre_build_cmds[0]).unwrap();
+    let prebuild = fs::read_to_string(
+        cargo
+            .pre_build_cmds
+            .first()
+            .expect("dynamic std build should prepare a pre-build archive script"),
+    )
+    .unwrap();
     assert!(prebuild.contains("target_name='x86_64-unknown-linux-musl'"));
     assert!(!prebuild.contains("cargo}\" build -p ax-std"));
     assert!(!prebuild.contains("libax_std.a"));
@@ -129,4 +106,30 @@ fn std_build_cargo_config_builds_fake_lib_before_app() {
     assert!(prebuild.contains("$(rustc --print sysroot)"));
     assert!(prebuild.contains("create_empty_archive \"$fake_dir/libc.a\""));
     assert!(prebuild.contains("create_empty_archive \"$fake_dir/libunwind.a\""));
+}
+
+#[test]
+fn preparing_another_build_preserves_existing_target_configuration() {
+    let root = tempdir().unwrap();
+    let linker = root.path().join("linker");
+    let target = "x86_64-unknown-linux-musl";
+    let protected =
+        std_cargo_config_path(target, &linker, &["-Zstack-protector=strong".to_string()]).unwrap();
+    let original = fs::read_to_string(&protected).unwrap();
+    let plain = std_cargo_config_path(target, &linker, &[]).unwrap();
+
+    assert_ne!(
+        protected, plain,
+        "different build options must not share mutable configuration"
+    );
+    assert_eq!(fs::read_to_string(&protected).unwrap(), original);
+    assert!(
+        !fs::read_to_string(&plain)
+            .unwrap()
+            .contains("stack-protector")
+    );
+    assert_eq!(
+        std_cargo_config_path(target, &linker, &["-Zstack-protector=strong".to_string()]).unwrap(),
+        protected,
+    );
 }

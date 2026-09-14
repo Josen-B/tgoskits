@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.9...rockchip-pm-v0.4.10) - 2026-09-09
+
+### Fixed
+
+- *(repo)* remove redundant Cargo manifest declarations ([#2297](https://github.com/rcore-os/tgoskits/pull/2297))
+
+## [0.4.9](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.8...rockchip-pm-v0.4.9) - 2026-08-20
+
+### Other
+
+- updated the following local packages: rdif-base
+
+## [0.4.8](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.7...rockchip-pm-v0.4.8) - 2026-08-09
+
+### Other
+
+- updated the following local packages: rdif-base
+
+## [0.4.7](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.6...rockchip-pm-v0.4.7) - 2026-08-03
+
+### Added
+
+- *(rockchip)* add RK3576 ROCK 4D support ([#1704](https://github.com/rcore-os/tgoskits/pull/1704))
+
 ## [0.4.6](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.5...rockchip-pm-v0.4.6) - 2026-07-07
 
 ### Added

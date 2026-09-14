@@ -178,10 +178,11 @@ baud_rate = "1500000"
 "#,
         );
 
-        assert_eq!(
-            board_names(root.path()).unwrap(),
-            vec!["a-board".to_string(), "z-board".to_string()]
-        );
+        let names = board_names(root.path()).unwrap();
+        assert!(names.contains(&"a-board".to_string()));
+        assert!(names.contains(&"z-board".to_string()));
+        assert!(!names.contains(&"orangepi-5-plus-uboot".to_string()));
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]
@@ -211,7 +212,7 @@ log = "Warn"
             "qemu-riscv64",
             r#"
 target = "riscv64gc-unknown-none-elf"
-features = ["ax-driver/serial", "ax-driver/virtio-blk"]
+features = ["ax-driver/serial", "ax-driver/nvme"]
 log = "Warn"
 "#,
         );

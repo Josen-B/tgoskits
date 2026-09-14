@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.2...ax-api-v0.8.3) - 2026-09-13
+
+### Other
+
+- updated the following local packages: ax-hal, ax-runtime
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.1...ax-api-v0.8.2) - 2026-09-12
+
+### Other
+
+- updated the following local packages: ax-runtime
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.8.0...ax-api-v0.8.1) - 2026-09-11
+
+### Other
+
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.9...ax-api-v0.8.0) - 2026-09-09
+
+### Fixed
+
+- *(ax-posix-api)* deliver EPOLLIN/EPOLLOUT edges via direction-split readiness versions ([#2235](https://github.com/rcore-os/tgoskits/pull/2235))
+
+### Other
+
+- *(ax-task)* [**breaking**] organize scheduler namespaces and unify runtime APIs ([#2313](https://github.com/rcore-os/tgoskits/pull/2313))
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+- *(rsext4)* [**breaking**] align ext4 semantics with Linux 7.1 ([#1957](https://github.com/rcore-os/tgoskits/pull/1957))
+
+## [0.7.9](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.8...ax-api-v0.7.9) - 2026-08-27
+
+### Other
+
+- *(runtime)* make IRQ and multitasking mandatory ([#2188](https://github.com/rcore-os/tgoskits/pull/2188))
+- *(axvm)* unify host timer ownership ([#2190](https://github.com/rcore-os/tgoskits/pull/2190))
+
+## [0.7.8](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.7...ax-api-v0.7.8) - 2026-08-20
+
+### Fixed
+
+- *(console)* unify sleepable runtime console arbitration ([#2113](https://github.com/rcore-os/tgoskits/pull/2113))
+
+### Other
+
+- *(serial)* establish bounded owner-affine UART runtime ([#2076](https://github.com/rcore-os/tgoskits/pull/2076))
+- *(errors)* introduce domain-owned error boundaries ([#2024](https://github.com/rcore-os/tgoskits/pull/2024))
+- *(sync)* move lock implementation into ax-task ([#1962](https://github.com/rcore-os/tgoskits/pull/1962))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.7.7](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.6...ax-api-v0.7.7) - 2026-08-09
+
+### Other
+
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
+## [0.7.6](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.5...ax-api-v0.7.6) - 2026-08-03
+
+### Fixed
+
+- *(dma-api)* retire legacy axdma release paths ([#1796](https://github.com/rcore-os/tgoskits/pull/1796))
+
+### Other
+
+- *(block)* adopt IRQ-driven multi-queue runtime ([#1768](https://github.com/rcore-os/tgoskits/pull/1768))
+
+## [0.7.5](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.4...ax-api-v0.7.5) - 2026-07-23
+
+### Other
+
+- updated the following local packages: ax-io, ax-alloc, axpoll, ax-hal, ax-ipi, ax-task, ax-fs-ng, ax-net, ax-runtime, ax-mm, ax-sync, ax-display, ax-dma
+
+## [0.7.4](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.3...ax-api-v0.7.4) - 2026-07-10
+
+### Other
+
+- updated the following local packages: ax-hal, ax-runtime, ax-alloc, ax-ipi, ax-mm, ax-task, ax-sync, ax-display, ax-dma, ax-fs-ng, ax-net
+
+## [0.7.3](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.2...ax-api-v0.7.3) - 2026-07-08
+
+### Other
+
+- updated the following local packages: ax-hal, ax-runtime, ax-alloc, ax-ipi, ax-mm, ax-task, ax-sync, ax-display, ax-dma, ax-fs-ng, ax-net
+
 ## [0.7.2](https://github.com/rcore-os/tgoskits/compare/ax-api-v0.7.1...ax-api-v0.7.2) - 2026-07-08
 
 ### Other

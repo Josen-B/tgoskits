@@ -1,50 +1,45 @@
 //! Device emulation operations for VPlicGlobal.
 //!
-//! Implements the `BaseDeviceOps` trait for MMIO read/write handling.
+//! Implements V3 device-access handling for MMIO read/write operations.
 
-use ax_errno::{AxResult, ax_err};
-use axdevice_base::{AccessWidth, BaseDeviceOps, DeviceAddrRange, EmuDeviceType};
-use axvm_types::{GuestPhysAddrRange, HostPhysAddr};
+use axdevice_base::{
+    AccessWidth, BusKind, Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult,
+};
+use axvm_types::GuestPhysAddr;
 use bitmaps::Bitmap;
 
-use crate::{consts::*, utils::*, vplic::VPlicGlobal};
+use crate::{
+    VplicError, VplicResult,
+    consts::*,
+    vplic::{VPlicGlobal, VplicCompletion},
+};
 
-#[cfg(target_arch = "riscv64")]
-const VCAUSE_INTERRUPT_BIT: usize = 1usize << (usize::BITS - 1);
-#[cfg(target_arch = "riscv64")]
-const VCAUSE_VS_TIMER: usize = VCAUSE_INTERRUPT_BIT | 5;
 const PLIC_PENDING_WORDS: usize = PLIC_NUM_SOURCES / 32;
 
 impl VPlicGlobal {
-    fn validate_irq_id(irq_id: usize) -> AxResult {
+    fn validate_irq_id(irq_id: usize) -> VplicResult {
         if irq_id == 0 || irq_id >= PLIC_NUM_SOURCES {
-            return ax_err!(
-                InvalidInput,
-                format_args!(
-                    "invalid PLIC source ID {irq_id}; valid source IDs are 1..{}",
-                    PLIC_NUM_SOURCES - 1
-                )
-            );
+            return Err(VplicError::InvalidSource {
+                source_id: irq_id,
+                max: PLIC_NUM_SOURCES,
+            });
         }
         Ok(())
     }
 
-    fn validate_assigned_irq(&self, irq_id: usize) -> AxResult {
+    fn validate_assigned_irq(&self, irq_id: usize) -> VplicResult {
         Self::validate_irq_id(irq_id)?;
 
-        let assigned_irqs = self.assigned_irqs.lock();
+        let assigned_irqs = self.assigned_irqs.lock_irqsave();
         if !assigned_irqs.is_empty() && !assigned_irqs.get(irq_id) {
-            return ax_err!(
-                PermissionDenied,
-                format_args!("PLIC source ID {irq_id} is not assigned to this virtual PLIC")
-            );
+            return Err(VplicError::SourceNotAssigned { source_id: irq_id });
         }
         Ok(())
     }
 
-    fn update_pending_irq(&self, irq_id: usize, pending: bool) -> AxResult {
+    fn update_pending_irq(&self, irq_id: usize, pending: bool) -> VplicResult {
         self.validate_assigned_irq(irq_id)?;
-        self.pending_irqs.lock().set(irq_id, pending);
+        self.pending_irqs.lock_irqsave().set(irq_id, pending);
         Ok(())
     }
 
@@ -53,58 +48,57 @@ impl VPlicGlobal {
     /// Source ID 0 and IDs outside the PLIC source range are rejected. An
     /// empty assignment bitmap preserves the existing unrestricted behavior;
     /// once assignments are populated, only assigned sources are accepted.
-    pub fn set_pending(&self, irq_id: usize) -> AxResult {
-        self.update_pending_irq(irq_id, true)?;
-        self.sync_all_guest_contexts_vseip()
+    pub fn set_pending(&self, irq_id: usize) -> VplicResult {
+        self.update_pending_irq(irq_id, true)
     }
 
     /// Clears the pending state of one interrupt source.
-    pub fn clear_pending(&self, irq_id: usize) -> AxResult {
-        self.update_pending_irq(irq_id, false)?;
-        self.sync_all_guest_contexts_vseip()
+    pub fn clear_pending(&self, irq_id: usize) -> VplicResult {
+        self.update_pending_irq(irq_id, false)
+    }
+
+    /// Updates one level-triggered device input.
+    ///
+    /// Returns `true` when a low-to-high transition needs initial delivery.
+    /// The asserted state remains controller-owned so completion can repend
+    /// the source until the device lowers the line.
+    pub fn set_irq_line_level(&self, irq_id: usize, asserted: bool) -> VplicResult<bool> {
+        self.validate_assigned_irq(irq_id)?;
+        let newly_asserted = {
+            let mut asserted_irqs = self.line_asserted_irqs.lock_irqsave();
+            let was_asserted = asserted_irqs.get(irq_id);
+            asserted_irqs.set(irq_id, asserted);
+            asserted && !was_asserted
+        };
+        self.pending_irqs.lock_irqsave().set(irq_id, asserted);
+        Ok(newly_asserted)
     }
 
     /// Returns whether one interrupt source is pending.
-    pub fn is_pending(&self, irq_id: usize) -> AxResult<bool> {
+    pub fn is_pending(&self, irq_id: usize) -> VplicResult<bool> {
         self.validate_assigned_irq(irq_id)?;
-        Ok(self.pending_irqs.lock().get(irq_id))
+        Ok(self.pending_irqs.lock_irqsave().get(irq_id))
     }
 
-    /// Reads the priority of an interrupt source from the host PLIC.
-    fn irq_priority(&self, irq_id: usize) -> AxResult<u32> {
-        let addr = HostPhysAddr::from_usize(
-            self.host_plic_addr.as_usize() + PLIC_PRIORITY_OFFSET + irq_id * 4,
-        );
-        Ok(perform_mmio_read(addr, AccessWidth::Dword)? as u32)
+    /// Reads the priority programmed by this guest.
+    fn irq_priority(&self, irq_id: usize) -> VplicResult<u32> {
+        Ok(self.registers.lock_irqsave().priorities[irq_id])
     }
 
     /// Reads the priority threshold configured for a PLIC context.
-    #[cfg(target_arch = "riscv64")]
-    fn context_threshold(&self, context_id: usize) -> AxResult<u32> {
-        let addr = HostPhysAddr::from_usize(
-            self.host_plic_addr.as_usize()
-                + PLIC_CONTEXT_CTRL_OFFSET
-                + context_id * PLIC_CONTEXT_STRIDE
-                + PLIC_CONTEXT_THRESHOLD_OFFSET,
-        );
-        Ok(perform_mmio_read(addr, AccessWidth::Dword)? as u32)
+    fn context_threshold(&self, context_id: usize) -> VplicResult<u32> {
+        Ok(self.registers.lock_irqsave().thresholds[context_id])
     }
 
     /// Reads one enable register word for a PLIC context.
-    fn context_enable_mask(&self, context_id: usize, reg_index: usize) -> AxResult<u32> {
-        let addr = HostPhysAddr::from_usize(
-            self.host_plic_addr.as_usize()
-                + PLIC_ENABLE_OFFSET
-                + context_id * PLIC_ENABLE_STRIDE
-                + reg_index * 4,
-        );
-        Ok(perform_mmio_read(addr, AccessWidth::Dword)? as u32)
+    fn context_enable_mask(&self, context_id: usize, reg_index: usize) -> VplicResult<u32> {
+        Ok(self.registers.lock_irqsave().enable_masks[context_id][reg_index])
     }
 
     /// Returns pending interrupts that are not currently in service.
     fn pending_inactive_irqs(&self) -> Bitmap<{ PLIC_NUM_SOURCES }> {
-        let pending_irqs = self.pending_irqs.lock();
-        let active_irqs = self.active_irqs.lock();
+        let pending_irqs = self.pending_irqs.lock_irqsave();
+        let active_irqs = self.active_irqs.lock_irqsave();
         let mut candidates = *pending_irqs & !*active_irqs;
         // IRQ 0 is reserved by the PLIC specification and must never be claimed.
         candidates.set(0, false);
@@ -116,7 +110,7 @@ impl VPlicGlobal {
         &self,
         context_id: usize,
         candidate_irqs: Bitmap<{ PLIC_NUM_SOURCES }>,
-    ) -> AxResult<Option<(usize, u32)>> {
+    ) -> VplicResult<Option<(usize, u32)>> {
         let mut best_irq = None;
         let mut best_priority = 0;
         let mut cached_enable_reg_index = usize::MAX;
@@ -148,8 +142,7 @@ impl VPlicGlobal {
     }
 
     /// Returns the next IRQ that should assert VSEIP for this context.
-    #[cfg(target_arch = "riscv64")]
-    fn next_deliverable_irq(&self, context_id: usize) -> AxResult<Option<usize>> {
+    fn next_deliverable_irq(&self, context_id: usize) -> VplicResult<Option<usize>> {
         let threshold = self.context_threshold(context_id)?;
         let candidate_irqs = self.pending_inactive_irqs();
         if let Some((irq_id, priority)) =
@@ -161,8 +154,24 @@ impl VPlicGlobal {
         Ok(None)
     }
 
+    /// Returns whether one guest context currently has a deliverable source.
+    ///
+    /// The vPLIC owns pending, active, enable, priority, threshold, and level
+    /// state. Architecture glue consumes this derived value when binding a
+    /// vCPU and programs VSEIP there; the controller never writes a physical
+    /// CPU's CSR on behalf of a different guest context.
+    pub fn context_has_deliverable_irq(&self, context_id: usize) -> VplicResult<bool> {
+        if context_id >= self.contexts_num {
+            return Err(VplicError::InvalidContext {
+                context: context_id,
+                contexts: self.contexts_num,
+            });
+        }
+        Ok(self.next_deliverable_irq(context_id)?.is_some())
+    }
+
     /// Claims the next enabled pending IRQ and moves it to the active set.
-    fn claim_next_irq(&self, context_id: usize) -> AxResult<Option<usize>> {
+    fn claim_next_irq(&self, context_id: usize) -> VplicResult<Option<usize>> {
         loop {
             let candidate_irqs = self.pending_inactive_irqs();
             let Some((irq_id, _priority)) =
@@ -171,8 +180,8 @@ impl VPlicGlobal {
                 return Ok(None);
             };
 
-            let mut pending_irqs = self.pending_irqs.lock();
-            let mut active_irqs = self.active_irqs.lock();
+            let mut pending_irqs = self.pending_irqs.lock_irqsave();
+            let mut active_irqs = self.active_irqs.lock_irqsave();
             if !pending_irqs.get(irq_id) || active_irqs.get(irq_id) {
                 continue;
             }
@@ -184,230 +193,304 @@ impl VPlicGlobal {
             return Ok(Some(irq_id));
         }
     }
-
-    /// Recomputes whether VSEIP should remain asserted for one context.
-    #[cfg(target_arch = "riscv64")]
-    fn sync_vseip(&self, context_id: usize) -> AxResult<()> {
-        // VSEIP should track whether this context still has a deliverable
-        // external interrupt, not merely whether some pending bit is set.
-        if self.next_deliverable_irq(context_id)?.is_some() {
-            unsafe {
-                // If the guest is already executing a VS timer interrupt handler,
-                // the corresponding tick is "in service" from the guest's point of
-                // view. Clearing VSTIP here avoids needlessly keeping a timer
-                // interrupt pending while we queue the external interrupt.
-                if riscv_h::register::vscause::read().bits() == VCAUSE_VS_TIMER {
-                    riscv_h::register::hvip::clear_vstip();
-                }
-                riscv_h::register::hvip::set_vseip();
-            }
-        } else {
-            unsafe {
-                riscv_h::register::hvip::clear_vseip();
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_arch = "riscv64"))]
-    fn sync_vseip(&self, _context_id: usize) -> AxResult<()> {
-        Ok(())
-    }
-
-    /// Recomputes VSEIP for all guest supervisor contexts.
-    fn sync_all_guest_contexts_vseip(&self) -> AxResult<()> {
-        for context_id in (1..self.contexts_num).step_by(2) {
-            self.sync_vseip(context_id)?;
-        }
-        Ok(())
-    }
 }
 
-/// Implementation of device emulation operations for virtual PLIC.
-impl BaseDeviceOps<GuestPhysAddrRange> for VPlicGlobal {
-    fn emu_type(&self) -> axdevice_base::EmuDeviceType {
-        EmuDeviceType::PPPTGlobal
+impl VPlicGlobal {
+    fn contains(&self, addr: GuestPhysAddr) -> bool {
+        let base = self.addr.as_usize();
+        let end = base.saturating_add(self.size);
+        let addr = addr.as_usize();
+        addr >= base && addr < end
     }
 
-    fn address_range(&self) -> GuestPhysAddrRange {
-        GuestPhysAddrRange::from_start_size(self.addr, self.size)
-    }
-
-    /// Handles MMIO read operations from the virtual PLIC.
+    /// Reads a virtual PLIC MMIO register.
     ///
     /// Only 32-bit (Dword) accesses are supported.
     /// Read operations are forwarded to the host PLIC for most registers,
     /// except for pending and claim/complete registers which are emulated.
-    fn handle_read(
-        &self,
-        addr: <GuestPhysAddrRange as DeviceAddrRange>::Addr,
-        width: AccessWidth,
-    ) -> ax_errno::AxResult<usize> {
-        assert_eq!(width, AccessWidth::Dword);
-        let reg = addr - self.addr;
-        let host_addr = HostPhysAddr::from_usize(reg + self.host_plic_addr.as_usize());
-        // info!("vPlicGlobal read reg {reg:#x} width {width:?}");
-        match reg {
-            // priority
-            PLIC_PRIORITY_OFFSET..PLIC_PENDING_OFFSET => perform_mmio_read(host_addr, width),
-            // pending
-            PLIC_PENDING_OFFSET..PLIC_ENABLE_OFFSET => {
-                let reg_index = (reg - PLIC_PENDING_OFFSET) / 4;
-                if reg_index >= PLIC_PENDING_WORDS {
-                    return Ok(0);
-                }
-                let bit_index_start = reg_index * 32;
-                let mut val: u32 = 0;
-                let mut bit_mask: u32 = 1;
-                let pending_irqs = self.pending_irqs.lock();
-                for i in 0..32 {
-                    let irq_id = bit_index_start + i as usize;
-                    if irq_id != 0 && pending_irqs.get(irq_id) {
-                        val |= bit_mask;
-                    }
-                    bit_mask <<= 1;
-                }
-                Ok(val as usize)
-            }
-            // enable
-            PLIC_ENABLE_OFFSET..PLIC_CONTEXT_CTRL_OFFSET => perform_mmio_read(host_addr, width),
-            // threshold
-            offset
-                if offset >= PLIC_CONTEXT_CTRL_OFFSET
-                    && (offset - PLIC_CONTEXT_CTRL_OFFSET).is_multiple_of(PLIC_CONTEXT_STRIDE) =>
-            {
-                perform_mmio_read(host_addr, width)
-            }
-            // claim/complete
-            offset
-                if offset >= PLIC_CONTEXT_CTRL_OFFSET
-                    && (offset - PLIC_CONTEXT_CTRL_OFFSET - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
-                        .is_multiple_of(PLIC_CONTEXT_STRIDE) =>
-            {
-                let context_id =
-                    (offset - PLIC_CONTEXT_CTRL_OFFSET - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
-                        / PLIC_CONTEXT_STRIDE;
-                assert!(
-                    context_id < self.contexts_num,
-                    "Invalid context id {context_id}"
-                );
-                let Some(irq_id) = self.claim_next_irq(context_id)? else {
-                    self.sync_vseip(context_id)?;
-                    return Ok(0);
-                };
-                self.sync_vseip(context_id)?;
-                Ok(irq_id)
-            }
-            _ => {
-                unimplemented!("Unsupported vPlicGlobal read for reg {reg:#x}")
-            }
+    pub fn read_register(&self, addr: GuestPhysAddr, width: AccessWidth) -> DeviceResult<usize> {
+        if !self.contains(addr) {
+            return Err(DeviceError::OutOfRange {
+                addr: addr.as_usize() as u64,
+            });
         }
+        let result = (|| -> VplicResult<usize> {
+            if width != AccessWidth::Dword {
+                return Err(VplicError::InvalidAccessWidth {
+                    expected: AccessWidth::Dword,
+                    actual: width,
+                });
+            }
+            let reg = addr - self.addr;
+            // info!("vPlicGlobal read reg {reg:#x} width {width:?}");
+            match reg {
+                // priority
+                PLIC_PRIORITY_OFFSET..PLIC_PENDING_OFFSET => {
+                    Ok(self.registers.lock_irqsave().priorities[reg / 4] as usize)
+                }
+                // pending
+                PLIC_PENDING_OFFSET..PLIC_ENABLE_OFFSET => {
+                    let reg_index = (reg - PLIC_PENDING_OFFSET) / 4;
+                    if reg_index >= PLIC_PENDING_WORDS {
+                        return Ok(0);
+                    }
+                    let bit_index_start = reg_index * 32;
+                    let mut val: u32 = 0;
+                    let mut bit_mask: u32 = 1;
+                    let pending_irqs = self.pending_irqs.lock_irqsave();
+                    for i in 0..32 {
+                        let irq_id = bit_index_start + i as usize;
+                        if irq_id != 0 && pending_irqs.get(irq_id) {
+                            val |= bit_mask;
+                        }
+                        bit_mask <<= 1;
+                    }
+                    Ok(val as usize)
+                }
+                // enable
+                PLIC_ENABLE_OFFSET..PLIC_CONTEXT_CTRL_OFFSET => {
+                    let context_id = (reg - PLIC_ENABLE_OFFSET) / PLIC_ENABLE_STRIDE;
+                    let reg_index = ((reg - PLIC_ENABLE_OFFSET) % PLIC_ENABLE_STRIDE) / 4;
+                    if context_id >= self.contexts_num || reg_index >= PLIC_PENDING_WORDS {
+                        return Err(VplicError::InvalidContext {
+                            context: context_id,
+                            contexts: self.contexts_num,
+                        });
+                    }
+                    Ok(self.registers.lock_irqsave().enable_masks[context_id][reg_index] as usize)
+                }
+                // threshold
+                offset
+                    if offset >= PLIC_CONTEXT_CTRL_OFFSET
+                        && (offset - PLIC_CONTEXT_CTRL_OFFSET)
+                            .is_multiple_of(PLIC_CONTEXT_STRIDE) =>
+                {
+                    let context_id = (offset - PLIC_CONTEXT_CTRL_OFFSET) / PLIC_CONTEXT_STRIDE;
+                    if context_id >= self.contexts_num {
+                        return Err(VplicError::InvalidContext {
+                            context: context_id,
+                            contexts: self.contexts_num,
+                        });
+                    }
+                    Ok(self.registers.lock_irqsave().thresholds[context_id] as usize)
+                }
+                // claim/complete
+                offset
+                    if offset >= PLIC_CONTEXT_CTRL_OFFSET
+                        && (offset
+                            - PLIC_CONTEXT_CTRL_OFFSET
+                            - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
+                            .is_multiple_of(PLIC_CONTEXT_STRIDE) =>
+                {
+                    let context_id =
+                        (offset - PLIC_CONTEXT_CTRL_OFFSET - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
+                            / PLIC_CONTEXT_STRIDE;
+                    if context_id >= self.contexts_num {
+                        return Err(VplicError::InvalidContext {
+                            context: context_id,
+                            contexts: self.contexts_num,
+                        });
+                    }
+                    let Some(irq_id) = self.claim_next_irq(context_id)? else {
+                        return Ok(0);
+                    };
+                    Ok(irq_id)
+                }
+                _ => Err(VplicError::UnsupportedRegister {
+                    operation: "read",
+                    offset: reg,
+                }),
+            }
+        })();
+        Ok(result?)
     }
 
-    /// Handles MMIO write operations to the virtual PLIC.
+    /// Writes a virtual PLIC MMIO register.
     ///
     /// Only 32-bit (Dword) accesses are supported.
     /// Write operations are forwarded to the host PLIC for most registers.
     /// Writes to the pending register are used for interrupt injection by the hypervisor.
     /// Writes to the claim/complete register complete interrupt handling.
-    fn handle_write(
+    pub fn write_register(
         &self,
-        addr: <GuestPhysAddrRange as DeviceAddrRange>::Addr,
+        addr: GuestPhysAddr,
         width: AccessWidth,
         val: usize,
-    ) -> ax_errno::AxResult {
-        assert_eq!(width, AccessWidth::Dword);
-        let reg = addr - self.addr;
-        let host_addr = HostPhysAddr::from_usize(reg + self.host_plic_addr.as_usize());
-        // info!("vPlicGlobal write reg {reg:#x} width {width:?} val {val:#x}");
-        match reg {
-            // priority
-            PLIC_PRIORITY_OFFSET..PLIC_PENDING_OFFSET => {
-                perform_mmio_write(host_addr, width, val)?;
-                self.sync_all_guest_contexts_vseip()
-            }
-            // pending (Here is uesd for hyperivosr to inject pending IRQs, later should move it to a separate interface)
-            PLIC_PENDING_OFFSET..PLIC_ENABLE_OFFSET => {
-                // Note: here append, not overwrite.
-                let reg_index = (reg - PLIC_PENDING_OFFSET) / 4;
-                if reg_index >= PLIC_PENDING_WORDS {
-                    return Ok(());
-                }
-                let val = val as u32;
-                let mut bit_mask: u32 = 1;
-                for i in 0..32 {
-                    if (val & bit_mask) != 0 {
-                        let irq_id = reg_index * 32 + i;
-                        if irq_id != 0 {
-                            self.update_pending_irq(irq_id, true)?;
-                        }
-                    }
-                    bit_mask <<= 1;
-                }
+    ) -> DeviceResult {
+        self.write_register_with_completion(addr, width, val)
+            .map(|_| ())
+    }
 
-                self.sync_all_guest_contexts_vseip()
-            }
-            // enable
-            PLIC_ENABLE_OFFSET..PLIC_CONTEXT_CTRL_OFFSET => {
-                perform_mmio_write(host_addr, width, val)?;
-                let context_id = (reg - PLIC_ENABLE_OFFSET) / PLIC_ENABLE_STRIDE;
-                assert!(
-                    context_id < self.contexts_num,
-                    "Invalid context id {context_id}"
-                );
-                // A mask update can instantly expose or hide already-pending IRQs.
-                self.sync_vseip(context_id)
-            }
-            // threshold
-            offset
-                if offset >= PLIC_CONTEXT_CTRL_OFFSET
-                    && (offset - PLIC_CONTEXT_CTRL_OFFSET).is_multiple_of(PLIC_CONTEXT_STRIDE) =>
-            {
-                let context_id = (offset - PLIC_CONTEXT_CTRL_OFFSET) / PLIC_CONTEXT_STRIDE;
-                assert!(
-                    context_id < self.contexts_num,
-                    "Invalid context id {context_id}"
-                );
-                perform_mmio_write(host_addr, width, val)?;
-                // Threshold changes must be reflected on the hart line immediately.
-                self.sync_vseip(context_id)
-            }
-            // claim/complete
-            offset
-                if offset >= PLIC_CONTEXT_CTRL_OFFSET
-                    && (offset - PLIC_CONTEXT_CTRL_OFFSET - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
-                        .is_multiple_of(PLIC_CONTEXT_STRIDE) =>
-            {
-                // info!("vPlicGlobal: Writing to CLAIM/COMPLETE reg {reg:#x} val {val:#x}");
-                let context_id =
-                    (offset - PLIC_CONTEXT_CTRL_OFFSET - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
-                        / PLIC_CONTEXT_STRIDE;
-                assert!(
-                    context_id < self.contexts_num,
-                    "Invalid context id {context_id}"
-                );
-                let irq_id = val;
-
-                if irq_id == 0 || irq_id >= PLIC_NUM_SOURCES {
-                    return self.sync_vseip(context_id);
-                }
-                let mut active_irqs = self.active_irqs.lock();
-                if !active_irqs.get(irq_id) {
-                    drop(active_irqs);
-                    return self.sync_vseip(context_id);
-                }
-
-                // Write host PLIC.
-                perform_mmio_write(host_addr, width, irq_id)?;
-                // Clear the active bit only after the completion is accepted.
-                active_irqs.set(irq_id, false);
-                drop(active_irqs);
-                self.sync_vseip(context_id)
-            }
-            _ => {
-                unimplemented!("Unsupported vPlicGlobal read for reg {reg:#x}")
-            }
+    /// Writes a virtual PLIC register and reports a completed active source.
+    ///
+    /// The controller performs the complete and level re-pend transition
+    /// before returning. Any physical-backing action therefore runs after all
+    /// vPLIC locks are released.
+    pub fn write_register_with_completion(
+        &self,
+        addr: GuestPhysAddr,
+        width: AccessWidth,
+        val: usize,
+    ) -> DeviceResult<Option<VplicCompletion>> {
+        if !self.contains(addr) {
+            return Err(DeviceError::OutOfRange {
+                addr: addr.as_usize() as u64,
+            });
         }
+        let result = (|| -> VplicResult<Option<VplicCompletion>> {
+            if width != AccessWidth::Dword {
+                return Err(VplicError::InvalidAccessWidth {
+                    expected: AccessWidth::Dword,
+                    actual: width,
+                });
+            }
+            let reg = addr - self.addr;
+            // info!("vPlicGlobal write reg {reg:#x} width {width:?} val {val:#x}");
+            match reg {
+                // priority
+                PLIC_PRIORITY_OFFSET..PLIC_PENDING_OFFSET => {
+                    self.registers.lock_irqsave().priorities[reg / 4] = val as u32;
+                    Ok(None)
+                }
+                // pending (Here is uesd for hyperivosr to inject pending IRQs, later should move it to a separate interface)
+                PLIC_PENDING_OFFSET..PLIC_ENABLE_OFFSET => {
+                    // Note: here append, not overwrite.
+                    let reg_index = (reg - PLIC_PENDING_OFFSET) / 4;
+                    if reg_index >= PLIC_PENDING_WORDS {
+                        return Ok(None);
+                    }
+                    let val = val as u32;
+                    let mut bit_mask: u32 = 1;
+                    for i in 0..32 {
+                        if (val & bit_mask) != 0 {
+                            let irq_id = reg_index * 32 + i;
+                            if irq_id != 0 {
+                                self.update_pending_irq(irq_id, true)?;
+                            }
+                        }
+                        bit_mask <<= 1;
+                    }
+                    Ok(None)
+                }
+                // enable
+                PLIC_ENABLE_OFFSET..PLIC_CONTEXT_CTRL_OFFSET => {
+                    let context_id = (reg - PLIC_ENABLE_OFFSET) / PLIC_ENABLE_STRIDE;
+                    let reg_index = ((reg - PLIC_ENABLE_OFFSET) % PLIC_ENABLE_STRIDE) / 4;
+                    if context_id >= self.contexts_num || reg_index >= PLIC_PENDING_WORDS {
+                        return Err(VplicError::InvalidContext {
+                            context: context_id,
+                            contexts: self.contexts_num,
+                        });
+                    }
+                    self.registers.lock_irqsave().enable_masks[context_id][reg_index] = val as u32;
+                    Ok(None)
+                }
+                // threshold
+                offset
+                    if offset >= PLIC_CONTEXT_CTRL_OFFSET
+                        && (offset - PLIC_CONTEXT_CTRL_OFFSET)
+                            .is_multiple_of(PLIC_CONTEXT_STRIDE) =>
+                {
+                    let context_id = (offset - PLIC_CONTEXT_CTRL_OFFSET) / PLIC_CONTEXT_STRIDE;
+                    if context_id >= self.contexts_num {
+                        return Err(VplicError::InvalidContext {
+                            context: context_id,
+                            contexts: self.contexts_num,
+                        });
+                    }
+                    self.registers.lock_irqsave().thresholds[context_id] = val as u32;
+                    Ok(None)
+                }
+                // claim/complete
+                offset
+                    if offset >= PLIC_CONTEXT_CTRL_OFFSET
+                        && (offset
+                            - PLIC_CONTEXT_CTRL_OFFSET
+                            - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
+                            .is_multiple_of(PLIC_CONTEXT_STRIDE) =>
+                {
+                    // info!("vPlicGlobal: Writing to CLAIM/COMPLETE reg {reg:#x} val {val:#x}");
+                    let context_id =
+                        (offset - PLIC_CONTEXT_CTRL_OFFSET - PLIC_CONTEXT_CLAIM_COMPLETE_OFFSET)
+                            / PLIC_CONTEXT_STRIDE;
+                    if context_id >= self.contexts_num {
+                        return Err(VplicError::InvalidContext {
+                            context: context_id,
+                            contexts: self.contexts_num,
+                        });
+                    }
+                    let irq_id = val;
+
+                    if irq_id == 0 || irq_id >= PLIC_NUM_SOURCES {
+                        return Ok(None);
+                    }
+                    let asserted_irqs = self.line_asserted_irqs.lock_irqsave();
+                    let mut active_irqs = self.active_irqs.lock_irqsave();
+                    if !active_irqs.get(irq_id) {
+                        drop(active_irqs);
+                        drop(asserted_irqs);
+                        return Ok(None);
+                    }
+
+                    // Completion belongs to the virtual controller. An
+                    // optional host transaction is reported only after this
+                    // canonical transition and every controller lock release.
+                    active_irqs.set(irq_id, false);
+                    drop(active_irqs);
+                    if asserted_irqs.get(irq_id) {
+                        self.pending_irqs.lock_irqsave().set(irq_id, true);
+                    }
+                    drop(asserted_irqs);
+                    Ok(Some(VplicCompletion::new(irq_id)))
+                }
+                _ => Err(VplicError::UnsupportedRegister {
+                    operation: "write",
+                    offset: reg,
+                }),
+            }
+        })();
+        Ok(result?)
+    }
+}
+
+impl Device for VPlicGlobal {
+    fn name(&self) -> &str {
+        "riscv-vplic"
+    }
+
+    fn resources(&self) -> &[axdevice_base::Resource] {
+        &self.resources
+    }
+
+    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        if access.bus() != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        self.read_register(
+            GuestPhysAddr::from_usize(access.address() as usize),
+            access.width(),
+        )
+        .map(|value| value as u64)
+    }
+
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        if access.bus() != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        self.write_register(
+            GuestPhysAddr::from_usize(access.address() as usize),
+            access.width(),
+            value as usize,
+        )
     }
 }
 
@@ -419,10 +502,10 @@ mod tests {
 
     #[test]
     fn pending_inactive_irqs_excludes_reserved_irq_zero() {
-        let vplic = VPlicGlobal::new(GuestPhysAddr::from(0x0c00_0000), Some(0x400000), 2);
+        let vplic = VPlicGlobal::new(GuestPhysAddr::from(0x0c00_0000), Some(0x400000), 2).unwrap();
 
         {
-            let mut pending_irqs = vplic.pending_irqs.lock();
+            let mut pending_irqs = vplic.pending_irqs.lock_irqsave();
             pending_irqs.set(0, true);
             pending_irqs.set(1, true);
         }

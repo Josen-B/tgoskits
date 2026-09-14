@@ -61,15 +61,15 @@ pub(crate) async fn download_file_verified_sha256(
     url: &str,
     path: &Path,
     expected_sha256: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DownloadOutcome> {
     let _lock = acquire_path_lock(path).await?;
     if path.exists() {
-        match verify_file_sha256(path, expected_sha256) {
-            Ok(true) => {
+        match file_sha256(path) {
+            Ok(actual_sha256) if actual_sha256 == expected_sha256 => {
                 println!("file already exists and passed checksum verification");
-                return Ok(());
+                return Ok(DownloadOutcome::Reused);
             }
-            Ok(false) => {
+            Ok(_) => {
                 println!("existing file checksum mismatch, re-downloading...");
             }
             Err(err) => {
@@ -82,17 +82,22 @@ pub(crate) async fn download_file_verified_sha256(
     }
 
     download_file_with_retries(client, url, path).await?;
-    match verify_file_sha256(path, expected_sha256) {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            let _ = tokio_fs::remove_file(path).await;
-            bail!("downloaded file checksum mismatch for {url}");
-        }
-        Err(err) => {
-            let _ = tokio_fs::remove_file(path).await;
-            Err(err)
-        }
+    let actual_sha256 = file_sha256(path)?;
+    if actual_sha256 != expected_sha256 {
+        let _ = tokio_fs::remove_file(path).await;
+        bail!(
+            "downloaded file checksum mismatch for {url}: expected {expected_sha256}, got \
+             {actual_sha256}"
+        );
     }
+
+    Ok(DownloadOutcome::Downloaded)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DownloadOutcome {
+    Reused,
+    Downloaded,
 }
 
 async fn download_file_with_retries(
@@ -136,10 +141,6 @@ pub(crate) fn file_sha256(path: &Path) -> anyhow::Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-pub(crate) fn verify_file_sha256(path: &Path, expected_sha256: &str) -> anyhow::Result<bool> {
-    Ok(file_sha256(path)? == expected_sha256)
 }
 
 async fn download_file_inner(

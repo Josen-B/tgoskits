@@ -1,6 +1,5 @@
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![feature(extern_item_impls)]
 #![deny(missing_docs)]
 #![doc = include_str!("../README.md")]
 
@@ -10,28 +9,53 @@ extern crate log;
 #[macro_use]
 extern crate ax_memory_addr;
 
+pub use ax_memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
+
 #[macro_use]
 pub mod trap;
 
-pub mod cap;
+pub(crate) use trap::TrapOrigin;
+
+#[cfg(feature = "context")]
+mod task_local;
+#[cfg(feature = "context")]
+pub(crate) use task_local::TaskLocalState;
+
+pub mod capability;
+
+pub mod paging;
 
 #[cfg(feature = "exception-table")]
 mod exception_table;
 #[cfg(feature = "uspace")]
+mod user_access;
+#[cfg(feature = "uspace")]
 mod uspace_common;
+#[cfg(feature = "uspace")]
+pub(crate) use user_access::UserAccessType;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_arch = "x86_64")] {
-        mod x86_64;
-        pub use self::x86_64::*;
-    } else if #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))] {
-        mod riscv;
-        pub use self::riscv::*;
-    } else if #[cfg(target_arch = "aarch64")]{
-        mod aarch64;
-        pub use self::aarch64::*;
-    } else if #[cfg(any(target_arch = "loongarch64"))] {
-        mod loongarch64;
-        pub use self::loongarch64::*;
-    }
-}
+mod arch;
+pub mod boot;
+pub mod cache;
+pub mod context;
+pub mod interrupt;
+pub mod mmu;
+pub mod registers;
+pub mod timer;
+
+#[cfg(all(target_arch = "aarch64", feature = "pmu"))]
+pub mod pmu;
+pub(crate) use arch::current::asm;
+#[cfg(feature = "uspace")]
+pub(crate) use arch::current::uspace;
+
+#[cfg(feature = "uspace")]
+pub mod user;
+
+pub mod barrier;
+
+#[cfg(feature = "context")]
+pub(crate) use context::KernelTlsBase;
+
+#[cfg(feature = "virtualization")]
+pub mod virtualization;

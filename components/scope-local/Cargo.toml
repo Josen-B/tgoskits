@@ -1,6 +1,6 @@
 [package]
 name = "scope-local"
-version = "0.4.2"
+version = "0.6.3"
 edition.workspace = true
 description = "Scope local storage"
 authors = ["朝倉水希 <asakuramizu111@gmail.com>"]
@@ -8,10 +8,16 @@ keywords = ["arceos"]
 repository = "https://github.com/Starry-OS/scope-local"
 license = "Apache-2.0"
 
+[features]
+host-test = ["ax-sync/host-test", "cpu-local/host-test"]
+
 [dependencies]
-ax-percpu = { workspace = true, features = ["non-zero-vma"] }
-spin = { workspace = true }
+ax-lazyinit.workspace = true
+ax-percpu.workspace = true
+ax-sync.workspace = true
+cpu-local.workspace = true
 
 [dev-dependencies]
+ax-sync = { path = "../../os/arceos/modules/axsync" }
 ctor = "0.6"
-ax-percpu = { workspace = true, features = ["host-test", "non-zero-vma"] }
+ax-percpu = { path = "../percpu/percpu", features = ["host-test"] }

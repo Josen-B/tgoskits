@@ -78,6 +78,7 @@ pub trait PinCtrlOp {
 
 #[enum_dispatch::enum_dispatch(PinCtrlOp)]
 pub enum PinCtrl {
+    Rk3576(crate::variants::rk3576::PinCtrl),
     Rk3588(crate::variants::rk3588::PinCtrl),
 }
 
@@ -85,7 +86,14 @@ impl PinCtrl {
     pub fn new(ty: SocType, ioc: Mmio, gpio: &[Mmio]) -> Self {
         match ty {
             SocType::Rk3588 => PinCtrl::Rk3588(crate::variants::rk3588::PinCtrl::new(ioc, gpio)),
+            SocType::Rk3576 => {
+                PinCtrl::Rk3576(crate::variants::rk3576::PinCtrl::new(ioc, None, gpio))
+            }
             SocType::Rk3568 => panic!("RK3568 pinctrl is not implemented"),
         }
+    }
+
+    pub fn new_rk3576(ioc: Mmio, sys_grf: Option<Mmio>, gpio: &[Mmio]) -> Self {
+        Self::Rk3576(crate::variants::rk3576::PinCtrl::new(ioc, sys_grf, gpio))
     }
 }

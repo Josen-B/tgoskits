@@ -3,7 +3,7 @@ args = [
     "-m",
     "1G",
     "-device",
-    "virtio-blk-pci,drive=disk0",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
     "-drive",
     "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
     "-device",
@@ -11,10 +11,12 @@ args = [
     "-netdev",
     "user,id=net0",
 ]
-uefi = false
-to_bin = false
-shell_prefix = "root@starry:"
-shell_init_cmd = "NGINX_RUNNER_PHASE_TIMEOUT=1800 NGINX_SHORT_CONN_DEBUG_USE_TIMEOUT=0 /usr/bin/nginx-runner.sh debug short-connection-debug"
-success_regex = ["(?m)^NGINX_RUNNER_PASSED\\b"]
+uefi = true
+to_bin = true
 fail_regex = ["(?i)\\bpanic(?:ked)?\\b", "(?m)^NGINX_RUNNER_FAILED\\b"]
 timeout = 3600
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "NGINX_RUNNER_PHASE_TIMEOUT=1800 NGINX_SHORT_CONN_DEBUG_USE_TIMEOUT=0 /usr/bin/nginx-runner.sh debug short-connection-debug"
+success_regex = ["(?m)^NGINX_RUNNER_PASSED(?-u:\\b)"]

@@ -1,9 +1,8 @@
 use core::hint::spin_loop;
 
-use aarch64_cpu::asm::barrier;
 use tock_registers::{interfaces::*, register_bitfields, register_structs, registers::*};
 
-use crate::VirtAddr;
+use crate::{VirtAddr, arch};
 
 pub const GITS_TRANSLATER_OFFSET: u64 = 0x10040;
 pub const ITS_COMMAND_SIZE: usize = core::mem::size_of::<ItsCommand>();
@@ -160,6 +159,14 @@ impl ItsCommand {
         cmd.le()
     }
 
+    pub fn movi(device_id: u32, event_id: u32, collection: u16) -> Self {
+        let mut cmd = Self::opcode(0x01);
+        cmd.encode_device(device_id);
+        cmd.encode_event(event_id);
+        cmd.encode_collection(collection);
+        cmd.le()
+    }
+
     pub fn inv(device_id: u32, event_id: u32) -> Self {
         let mut cmd = Self::opcode(0x0c);
         cmd.encode_device(device_id);
@@ -296,12 +303,12 @@ impl Its {
                 + CBASER::InnerCache::RaWaWb
                 + CBASER::OuterCache::RaWaWb,
         );
-        barrier::dsb(barrier::SY);
+        arch::dsb();
     }
 
     pub fn program_baser(&self, index: usize, value: u64) {
         self.regs().BASER[index].set(value);
-        barrier::dsb(barrier::SY);
+        arch::dsb();
     }
 
     pub fn baser_value(
@@ -325,12 +332,12 @@ impl Its {
 
     pub fn enable(&self) {
         self.regs().CTLR.modify(CTLR::Enabled::SET);
-        barrier::isb(barrier::SY);
+        arch::isb();
     }
 
     pub fn disable(&self) {
         self.regs().CTLR.modify(CTLR::Enabled::CLEAR);
-        barrier::isb(barrier::SY);
+        arch::isb();
         while !self.regs().CTLR.is_set(CTLR::Quiescent) {
             spin_loop();
         }
@@ -340,7 +347,7 @@ impl Its {
         self.regs()
             .CWRITER
             .write(CWRITER::Offset.val((byte_offset >> 5) as u64));
-        barrier::dsb(barrier::SY);
+        arch::dsb();
     }
 
     pub fn creadr_offset(&self) -> usize {
@@ -349,5 +356,23 @@ impl Its {
 
     fn regs(&self) -> &ItsRegs {
         unsafe { &*self.base.as_ptr() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ItsCommand;
+
+    #[test]
+    fn movi_encodes_device_event_and_collection() {
+        assert_eq!(
+            ItsCommand::movi(0x1234, 0x5678, 0x9abc).raw(),
+            [
+                (0x01 | (0x1234_u64 << 32)).to_le(),
+                0x5678_u64.to_le(),
+                0x9abc_u64.to_le(),
+                0,
+            ]
+        );
     }
 }

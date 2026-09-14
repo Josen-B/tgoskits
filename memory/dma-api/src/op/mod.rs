@@ -2,7 +2,7 @@ use core::{num::NonZeroUsize, ptr::NonNull};
 
 use mbarrier::mb;
 
-use crate::{DmaAllocHandle, DmaConstraints, DmaDirection, DmaError, DmaMapHandle};
+use crate::{DmaAllocHandle, DmaCoherency, DmaConstraints, DmaDirection, DmaError, DmaMapHandle};
 
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "aarch64")] {
@@ -39,16 +39,19 @@ pub trait DmaOp: Sync + Send + 'static {
     /// Must be paired with `alloc_contiguous`.
     unsafe fn dealloc_contiguous(&self, handle: DmaAllocHandle);
 
-    /// Allocates coherent DMA memory.
+    /// Creates a coherent CPU mapping for a non-coherent DMA device.
     ///
-    /// Coherent memory is CPU/device visible without explicit cache
-    /// maintenance. Ordering barriers are still the driver's responsibility.
+    /// `DeviceDma` calls this branch only when the device is non-coherent.
+    /// Coherent devices retain the normal mapping returned by
+    /// `alloc_contiguous`. Ordering barriers remain the driver's responsibility.
     ///
     /// # Safety
     ///
     /// Implementations must return a live allocation described by `layout`,
     /// with a DMA address range satisfying `constraints`, and with the backend's
-    /// coherent mapping policy applied until `dealloc_coherent`.
+    /// coherent mapping policy applied until `dealloc_coherent`. When the CPU
+    /// mapping is an alias, the handle must retain the original allocation
+    /// address privately for release.
     unsafe fn alloc_coherent(
         &self,
         constraints: DmaConstraints,
@@ -57,8 +60,10 @@ pub trait DmaOp: Sync + Send + 'static {
 
     /// # Safety
     ///
-    /// Must be paired with `alloc_coherent`.
-    unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle);
+    /// Must be paired with `alloc_coherent`. The handle is consumed even when
+    /// this operation fails. On failure the implementation must quarantine the
+    /// allocation instead of returning its storage to the allocator.
+    unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError>;
 
     /// Maps an existing caller-owned buffer for streaming DMA.
     ///
@@ -133,6 +138,7 @@ pub trait DmaOp: Sync + Send + 'static {
         offset: usize,
         size: usize,
         direction: DmaDirection,
+        coherency: DmaCoherency,
     ) {
         let source = unsafe { handle.as_ptr().add(offset) };
         if let Some(map_virt) = handle.bounce_ptr()
@@ -148,10 +154,18 @@ pub trait DmaOp: Sync + Send + 'static {
                         .as_ptr()
                         .copy_from_nonoverlapping(source.as_ptr(), size);
                 }
-                self.flush(target, size);
-            } else if matches!(direction, DmaDirection::FromDevice) {
+                if coherency == DmaCoherency::NonCoherent {
+                    self.flush(target, size);
+                }
+            } else if matches!(direction, DmaDirection::FromDevice)
+                && coherency == DmaCoherency::NonCoherent
+            {
                 self.invalidate(target, size);
             }
+            return;
+        }
+
+        if coherency == DmaCoherency::Coherent {
             return;
         }
 
@@ -168,6 +182,7 @@ pub trait DmaOp: Sync + Send + 'static {
         offset: usize,
         size: usize,
         direction: DmaDirection,
+        coherency: DmaCoherency,
     ) {
         if !matches!(
             direction,
@@ -181,7 +196,9 @@ pub trait DmaOp: Sync + Send + 'static {
             && map_virt != handle.as_ptr()
         {
             let source = unsafe { map_virt.add(offset) };
-            self.invalidate(source, size);
+            if coherency == DmaCoherency::NonCoherent {
+                self.invalidate(source, size);
+            }
             unsafe {
                 target
                     .as_ptr()
@@ -190,6 +207,8 @@ pub trait DmaOp: Sync + Send + 'static {
             return;
         }
 
-        self.invalidate(target, size);
+        if coherency == DmaCoherency::NonCoherent {
+            self.invalidate(target, size);
+        }
     }
 }

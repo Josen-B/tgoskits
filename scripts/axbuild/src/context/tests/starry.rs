@@ -1,13 +1,6 @@
 use super::{common::*, *};
 
 #[test]
-fn starry_snapshot_load_returns_default_when_missing() {
-    let root = tempdir().unwrap();
-    let snapshot = StarryCommandSnapshot::load(root.path()).unwrap();
-    assert_eq!(snapshot, StarryCommandSnapshot::default());
-}
-
-#[test]
 fn starry_snapshot_store_round_trips() {
     let root = tempdir().unwrap();
     let snapshot = StarryCommandSnapshot {
@@ -331,6 +324,7 @@ fn prepare_starry_request_cli_arch_drops_stale_snapshot_runtime_paths() {
         r#"
 arch = "aarch64"
 target = "aarch64-unknown-none-softfloat"
+smp = 1
 
 [qemu]
 qemu_config = "os/StarryOS/starryos/.qemu-aarch64.toml"
@@ -359,8 +353,10 @@ uboot_config = "configs/uboot-aarch64.toml"
 
     assert_eq!(request.arch, "riscv64");
     assert_eq!(request.target, "riscv64gc-unknown-none-elf");
+    assert_eq!(request.smp, None);
     assert_eq!(request.qemu_config, None);
     assert_eq!(request.uboot_config, None);
+    assert_eq!(snapshot.smp, None);
     assert_eq!(snapshot.qemu.qemu_config, None);
     assert_eq!(snapshot.uboot.uboot_config, None);
 }

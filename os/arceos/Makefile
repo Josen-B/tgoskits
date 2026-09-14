@@ -14,7 +14,7 @@
 #     - `FEATURES`: Features os ArceOS modules to be enabled.
 #     - `APP_FEATURES`: Features of (rust) apps to be enabled.
 # * QEMU options:
-#     - `BLK`: Enable storage devices (virtio-blk)
+#     - `BLK`: Enable the IRQ-driven NVMe storage path
 #     - `NET`: Enable network devices (virtio-net)
 #     - `GRAPHIC`: Enable display devices and graphic output (virtio-gpu)
 #     - `BUS`: Device bus type: mmio, pci
@@ -131,8 +131,8 @@ GDB ?= gdb
 
 # Paths
 OUT_DIR ?= $(APP)
-LD_SCRIPT ?= $(shell find "$(TARGET_DIR)/$(TARGET)/$(MODE)/build" -path '*/ax-runtime-*/out/linker.x' -printf '%T@ %p\n' 2>/dev/null | sort -rn | sed -n '1s/^[^ ]* //p')
-AXPLAT_SCRIPT ?= $(shell find "$(TARGET_DIR)/$(TARGET)/$(MODE)/build" -path '*/axplat-dyn-*/out/axplat.x' -printf '%T@ %p\n' 2>/dev/null | sort -rn | sed -n '1s/^[^ ]* //p')
+LD_SCRIPT ?= $(shell find "$(TARGET_DIR)/$(TARGET)/$(MODE)/build" \( -path '*/ax-runtime-*/out/linker.x' -o -path '*/ax-runtime/*/out/linker.x' \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | sed -n '1s/^[^ ]* //p')
+AXPLAT_SCRIPT ?= $(shell find "$(TARGET_DIR)/$(TARGET)/$(MODE)/build" \( -path '*/axplat-dyn-*/out/axplat.x' -o -path '*/axplat-dyn/*/out/axplat.x' \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | sed -n '1s/^[^ ]* //p')
 LINKER_SCRIPT_DIRS ?= $(sort $(dir $(LD_SCRIPT) $(AXPLAT_SCRIPT)))
 
 APP_NAME := $(shell basename $(APP))

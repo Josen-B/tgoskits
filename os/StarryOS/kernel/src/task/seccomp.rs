@@ -7,11 +7,13 @@
 //! compact classic-BPF interpreter for `struct seccomp_data`; unsupported or
 //! malformed programs fail closed by returning a kill decision.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-use ax_errno::{AxError, AxResult};
-use ax_runtime::hal::cpu::uspace::UserContext;
+use ax_runtime::hal::cpu::user::UserContext;
 use syscalls::Sysno;
+
+use crate::{StarryError, StarryResult, sync::Mutex};
 
 const BPF_MAXINSNS: usize = 4096;
 const BPF_MEMWORDS: usize = 16;
@@ -118,6 +120,89 @@ pub struct SeccompState {
     filters: Vec<SeccompFilter>,
 }
 
+/// Append-only publication store for immutable per-thread seccomp snapshots.
+///
+/// Linux evaluates seccomp from an immutable filter chain without taking an
+/// rtmutex on every syscall. StarryOS follows the same lifetime model: writers
+/// serialize rare policy updates, publish the fully built snapshot with
+/// release ordering, and retain every published allocation until the owning
+/// thread is destroyed. Readers can therefore borrow the acquire-loaded
+/// snapshot without locking or reference-count traffic.
+pub(crate) struct SeccompStateStore {
+    current: AtomicPtr<SeccompState>,
+    snapshots: Mutex<Vec<Arc<SeccompState>>>,
+}
+
+impl SeccompStateStore {
+    pub(crate) fn new() -> crate::StarryResult<Self> {
+        let initial = super::allocation::try_arc(SeccompState::default())?;
+        let mut snapshots = super::allocation::try_vec(1)?;
+        let current = Arc::as_ptr(&initial).cast_mut();
+        snapshots.push(initial);
+        Ok(Self {
+            current: AtomicPtr::new(current),
+            snapshots: Mutex::new(snapshots),
+        })
+    }
+
+    fn current(&self) -> &SeccompState {
+        let current = self.current.load(Ordering::Acquire);
+        // SAFETY: `current` is initialized from the first element in
+        // `snapshots`. Writers append before publishing and never remove a
+        // snapshot, so every published allocation remains alive for `self`.
+        unsafe { &*current }
+    }
+
+    pub(crate) fn evaluate(&self, uctx: &UserContext) -> SeccompDecision {
+        self.current().evaluate(uctx)
+    }
+
+    pub(crate) fn snapshot(&self) -> Arc<SeccompState> {
+        let current = self.current.load(Ordering::Acquire);
+        // SAFETY: the append-only owner list keeps `current` alive while
+        // `self` is borrowed. Incrementing before constructing the Arc gives
+        // the caller an independent strong reference.
+        unsafe {
+            Arc::increment_strong_count(current);
+            Arc::from_raw(current)
+        }
+    }
+
+    /// Reserves the child's inherited snapshot before publishing its identity.
+    pub(crate) fn inherit(&self, state: Arc<SeccompState>) -> StarryResult<()> {
+        let mut snapshots = self.snapshots.lock();
+        super::allocation::point()?;
+        snapshots
+            .try_reserve(1)
+            .map_err(|_| StarryError::NoMemory)?;
+        let current = Arc::as_ptr(&state).cast_mut();
+        snapshots.push(state);
+        self.current.store(current, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn replace(&self, state: Arc<SeccompState>) {
+        let mut snapshots = self.snapshots.lock();
+        let current = Arc::as_ptr(&state).cast_mut();
+        snapshots.push(state);
+        self.current.store(current, Ordering::Release);
+    }
+
+    pub(crate) fn update(
+        &self,
+        operation: impl FnOnce(&mut SeccompState) -> crate::StarryResult<()>,
+    ) -> crate::StarryResult<()> {
+        let mut snapshots = self.snapshots.lock();
+        let mut next = self.current().clone();
+        operation(&mut next)?;
+        let next = Arc::new(next);
+        let current = Arc::as_ptr(&next).cast_mut();
+        snapshots.push(next);
+        self.current.store(current, Ordering::Release);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 /// Active seccomp operating mode for a thread.
 enum SeccompMode {
@@ -158,13 +243,17 @@ struct SeccompData {
 }
 
 impl SeccompState {
+    pub(crate) fn is_active(&self) -> bool {
+        self.mode != SeccompMode::Disabled
+    }
+
     /// Enable Linux strict seccomp mode for this thread.
     ///
     /// Strict mode can only be installed from the disabled state.  Once a
     /// seccomp mode is active, Linux does not allow returning to disabled mode.
-    pub fn install_strict(&mut self) -> AxResult<()> {
+    pub fn install_strict(&mut self) -> StarryResult<()> {
         if self.mode != SeccompMode::Disabled {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         self.mode = SeccompMode::Strict;
         Ok(())
@@ -174,7 +263,7 @@ impl SeccompState {
     ///
     /// Multiple filters are all evaluated, and their raw return actions are
     /// merged using Linux seccomp action precedence.
-    pub fn append_filter(&mut self, insns: Vec<SockFilter>) -> AxResult<()> {
+    pub fn append_filter(&mut self, insns: Vec<SockFilter>) -> StarryResult<()> {
         let filter = SeccompFilter::new(insns)?;
         self.mode = SeccompMode::Filter;
         self.filters.push(filter);
@@ -221,9 +310,9 @@ impl SeccompState {
 
 impl SeccompFilter {
     /// Validate and construct a seccomp filter from userspace BPF instructions.
-    pub fn new(insns: Vec<SockFilter>) -> AxResult<Self> {
+    pub fn new(insns: Vec<SockFilter>) -> StarryResult<Self> {
         if insns.is_empty() || insns.len() > BPF_MAXINSNS {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         Ok(Self { insns })
     }
@@ -439,5 +528,296 @@ pub fn seccomp_errno(errno: u16) -> usize {
         0
     } else {
         -(errno as i32) as usize
+    }
+}
+
+#[cfg(all(test, not(axtest)))]
+fn seccomp_filter_rules_hold_for_test() -> bool {
+    let allow = SockFilter {
+        code: BPF_RET,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    };
+    let errno = SockFilter {
+        code: BPF_RET,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ERRNO | 13,
+    };
+    let data = SeccompData {
+        nr: Sysno::read as i32,
+        arch: AUDIT_ARCH,
+        instruction_pointer: 0x1234_5678_9abc_def0,
+        args: [0x1122_3344_5566_7788, 1, 2, 3, 4, 5],
+    };
+    let syscall_errno_filter = SeccompFilter::new(alloc::vec![
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ,
+            jt: 0,
+            jf: 1,
+            k: Sysno::read as u32,
+        },
+        errno,
+        allow,
+    ]);
+    let alu_filter = SeccompFilter::new(alloc::vec![
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_IMM,
+            jt: 0,
+            jf: 0,
+            k: 7,
+        },
+        SockFilter {
+            code: BPF_ST,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: BPF_LDX | BPF_W | BPF_MEM,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: BPF_ALU | BPF_ADD | BPF_X,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: BPF_ALU | BPF_MOD,
+            jt: 0,
+            jf: 0,
+            k: 5,
+        },
+        SockFilter {
+            code: BPF_MISC | BPF_TAX,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_X,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ]);
+    let invalid_div_filter = SeccompFilter::new(alloc::vec![
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_IMM,
+            jt: 0,
+            jf: 0,
+            k: 1,
+        },
+        SockFilter {
+            code: BPF_ALU | BPF_DIV,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ]);
+
+    SeccompFilter::new(alloc::vec![]).is_err()
+        && strict_decision(Sysno::read as usize) == SeccompDecision::Allow
+        && strict_decision(Sysno::openat as usize) == SeccompDecision::KillProcess
+        // Cover every strict_decision branch (exit/exit_group/rt_sigreturn allow).
+        && strict_decision(Sysno::write as usize) == SeccompDecision::Allow
+        && strict_decision(Sysno::exit as usize) == SeccompDecision::Allow
+        && strict_decision(Sysno::exit_group as usize) == SeccompDecision::Allow
+        && strict_decision(Sysno::rt_sigreturn as usize) == SeccompDecision::Allow
+        // Cover every action_to_decision arm.
+        && action_to_decision(SECCOMP_RET_ALLOW) == SeccompDecision::Allow
+        && action_to_decision(SECCOMP_RET_LOG) == SeccompDecision::Allow
+        && action_to_decision(SECCOMP_RET_ERRNO | 9) == SeccompDecision::Errno(9)
+        && action_to_decision(SECCOMP_RET_KILL_PROCESS) == SeccompDecision::KillProcess
+        && action_to_decision(SECCOMP_RET_KILL_THREAD) == SeccompDecision::KillThread
+        && action_to_decision(SECCOMP_RET_TRAP) == SeccompDecision::UnsupportedAction
+        && action_to_decision(SECCOMP_RET_TRACE) == SeccompDecision::UnsupportedAction
+        && action_to_decision(0xffff_ffff) == SeccompDecision::KillProcess
+        && action_precedence(SECCOMP_RET_KILL_PROCESS) > action_precedence(SECCOMP_RET_ERRNO)
+        && action_precedence(SECCOMP_RET_KILL_THREAD) > action_precedence(SECCOMP_RET_TRAP)
+        && action_precedence(SECCOMP_RET_TRAP) > action_precedence(SECCOMP_RET_ERRNO)
+        && action_precedence(SECCOMP_RET_ERRNO) > action_precedence(SECCOMP_RET_TRACE)
+        && action_precedence(SECCOMP_RET_TRACE) > action_precedence(SECCOMP_RET_LOG)
+        && action_precedence(SECCOMP_RET_LOG) > action_precedence(SECCOMP_RET_ALLOW)
+        // Cover jump_rhs both BPF_X (use register) and non-BPF_X (use k) arms.
+        && jump_rhs(
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_X,
+                k: 99,
+                ..allow
+            },
+            7,
+        ) == 7
+        && jump_rhs(
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ,
+                k: 99,
+                ..allow
+            },
+            7,
+        ) == 99
+        && jump_target(
+            3,
+            SockFilter {
+                jt: 2,
+                jf: 4,
+                ..allow
+            },
+            true,
+        ) == Some(5)
+        && jump_target(
+            3,
+            SockFilter {
+                jt: 2,
+                jf: 4,
+                ..allow
+            },
+            false,
+        ) == Some(7)
+        && load_seccomp_data(&data, 0, BPF_W) == Some(Sysno::read as u32)
+        && load_seccomp_data(&data, 4, BPF_W) == Some(AUDIT_ARCH)
+        && load_seccomp_data(&data, 8, BPF_W) == Some(0x9abc_def0)
+        && load_seccomp_data(&data, 12, BPF_W) == Some(0x1234_5678)
+        && load_seccomp_data(&data, 16, BPF_W) == Some(0x5566_7788)
+        && load_seccomp_data(&data, 20, BPF_W) == Some(0x1122_3344)
+        && load_seccomp_data(&data, 24, BPF_W) == Some(1)
+        && load_seccomp_data(&data, 48, BPF_W) == Some(4)
+        && load_seccomp_data(&data, 52, BPF_W) == Some(0)
+        && load_seccomp_data(&data, 16, BPF_H) == Some(0x7788)
+        && load_seccomp_data(&data, 16, BPF_B) == Some(0x88)
+        // Unknown size code (none of BPF_W=0, BPF_H=0x08, BPF_B=0x10) returns None.
+        && load_seccomp_data(&data, 0, 0x20).is_none()
+        // Unknown offset returns None.
+        && load_seccomp_data(&data, 64, BPF_W).is_none()
+        && syscall_errno_filter
+            .as_ref()
+            .is_ok_and(|filter| filter.execute(&data) == (SECCOMP_RET_ERRNO | 13))
+        && alu_filter
+            .as_ref()
+            .is_ok_and(|filter| filter.execute(&data) == 4)
+        && invalid_div_filter
+            .as_ref()
+            .is_ok_and(|filter| filter.execute(&data) == SECCOMP_RET_KILL_THREAD)
+        && seccomp_errno(0) == 0
+        && seccomp_errno(13) == (-13i32 as usize)
+}
+
+#[cfg(all(test, not(axtest)))]
+fn seccomp_filter_construction_rules_hold_for_test() -> bool {
+    use alloc::vec;
+
+    // Empty instruction list is rejected.
+    SeccompFilter::new(alloc::vec![]).is_err()
+        // A single return-instruction filter is accepted.
+        && SeccompFilter::new(alloc::vec![SockFilter {
+            code: BPF_RET,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        }])
+        .is_ok()
+        // Exactly BPF_MAXINSNS instructions is the boundary and is accepted.
+        && SeccompFilter::new(alloc::vec![
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            };
+            BPF_MAXINSNS
+        ])
+        .is_ok()
+        // One instruction above BPF_MAXINSNS is rejected.
+        && SeccompFilter::new(alloc::vec![
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            };
+            BPF_MAXINSNS + 1
+        ])
+        .is_err()
+}
+
+#[cfg(all(test, not(axtest)))]
+fn seccomp_action_and_precedence_rules_hold_for_test() -> bool {
+    // action_to_decision: converts raw seccomp return to decision.
+    assert!(matches!(
+        action_to_decision(SECCOMP_RET_ALLOW),
+        SeccompDecision::Allow
+    ));
+    assert!(matches!(
+        action_to_decision(SECCOMP_RET_LOG),
+        SeccompDecision::Allow
+    ));
+    assert!(matches!(
+        action_to_decision(SECCOMP_RET_ERRNO | 1),
+        SeccompDecision::Errno(1)
+    ));
+    assert!(matches!(
+        action_to_decision(SECCOMP_RET_KILL_PROCESS),
+        SeccompDecision::KillProcess
+    ));
+    assert!(matches!(
+        action_to_decision(SECCOMP_RET_KILL_THREAD),
+        SeccompDecision::KillThread
+    ));
+    assert!(matches!(
+        action_to_decision(SECCOMP_RET_TRAP),
+        SeccompDecision::UnsupportedAction
+    ));
+
+    // action_precedence: KILL_PROCESS has highest precedence (7).
+    assert!(action_precedence(SECCOMP_RET_KILL_PROCESS) == 7);
+    assert!(action_precedence(SECCOMP_RET_KILL_THREAD) == 6);
+    assert!(action_precedence(SECCOMP_RET_ERRNO) == 4);
+    assert!(action_precedence(SECCOMP_RET_ALLOW) == 1);
+
+    // jump_rhs: selects RHS operand based on BPF_SRC_MASK.
+    let insn_k = SockFilter {
+        code: BPF_JEQ, // immediate mode
+        jt: 0,
+        jf: 0,
+        k: 42,
+    };
+    assert!(jump_rhs(insn_k, 100) == 42);
+
+    let insn_x = SockFilter {
+        code: BPF_JEQ | BPF_X, // X register mode
+        jt: 0,
+        jf: 0,
+        k: 0,
+    };
+    assert!(jump_rhs(insn_x, 100) == 100);
+
+    true
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    #[test]
+    fn seccomp_filter_rules_hold() {
+        assert!(super::seccomp_filter_rules_hold_for_test());
+    }
+
+    #[test]
+    fn seccomp_filter_construction_rules_hold() {
+        assert!(super::seccomp_filter_construction_rules_hold_for_test());
+    }
+
+    #[test]
+    fn seccomp_action_and_precedence_rules_hold() {
+        assert!(super::seccomp_action_and_precedence_rules_hold_for_test());
     }
 }

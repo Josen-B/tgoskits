@@ -5,7 +5,7 @@ args = [
     "-cpu",
     "rv64",
     "-device",
-    "virtio-blk-pci,drive=disk0",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
     "-drive",
     "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-alpine.img",
     "-device",
@@ -13,15 +13,17 @@ args = [
     "-netdev",
     "user,id=net0",
     "-append",
-    "root=/dev/sda",
+    "root=/dev/nvme0n1",
 ]
 uefi = false
 to_bin = true
-shell_prefix = "root@starry:"
-shell_init_cmd = "/usr/bin/mariadb-test.sh"
-success_regex = ["(?m)^MARIADB_TEST_PASSED\\s*$"]
 fail_regex = [
     '(?i)\bpanic(?:ked)?\b',
     "(?m)^MARIADB_TEST_FAILED(?:[: ].*)?$",
 ]
 timeout = 1800
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "/usr/bin/mariadb-test.sh"
+success_regex = ["(?m)^MARIADB_TEST_PASSED\\s*$"]

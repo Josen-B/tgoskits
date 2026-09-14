@@ -1,37 +1,36 @@
 //! Default private ArceOS host adapter for AxVM.
 
-extern crate alloc;
-
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "loongarch64"
-))]
-use alloc::boxed::Box;
-use core::{
-    sync::atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
-use ax_errno::AxResult;
 use ax_memory_addr::PAGE_SIZE_4K;
-use ax_std::{
-    os::arceos::{api, modules},
-    thread,
-};
+use ax_std::os::arceos::{api, modules, task as runtime_task};
 use axvm_types::{HostPhysAddr, HostVirtAddr};
 
+#[cfg(any(feature = "fs", feature = "host-fs"))]
+use crate::AxVmError;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use crate::host::HostHardTimerAction;
 #[cfg(target_arch = "x86_64")]
-use crate::host::HostConsole;
+use crate::host::HostTimerAction;
 use crate::{
-    arch::{ArchOps, CurrentArch},
-    host::{HostCpu, HostMemory, HostPlatform, HostTime},
+    AxVmResult,
+    arch::current::CurrentArch,
+    architecture::ArchOps,
+    host::{HostCpu, HostMemory, HostPlatform, HostTime, HostTimer},
 };
 
 /// Private default host adapter used by [`crate::AxvmRuntime`].
 pub(crate) struct ArceOsHost;
 
 const CPU_ENABLE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const AXVM_KERNEL_STACK_SIZE: usize = 0x40000;
 
 static ARCEOS_HOST: ArceOsHost = ArceOsHost;
 
@@ -88,79 +87,121 @@ impl HostMemory for ArceOsHost {
 }
 
 impl HostTime for ArceOsHost {
-    type CancelToken = usize;
-
-    #[cfg(target_arch = "x86_64")]
-    fn nanos_to_ticks(&self, nanos: u64) -> u64 {
-        modules::ax_hal::time::nanos_to_ticks(nanos)
-    }
-
     fn monotonic_time(&self) -> Duration {
         modules::ax_hal::time::monotonic_time()
     }
+}
 
-    #[cfg(not(target_arch = "loongarch64"))]
-    fn set_oneshot_timer(&self, deadline_ns: u64) {
-        modules::ax_hal::time::set_oneshot_timer(deadline_ns);
-    }
+impl HostTimer for ArceOsHost {
+    type TimerHandle = runtime_task::time::timer::KernelTimerHandle;
+    type HardTimerHandle = runtime_task::time::hard_timer::HardKernelTimerHandle;
 
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "loongarch64"
-    ))]
     fn register_timer(
         &self,
-        deadline_ns: u64,
+        deadline: Duration,
         callback: Box<dyn FnOnce(Duration) + Send + 'static>,
-    ) -> Self::CancelToken {
-        crate::timer::register_timer(deadline_ns, callback)
+    ) -> AxVmResult<Self::TimerHandle> {
+        let deadline = runtime_task::time::MonotonicDeadline::from_duration(deadline);
+        runtime_task::time::timer::register_kernel_timer(
+            deadline,
+            Box::new(move |now| callback(Duration::from_nanos(now.as_nanos()))),
+        )
+        .map_err(|error| crate::AxVmError::host("register host timer", error))
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-    fn cancel_timer(&self, token: Self::CancelToken) {
-        crate::timer::cancel_timer(token);
+    #[cfg(target_arch = "x86_64")]
+    fn register_restartable_timer(
+        &self,
+        deadline: Duration,
+        mut callback: Box<dyn FnMut(Duration) -> HostTimerAction + Send + 'static>,
+    ) -> AxVmResult<Self::TimerHandle> {
+        let deadline = runtime_task::time::MonotonicDeadline::from_duration(deadline);
+        runtime_task::time::timer::register_restartable_kernel_timer(
+            deadline,
+            Box::new(
+                move |now| match callback(Duration::from_nanos(now.as_nanos())) {
+                    HostTimerAction::Complete => {
+                        runtime_task::time::timer::KernelTimerAction::Complete
+                    }
+                    HostTimerAction::Rearm(deadline) => {
+                        runtime_task::time::timer::KernelTimerAction::Rearm(
+                            runtime_task::time::MonotonicDeadline::from_duration(deadline),
+                        )
+                    }
+                },
+            ),
+        )
+        .map_err(|error| crate::AxVmError::host("register restartable host timer", error))
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    unsafe fn register_hard_restartable_timer(
+        &self,
+        deadline: Duration,
+        mut callback: Box<dyn FnMut(Duration) -> HostHardTimerAction + Send + 'static>,
+    ) -> AxVmResult<Self::HardTimerHandle> {
+        let deadline = runtime_task::time::MonotonicDeadline::from_duration(deadline);
+        let callback = unsafe {
+            // SAFETY: the caller owns the callback's hard-IRQ proof. This
+            // adapter changes only timestamp and action representations.
+            runtime_task::time::hard_timer::HardKernelTimerCallback::new(Box::new(move |now| {
+                match callback(Duration::from_nanos(now.as_nanos())) {
+                    HostHardTimerAction::Complete => {
+                        runtime_task::time::hard_timer::HardKernelTimerAction::Complete
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    HostHardTimerAction::Disarm => {
+                        runtime_task::time::hard_timer::HardKernelTimerAction::Disarm
+                    }
+                    HostHardTimerAction::Rearm(deadline) => {
+                        runtime_task::time::hard_timer::HardKernelTimerAction::Rearm(
+                            runtime_task::time::MonotonicDeadline::from_duration(deadline),
+                        )
+                    }
+                }
+            }))
+        };
+        runtime_task::time::hard_timer::register_hard_restartable_kernel_timer(deadline, callback)
+            .map_err(|error| crate::AxVmError::host("register hard host timer", error))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn arm_hard_timer(&self, handle: Self::HardTimerHandle, deadline: Duration) -> AxVmResult {
+        let deadline = runtime_task::time::MonotonicDeadline::from_duration(deadline);
+        runtime_task::time::hard_timer::arm_hard_kernel_timer(handle, deadline)
+            .map_err(|error| crate::AxVmError::host("arm hard host timer", error))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn disarm_hard_timer(&self, handle: Self::HardTimerHandle) -> AxVmResult {
+        runtime_task::time::hard_timer::disarm_hard_kernel_timer(handle)
+            .map_err(|error| crate::AxVmError::host("disarm hard host timer", error))
+    }
+
+    fn cancel_timer(&self, handle: Self::TimerHandle) -> AxVmResult<super::HostTimerCancelOutcome> {
+        runtime_task::time::timer::cancel_kernel_timer(handle)
+            .map(|outcome| match outcome {
+                runtime_task::time::timer::KernelTimerCancelOutcome::Cancelled => {
+                    super::HostTimerCancelOutcome::Cancelled
+                }
+                runtime_task::time::timer::KernelTimerCancelOutcome::CancellationDeferred => {
+                    super::HostTimerCancelOutcome::CancellationDeferred
+                }
+                runtime_task::time::timer::KernelTimerCancelOutcome::AlreadyCompleted => {
+                    super::HostTimerCancelOutcome::AlreadyCompleted
+                }
+            })
+            .map_err(|error| crate::AxVmError::host("cancel host timer", error))
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn monotonic_time_nanos() -> u64 {
-    modules::ax_hal::time::monotonic_time_nanos()
-}
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn handle_host_irq(vector: usize) -> Option<usize> {
-    modules::ax_hal::irq::handle_irq(vector).then_some(vector)
+/// Returns the platform IRQ reserved for the physical host console.
+pub(crate) fn host_console_irq() -> Option<modules::ax_hal::irq::IrqId> {
+    modules::ax_hal::console::irq_num()
 }
 
 pub(crate) fn dispatch_host_irq(vector: usize) {
-    modules::ax_hal::irq::handle_irq(vector);
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub(crate) fn set_irq_enabled(raw_irq: usize, enabled: bool) {
-    let gsi = match u32::try_from(raw_irq) {
-        Ok(gsi) => gsi,
-        Err(_) => {
-            warn!("failed to resolve LoongArch passthrough IRQ {raw_irq}: out of GSI range");
-            return;
-        }
-    };
-    let irq = match modules::ax_hal::irq::resolve_irq_source(
-        modules::ax_hal::irq::IrqSource::AcpiGsi(gsi),
-    ) {
-        Ok(irq) => irq,
-        Err(err) => {
-            warn!("failed to resolve LoongArch passthrough IRQ {raw_irq}: {err:?}");
-            return;
-        }
-    };
-    if let Err(err) = modules::ax_hal::irq::set_enable(irq, enabled) {
-        warn!(
-            "failed to set LoongArch passthrough IRQ {raw_irq} ({irq:?}) enabled={enabled}: \
-             {err:?}"
-        );
-    }
+    modules::ax_hal::irq::handle_irq(vector, modules::ax_hal::irq::TrapOrigin::Kernel);
 }
 
 impl HostCpu for ArceOsHost {
@@ -175,25 +216,119 @@ impl HostCpu for ArceOsHost {
     }
 }
 
-pub(crate) fn cpu_mask_from_raw_bits(bits: usize) -> api::task::AxCpuMask {
-    api::task::AxCpuMask::from_raw_bits(bits)
-}
-
-pub(crate) type ArceOsCpuMask = api::task::AxCpuMask;
-pub(crate) type ArceOsAxTaskExt = modules::ax_task::AxTaskExt;
-pub(crate) type ArceOsAxTaskRef = modules::ax_task::AxTaskRef;
-pub(crate) type ArceOsCurrentTask = modules::ax_task::CurrentTask;
-pub(crate) type ArceOsTaskInner = modules::ax_task::TaskInner;
-pub(crate) type ArceOsWaitQueue = modules::ax_task::WaitQueue;
+pub(crate) type ArceOsThreadHandle = runtime_task::thread::ThreadHandle;
+pub(crate) type ArceOsThreadWakeHandle = runtime_task::thread::ThreadWakeHandle;
+#[cfg(target_arch = "x86_64")]
+pub(crate) type ArceOsWakeResult = runtime_task::thread::WakeResult;
+pub(crate) type ArceOsWaitQueue = runtime_task::sync::WaitQueue;
+#[cfg(target_arch = "aarch64")]
+pub(crate) type ArceOsIrqError = modules::ax_hal::irq::IrqError;
 pub(crate) type ArceOsWaitQueueHandle = api::task::AxWaitQueueHandle;
-pub(crate) use modules::ax_task::TaskExt as ArceOsTaskExt;
+pub(crate) use runtime_task::{
+    sched::{CpuId as ArceOsCpuId, CpuSet as ArceOsCpuSet, SchedulePolicy as ArceOsSchedulePolicy},
+    thread::{
+        SwitchReason as ArceOsSwitchReason, ThreadExtension as ArceOsThreadExtension,
+        ThreadExtensionOps as ArceOsThreadExtensionOps, ThreadId as ArceOsThreadId,
+    },
+    time::MonotonicDeadline as ArceOsMonotonicDeadline,
+};
 
-pub(crate) fn current_task() -> ArceOsCurrentTask {
-    modules::ax_task::current()
+/// Hard-IRQ-safe event consumed by one fixed ArceOS service thread.
+pub(crate) struct ArceOsIrqNotification {
+    event: runtime_task::sync::irq::IrqWaitCell,
+    waiter: OnceLock<ArceOsIrqWaiter>,
 }
 
-pub(crate) fn spawn_task(task: ArceOsTaskInner) -> ArceOsAxTaskRef {
-    modules::ax_task::spawn_task(task)
+struct ArceOsIrqWaiter {
+    owner: ArceOsThreadId,
+    registration: runtime_task::sync::irq::IrqWaitRegistration,
+    park: runtime_task::sync::WaitQueue,
+}
+
+impl ArceOsIrqNotification {
+    pub(crate) const fn new() -> Self {
+        Self {
+            event: runtime_task::sync::irq::IrqWaitCell::new(),
+            waiter: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn notify(&self) {
+        let _result = self.event.notify();
+    }
+
+    pub(crate) fn wait(&self) {
+        let _timed_out = self.wait_until(None);
+    }
+
+    /// Waits for one event or an optional absolute monotonic deadline.
+    ///
+    /// Returns `true` only when the task deadline won the wake race.
+    pub(crate) fn wait_until(&self, deadline: Option<ArceOsMonotonicDeadline>) -> bool {
+        let current = current_thread();
+        let waiter = self.waiter.get_or_init(|| ArceOsIrqWaiter {
+            owner: current.id(),
+            registration: runtime_task::sync::irq::IrqWaitRegistration::new(current.wake_handle()),
+            park: runtime_task::sync::WaitQueue::new(),
+        });
+        assert_eq!(
+            waiter.owner,
+            current.id(),
+            "one AxVM IRQ notification must be consumed by one fixed service thread"
+        );
+
+        match self.event.register(&waiter.registration) {
+            runtime_task::sync::irq::IrqRegisterResult::ConsumedPending => false,
+            runtime_task::sync::irq::IrqRegisterResult::Registered(token)
+            | runtime_task::sync::irq::IrqRegisterResult::NotificationInFlight(token) => {
+                let timed_out = match deadline {
+                    Some(deadline) => waiter
+                        .park
+                        .wait_until_deadline(deadline, || !token.is_attached()),
+                    None => {
+                        waiter.park.wait_until(|| !token.is_attached());
+                        false
+                    }
+                };
+                runtime_task::sync::irq::quiesce_irq_wait(token).unwrap_or_else(|error| {
+                    panic!("AxVM IRQ notification could not quiesce: {error}")
+                });
+                timed_out
+            }
+            runtime_task::sync::irq::IrqRegisterResult::Occupied => {
+                panic!("AxVM IRQ notification waiter was registered concurrently")
+            }
+        }
+    }
+}
+
+pub(crate) fn current_thread() -> ArceOsThreadHandle {
+    runtime_task::thread::current::current_thread_handle()
+        .unwrap_or_else(|error| panic!("AxVM requires a current scheduler thread: {error}"))
+}
+
+pub(crate) fn cpu_set_from_raw_bits(bits: usize) -> ArceOsCpuSet {
+    let cpu_count = modules::ax_hal::cpu_num();
+    let mut affinity = ArceOsCpuSet::empty(cpu_count);
+    for cpu_id in 0..cpu_count.min(usize::BITS as usize) {
+        if bits & (1usize << cpu_id) != 0 {
+            assert!(affinity.insert(ArceOsCpuId::new(cpu_id as u32)));
+        }
+    }
+    affinity
+}
+
+pub(crate) fn cpu_set_one(cpu_id: usize) -> ArceOsCpuSet {
+    let mut affinity = ArceOsCpuSet::empty(modules::ax_hal::cpu_num());
+    assert!(
+        affinity.insert(ArceOsCpuId::new(cpu_id as u32)),
+        "AxVM task CPU {cpu_id} is outside the runtime topology"
+    );
+    affinity
+}
+
+pub(crate) fn current_cpu_id() -> usize {
+    modules::ax_hal::percpu::this_cpu_id()
 }
 
 pub(crate) fn yield_now() {
@@ -215,10 +350,19 @@ pub(crate) fn send_ipi(cpu_id: usize) {
     if modules::ax_hal::percpu::this_cpu_id() == cpu_id {
         return;
     }
-    modules::ax_hal::irq::send_ipi(
-        modules::ax_hal::irq::ipi_irq(),
-        modules::ax_hal::irq::IpiTarget::Other { cpu_id },
-    );
+    ax_std::os::arceos::irq::notify_cpu(cpu_id)
+        .unwrap_or_else(|err| panic!("failed to deliver AxVM IPI to CPU {cpu_id}: {err:?}"));
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn run_on_cpu_sync(
+    cpu_id: usize,
+    f: unsafe fn(*mut ()),
+    arg: *mut (),
+) -> Result<(), ArceOsIrqError> {
+    // SAFETY: the caller guarantees that `arg` stays valid until the target CPU
+    // has executed `f`; `ax_hal` provides the synchronous completion boundary.
+    unsafe { modules::ax_hal::irq::run_on_cpu_sync(modules::ax_hal::irq::CpuId(cpu_id), f, arg) }
 }
 
 fn send_ipi_to_all_except_current(cpu_num: usize) {
@@ -226,89 +370,145 @@ fn send_ipi_to_all_except_current(cpu_num: usize) {
         return;
     }
     let cpu_id = modules::ax_hal::percpu::this_cpu_id();
-    modules::ax_hal::irq::send_ipi(
-        modules::ax_hal::irq::ipi_irq(),
-        modules::ax_hal::irq::IpiTarget::AllExceptCurrent { cpu_id, cpu_num },
-    );
+    for target_cpu in 0..cpu_num {
+        if target_cpu == cpu_id {
+            continue;
+        }
+        modules::ax_hal::irq::send_ipi(
+            modules::ax_hal::irq::ipi_irq(),
+            modules::ax_hal::irq::IpiTarget::Cpu(modules::ax_hal::irq::CpuId(target_cpu)),
+        )
+        .unwrap_or_else(|err| {
+            panic!("failed to deliver AxVM broadcast IPI to CPU {target_cpu}: {err:?}")
+        });
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) type ArceOsIrqContext = modules::ax_hal::irq::IrqContext;
-#[cfg(target_arch = "x86_64")]
-pub(crate) type ArceOsIrqError = modules::ax_hal::irq::IrqError;
-#[cfg(target_arch = "x86_64")]
-pub(crate) type ArceOsIrqHandle = modules::ax_hal::irq::IrqHandle;
-#[cfg(target_arch = "x86_64")]
-pub(crate) type ArceOsIrqId = modules::ax_hal::irq::IrqId;
-#[cfg(target_arch = "x86_64")]
-pub(crate) type ArceOsIrqReturn = modules::ax_hal::irq::IrqReturn;
-#[cfg(target_arch = "x86_64")]
-pub(crate) type ArceOsIrqSource = modules::ax_hal::irq::IrqSource;
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn request_shared_irq(
-    irq: ArceOsIrqId,
-    handler: impl FnMut(ArceOsIrqContext) -> ArceOsIrqReturn + Send + 'static,
-) -> Result<ArceOsIrqHandle, ArceOsIrqError> {
-    modules::ax_hal::irq::request_shared_irq(irq, handler)
-}
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn make_irq_id(domain: u16, hwirq: u32) -> ArceOsIrqId {
-    modules::ax_hal::irq::IrqId::new(
-        modules::ax_hal::irq::IrqDomainId(domain),
-        modules::ax_hal::irq::HwIrq(hwirq),
-    )
-}
-
-#[cfg(all(target_arch = "x86_64", not(test)))]
-pub(crate) fn set_irq_enable(irq: ArceOsIrqId, enabled: bool) -> Result<(), ArceOsIrqError> {
-    modules::ax_hal::irq::set_enable(irq, enabled)
-}
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn resolve_irq_source(source: ArceOsIrqSource) -> Result<ArceOsIrqId, ArceOsIrqError> {
-    modules::ax_hal::irq::resolve_irq_source(source)
-}
-
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "loongarch64",
-    target_arch = "riscv64"
-))]
-pub(crate) fn host_fdt_bootarg() -> usize {
-    modules::ax_hal::dtb::get_bootarg()
-}
-
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "loongarch64",
-    target_arch = "riscv64"
-))]
-pub(crate) fn phys_to_virt(paddr: ax_memory_addr::PhysAddr) -> ax_memory_addr::VirtAddr {
-    modules::ax_hal::mem::phys_to_virt(paddr)
-}
-
-#[cfg(all(
-    any(feature = "fs", feature = "host-fs"),
-    any(target_arch = "x86_64", target_arch = "loongarch64")
-))]
-pub(crate) fn shutdown_host_filesystems() -> AxResult {
-    modules::ax_fs_ng::shutdown_filesystems()?;
-    let released = modules::ax_fs_ng::release_block_irqs_for_passthrough();
+#[cfg(any(feature = "fs", feature = "host-fs"))]
+pub fn shutdown_host_filesystems() -> AxVmResult {
+    modules::ax_fs_ng::shutdown_filesystems()
+        .map_err(|error| AxVmError::host("shut down host filesystems", error))?;
+    let released = modules::ax_fs_ng::release_block_irqs_for_passthrough()
+        .map_err(|error| AxVmError::host("release host filesystem block IRQs", error))?;
     if released != 0 {
-        info!("Released {released} host filesystem block IRQ registration(s) before passthrough");
+        info!("Released {released} host filesystem block IRQ registration(s) during shutdown");
     }
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
-impl HostConsole for ArceOsHost {
-    fn write_bytes(&self, bytes: &[u8]) {
-        modules::ax_hal::console::write_bytes(bytes);
-    }
+#[cfg(all(feature = "host-fs", target_arch = "x86_64"))]
+pub(crate) fn register_qemu_block_passthrough_irq(vm: &crate::AxVMRef) -> AxVmResult {
+    let (_, _, _, guest_gsi) = crate::boot::x86_qemu_passthrough_block_intx();
+    let info = qemu_block_passthrough_pci_info();
 
-    fn read_bytes(&self, bytes: &mut [u8]) -> usize {
-        modules::ax_hal::console::read_bytes(bytes)
+    let route = match ax_driver::pci::resolve_intx_binding(info) {
+        Ok(Some(binding)) => {
+            let trigger = intx_forwarding_trigger(&binding);
+            resolve_binding_irq(binding).map(|host_irq| (host_irq, trigger))
+        }
+        Ok(None) => {
+            warn!("x86 QEMU block passthrough PCI INTx route was not found for {info:?}");
+            return Ok(());
+        }
+        Err(error) => {
+            warn!("failed to resolve x86 QEMU block passthrough PCI INTx route: {error:?}");
+            return Ok(());
+        }
+    };
+
+    match route {
+        Ok((host_irq, trigger)) => {
+            crate::arch::current::register_host_irq_forwarding_route_with_trigger(
+                vm, guest_gsi, host_irq, trigger,
+            )?;
+            crate::arch::current::register_host_irq_forwarding_activator(
+                vm,
+                guest_gsi,
+                unmask_qemu_block_passthrough_intx,
+            )?;
+            info!(
+                "Registered x86 QEMU block passthrough PCI INTx forwarding route: guest GSI \
+                 {guest_gsi} <- host IRQ {host_irq:?}, trigger {trigger:?}"
+            );
+        }
+        Err(error) => {
+            warn!(
+                "failed to resolve x86 QEMU block passthrough IRQ source into host IRQ: {error:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "host-fs", target_arch = "x86_64"))]
+pub(crate) fn prepare_qemu_block_passthrough_device() {
+    let info = qemu_block_passthrough_pci_info();
+    match ax_driver::pci::prepare_intx_passthrough(info) {
+        Ok(()) => info!("Prepared x86 QEMU block PCI INTx passthrough device {info:?}"),
+        Err(error) => {
+            warn!("failed to prepare x86 QEMU block PCI INTx passthrough device: {error:?}");
+        }
+    }
+}
+
+#[cfg(all(feature = "host-fs", target_arch = "x86_64"))]
+fn unmask_qemu_block_passthrough_intx() {
+    let info = qemu_block_passthrough_pci_info();
+    match ax_driver::pci::unmask_intx_passthrough(info) {
+        Ok(()) => info!("Unmasked x86 QEMU block PCI INTx passthrough device {info:?}"),
+        Err(error) => {
+            warn!("failed to unmask x86 QEMU block PCI INTx passthrough device: {error:?}");
+        }
+    }
+}
+
+#[cfg(all(feature = "host-fs", target_arch = "x86_64"))]
+fn qemu_block_passthrough_pci_info() -> ax_driver::probe::pci::PciInfo {
+    use ax_driver::probe::pci::{PciAddress, PciInfo, PciIntxRoute};
+
+    let (device, function, pin, _) = crate::boot::x86_qemu_passthrough_block_intx();
+    PciInfo {
+        address: PciAddress::new(0, 0, device, function),
+        interrupt_pin: pin,
+        interrupt_line: 0,
+        dma_coherent: true,
+        intx_route: Some(PciIntxRoute {
+            root_device: device,
+            root_function: function,
+            root_pin: pin,
+        }),
+    }
+}
+
+#[cfg(all(feature = "host-fs", target_arch = "x86_64"))]
+fn resolve_binding_irq(
+    binding: ax_driver::BindingIrq,
+) -> Result<modules::ax_hal::irq::IrqId, modules::ax_hal::irq::IrqError> {
+    use modules::ax_hal::irq;
+
+    if let Some(irq) = binding.irq_id() {
+        return Ok(irq);
+    }
+    let Some(source) = binding.as_irq_source() else {
+        return Err(irq::IrqError::Unsupported);
+    };
+    irq::resolve_irq_source(source)
+}
+
+#[cfg(all(feature = "host-fs", target_arch = "x86_64"))]
+fn intx_forwarding_trigger(binding: &ax_driver::BindingIrq) -> crate::InterruptTriggerMode {
+    match binding {
+        ax_driver::BindingIrq::Source(ax_driver::BindingIrqSource::AcpiGsiRoute(route)) => {
+            match route.trigger {
+                modules::ax_hal::irq::AcpiIrqTrigger::Edge => {
+                    crate::InterruptTriggerMode::EdgeTriggered
+                }
+                modules::ax_hal::irq::AcpiIrqTrigger::Level => {
+                    crate::InterruptTriggerMode::LevelTriggered
+                }
+            }
+        }
+        _ => crate::InterruptTriggerMode::LevelTriggered,
     }
 }
 
@@ -317,17 +517,18 @@ impl HostPlatform for ArceOsHost {
         CurrentArch::has_hardware_support()
     }
 
-    fn enable_virtualization_on_current_cpu(&self) -> AxResult {
-        crate::timer::init_percpu();
+    fn enable_virtualization_on_current_cpu(&self) -> AxVmResult {
+        crate::arch::current::prepare_host_virtualization()?;
         crate::percpu::init_current_cpu()?;
         crate::percpu::enable_current_cpu()?;
         crate::percpu::mark_cpu_enabled(self.this_cpu_id());
         Ok(())
     }
 
-    fn enable_virtualization_on_all_cpus(&self) -> AxResult {
+    fn enable_virtualization_on_all_cpus(&self) -> AxVmResult {
         static CORES: AtomicUsize = AtomicUsize::new(0);
 
+        crate::arch::current::prepare_host_virtualization()?;
         info!("Enabling hardware virtualization support on all cores...");
         CORES.store(0, Ordering::Release);
         crate::percpu::reset_enabled_cpu_mask();
@@ -343,20 +544,25 @@ impl HostPlatform for ArceOsHost {
             if cpu_id == current_cpu {
                 continue;
             }
-            let task = modules::ax_task::TaskInner::new(
-                move || {
-                    let host = arceos_host();
-                    info!("Core {cpu_id} is initializing hardware virtualization support...");
-                    host.enable_virtualization_on_current_cpu()
-                        .expect("failed to enable hardware virtualization");
-                    info!("Hardware virtualization support enabled on core {cpu_id}");
-                    let _ = CORES.fetch_add(1, Ordering::Release);
-                },
-                alloc::format!("axvm-hv-init-{cpu_id}"),
-                modules::ax_task::default_task_stack_size(),
-            );
-            task.set_cpumask(<Self as HostCpu>::CpuMask::one_shot(cpu_id));
-            modules::ax_task::spawn_task(task);
+            let affinity = cpu_set_one(cpu_id);
+            // SAFETY: no OS extension is transferred and the affinity is
+            // validated against the current runtime topology above.
+            let _task = {
+                ax_std::os::arceos::thread::builder(std::format!("axvm-hv-init-{cpu_id}"))
+                    .stack_size(AXVM_KERNEL_STACK_SIZE)
+                    .affinity(affinity)
+                    .spawn(move || {
+                        let host = arceos_host();
+                        info!("Core {cpu_id} is initializing hardware virtualization support...");
+                        host.enable_virtualization_on_current_cpu()
+                            .expect("failed to enable hardware virtualization");
+                        info!("Hardware virtualization support enabled on core {cpu_id}");
+                        let _ = CORES.fetch_add(1, Ordering::Release);
+                    })
+            }
+            .unwrap_or_else(|error| {
+                panic!("failed to spawn AxVM CPU {cpu_id} initialization task: {error}")
+            });
             if cpu_id != self.this_cpu_id() {
                 send_ipi(cpu_id);
             }
@@ -375,7 +581,7 @@ impl HostPlatform for ArceOsHost {
                 break;
             }
         }
-        CurrentArch::register_platform_irq_injector();
+        crate::arch::current::register_platform_irq_injector();
         let enabled_count = CORES.load(Ordering::Acquire);
         if enabled_count == cpu_count {
             info!("All cores have enabled hardware virtualization support.");

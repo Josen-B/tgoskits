@@ -15,16 +15,19 @@
 //! use riscv_vplic::VPlicGlobal;
 //!
 //! // Create a virtual PLIC with 2 contexts
-//! let vplic = VPlicGlobal::new(GuestPhysAddr::from(0x0c000000), Some(0x4000), 2);
+//! let vplic = VPlicGlobal::new(GuestPhysAddr::from(0x0c000000), Some(0x4000), 2)?;
+//! # Ok::<(), riscv_vplic::VplicError>(())
 //! ```
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 mod consts;
 mod devops_impl;
-pub mod host;
-mod utils;
+mod error;
 mod vplic;
 
 pub use consts::*;
-pub use vplic::VPlicGlobal;
+pub use error::{VplicError, VplicResult};
+pub use vplic::{VPlicGlobal, VplicCompletion};

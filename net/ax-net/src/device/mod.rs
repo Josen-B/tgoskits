@@ -14,13 +14,15 @@
 //!
 //! # Readiness
 //!
-//! A device may use platform IRQs, polling, or out-of-band notifications. The
-//! router asks devices for a readiness poll set and performs `PollSet`
-//! register/wake operations after releasing the concrete device lock.
+//! Physical devices enter the router only through the IRQ-backed queue runtime;
+//! periodic polling and out-of-band wake fallbacks are not supported. The
+//! in-memory loopback device has no hardware readiness source. The router asks
+//! devices for protocol-side readiness and performs `PollSet` register/wake
+//! operations after releasing the concrete device lock.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, vec::Vec};
+use core::ops::Range;
 
-use axpoll::PollSet;
 use smoltcp::{
     storage::PacketBuffer,
     time::Instant,
@@ -41,6 +43,54 @@ pub use loopback::*;
 #[cfg(feature = "vsock")]
 pub use vsock::*;
 
+/// Owned IP packet whose backing RX DMA token is retained through consumption.
+pub(crate) struct DeviceRxPacket {
+    frame_len: usize,
+    frame: ProtocolRxFrame,
+    packet: Range<usize>,
+}
+
+impl DeviceRxPacket {
+    pub(crate) fn with_packet_range(
+        frame_len: usize,
+        frame: ProtocolRxFrame,
+        packet: Range<usize>,
+    ) -> Self {
+        assert!(packet.end <= frame.packet_len());
+        Self {
+            frame_len,
+            frame,
+            packet,
+        }
+    }
+
+    /// Borrows the IP packet without releasing the RX DMA token.
+    pub fn read_with<R>(&self, consume: impl FnOnce(&[u8]) -> R) -> R {
+        self.frame
+            .read_with(|frame| consume(&frame[self.packet.clone()]))
+    }
+
+    /// Consumes the IP packet and recycles its DMA token afterwards.
+    pub fn consume<R>(self, consume: impl FnOnce(&[u8]) -> R) -> R {
+        self.read_with(consume)
+    }
+
+    /// Returns the received L2 frame length excluding FCS.
+    pub const fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+}
+
+/// Result of polling a device's optional owned receive path.
+pub(crate) enum DeviceRxPoll {
+    /// This device only implements the compatibility receive path.
+    Unsupported,
+    /// The owned receive path is supported but no IP packet is ready.
+    Idle,
+    /// One IP packet and its backing DMA token were received.
+    Packet(DeviceRxPacket),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArpEntry {
     /// IPv4 address in network byte order.
@@ -56,27 +106,128 @@ pub struct ArpEntry {
 }
 
 /// Packet I/O endpoint behind the multi-device router.
-pub trait Device: Send + Sync {
+pub(crate) trait Device: Send {
     /// Human-readable device name used in logs and userspace queries.
     fn name(&self) -> &str;
 
     /// Moves packets from the device into the shared IP RX buffer.
     ///
-    /// Returns `true` when at least one packet was delivered and the protocol
-    /// core should be polled again.
+    /// Returns the L2 frame byte count (excluding FCS) of the delivered IP
+    /// packet, or 0 when no IP packet was enqueued. ARP and other non-IP
+    /// frames are processed internally and do not produce a return value.
+    ///
+    /// The returned byte count aligns with Linux `/proc/net/dev` semantics
+    /// (Ethernet frame without trailing FCS).
+    ///
+    /// # Contract
+    ///
+    /// Each call that returns a non-zero value MUST have enqueued exactly one
+    /// IP packet into `buffer`. The return value is the L2 frame length of
+    /// that specific packet. The protocol executor relies on this 1:1
+    /// correspondence to pair frame lengths with dequeued packets in FIFO
+    /// order.
     fn recv(
         &mut self,
         interface_id: InterfaceId,
         buffer: &mut PacketBuffer<InterfaceId>,
         timestamp: Instant,
         snoop: &mut dyn FnMut(&[u8]),
-    ) -> bool;
+    ) -> usize;
+
+    /// Polls an optional owned receive path that retains DMA through `RxToken`.
+    fn poll_owned_rx(&mut self, _timestamp: Instant) -> DeviceRxPoll {
+        DeviceRxPoll::Unsupported
+    }
+
+    /// Receives directly from queue-owned backing into the final protocol
+    /// destination when supported.
+    ///
+    /// `None` selects the compatibility [`recv`](Self::recv) path. `Some(0)`
+    /// means the direct path is supported but no IP packet was delivered.
+    fn recv_direct(
+        &mut self,
+        _timestamp: Instant,
+        _deliver: &mut dyn FnMut(&[u8]) -> bool,
+        _snoop: &mut dyn FnMut(&[u8]),
+    ) -> Option<usize> {
+        None
+    }
     /// Sends a packet to the next hop.
     ///
-    /// Returns `true` if this operation resulted in the readiness of receive
-    /// operation. This is true for loopback devices and can be used to speed
-    /// up packet processing.
-    fn send(&mut self, next_hop: IpAddress, packet: &[u8], timestamp: Instant) -> bool;
+    /// Returns the L2 frame byte count (excluding FCS) actually transmitted,
+    /// or 0 if the packet was queued for later transmission (e.g. pending ARP
+    /// resolution) or could not be sent. The returned byte count aligns with
+    /// Linux `/proc/net/dev` semantics.
+    fn send(&mut self, next_hop: IpAddress, packet: &[u8], timestamp: Instant) -> usize;
+
+    /// Attempts a transmission while preserving transient queue backpressure.
+    ///
+    /// [`NetDeviceError::Again`] means the caller still owns the packet and
+    /// must leave it queued until a later protocol poll.
+    fn try_send(
+        &mut self,
+        next_hop: IpAddress,
+        packet: &[u8],
+        timestamp: Instant,
+    ) -> NetDeviceResult<usize> {
+        Ok(self.send(next_hop, packet, timestamp))
+    }
+
+    /// Returns the per-packet L2 frame byte counts for packets transmitted
+    /// on a side path during `recv()` (e.g. ARP resolution and replies)
+    /// since the last call. The internal accumulator is cleared on each call.
+    ///
+    /// Each element is the L2 frame byte count of one packet. An empty Vec
+    /// means no deferred transmissions occurred.
+    fn drain_deferred_tx(&mut self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Returns the per-packet L2 frame byte counts for non-IP frames
+    /// received during `recv()` (e.g. ARP requests and replies) since the
+    /// last call. The internal accumulator is cleared on each call.
+    ///
+    /// These frames were successfully received and processed at L2, but
+    /// were not enqueued into the IP buffer. Each element is the L2 frame
+    /// byte count of one received frame. An empty Vec means no non-IP
+    /// frames were received.
+    fn drain_deferred_rx(&mut self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Returns the count of TX errors accumulated during device operations
+    /// (e.g. buffer allocation failures, transmit hardware errors) since
+    /// the last call. The internal accumulator is cleared on each call.
+    fn drain_deferred_tx_errors(&mut self) -> u64 {
+        0
+    }
+
+    /// Returns the count of TX drops accumulated during device operations
+    /// (e.g. pending buffer full) since the last call.
+    /// The internal accumulator is cleared on each call.
+    ///
+    /// Distinct from `drain_deferred_tx_errors`: tx_errors counts hardware/
+    /// driver-level transmission failures and protocol errors; tx_drops counts
+    /// packets that were intentionally discarded due to resource constraints
+    /// (buffer exhaustion, queue overflow).
+    fn drain_deferred_tx_drops(&mut self) -> u64 {
+        0
+    }
+
+    /// Returns the count of RX errors accumulated during device operations
+    /// (e.g. driver receive errors, malformed frames) since the last call.
+    /// The internal accumulator is cleared on each call.
+    fn drain_deferred_rx_errors(&mut self) -> u64 {
+        0
+    }
+
+    /// Returns the count of RX drops accumulated during device operations
+    /// (e.g. frames with unsupported EtherType that were successfully
+    /// received at L2 but cannot be processed by the stack) since the last
+    /// call. The internal accumulator is cleared on each call.
+    fn drain_deferred_rx_drops(&mut self) -> u64 {
+        0
+    }
 
     /// Updates the IPv4 address used by device-local protocol helpers.
     fn set_ipv4_addr(&mut self, _addr: Option<Ipv4Cidr>) {}
@@ -84,14 +235,5 @@ pub trait Device: Send + Sync {
     /// Returns device-local ARP/neighbor entries for userspace queries.
     fn arp_entries(&self, _timestamp: Instant) -> Vec<ArpEntry> {
         Vec::new()
-    }
-
-    /// Returns the device readiness poll set when the device has a wake source.
-    ///
-    /// Interrupt-driven and out-of-band devices return a poll set. Pure-polling
-    /// devices should return `None`, or their wakers would sit on a poll set
-    /// that is never woken.
-    fn readiness_poll(&self) -> Option<Arc<PollSet>> {
-        None
     }
 }

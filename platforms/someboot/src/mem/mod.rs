@@ -10,14 +10,81 @@ pub mod mmu;
 pub(crate) mod ram;
 pub(crate) mod region;
 
+pub use mmu::{MemAttributes, PteConfig};
 pub use page_table_generic::*;
 
-use crate::{ArchTrait, DCacheOp, arch::Arch, smp::percpu_range};
+use crate::{ArchTrait, DCacheOp, arch::Arch, smp::cpu_area_region};
 
 pub const KB: usize = 1024;
 pub const MB: usize = 1024 * KB;
 pub const GB: usize = 1024 * MB;
 pub const KIMAGE_MAP_ALIGN: usize = 2 * MB;
+
+/// Invalid platform virtual-address geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum VirtualAddressSpaceError {
+    /// One of the half-open address ranges has its end below its start.
+    #[error("invalid virtual-address-space range")]
+    InvalidRange,
+    /// The user-capable and kernel page-table ranges overlap.
+    #[error("user and kernel virtual-address-space ranges overlap")]
+    OverlappingRanges,
+    /// CPUCFG reports an address width unsupported by the configured walker.
+    #[error("unsupported virtual-address width: VALEN={valen}")]
+    UnsupportedAddressWidth {
+        /// Architectural VALEN value, including the sign bit.
+        valen: usize,
+    },
+}
+
+/// Platform-owned page-table virtual-address layout.
+///
+/// Direct-map windows that bypass the page-table walker are deliberately not
+/// part of `kernel`. An empty `user` range means that the current build does
+/// not expose a user page table even if the architecture could support one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualAddressSpaceLayout {
+    user: Range<usize>,
+    kernel: Range<usize>,
+}
+
+impl VirtualAddressSpaceLayout {
+    /// Validates and constructs a platform layout.
+    pub fn try_new(
+        user: Range<usize>,
+        kernel: Range<usize>,
+    ) -> Result<Self, VirtualAddressSpaceError> {
+        if user.start > user.end || kernel.start > kernel.end {
+            return Err(VirtualAddressSpaceError::InvalidRange);
+        }
+        if user.start < kernel.end && kernel.start < user.end {
+            return Err(VirtualAddressSpaceError::OverlappingRanges);
+        }
+        Ok(Self { user, kernel })
+    }
+
+    /// Returns the lower range available to a user page table.
+    pub fn user(&self) -> Range<usize> {
+        self.user.clone()
+    }
+
+    /// Returns the page-table-backed kernel allocation range.
+    pub fn kernel(&self) -> Range<usize> {
+        self.kernel.clone()
+    }
+}
+
+pub(crate) fn configured_user_space(end: usize) -> Range<usize> {
+    #[cfg(uspace)]
+    {
+        0..end
+    }
+    #[cfg(not(uspace))]
+    {
+        let _ = end;
+        0..0
+    }
+}
 
 static mut VM_LOAD_OFFSET: isize = 0;
 static MEMORY_MAP: StaticCell<MemoryMap> = StaticCell::new(MemoryMap::new());
@@ -25,7 +92,7 @@ static MEMORY_MAP: StaticCell<MemoryMap> = StaticCell::new(MemoryMap::new());
 /// Load address of the kernel start
 static mut KIMAGE_START: Option<PhysAddr> = None;
 /// Load address of the kernel end
-static mut KIMAGE_END: PhysAddr = PhysAddr::new(0);
+static mut KIMAGE_END: PhysAddr = PhysAddr::from_usize(0);
 
 const MEMORY_MAP_CAPACITY: usize = 512;
 
@@ -38,9 +105,9 @@ pub(crate) fn setup_entry(
 ) {
     unsafe {
         KIMAGE_START = Some(kernel_start);
-        KIMAGE_END = kernel_end.raw().align_up(KIMAGE_MAP_ALIGN).into();
+        KIMAGE_END = kernel_end.as_usize().align_up(KIMAGE_MAP_ALIGN).into();
 
-        VM_LOAD_OFFSET = kernel_start.raw() as isize - kernel_start_link.raw() as isize;
+        VM_LOAD_OFFSET = kernel_start.as_usize() as isize - kernel_start_link.as_usize() as isize;
     }
 }
 
@@ -66,8 +133,8 @@ pub fn __io(paddr: usize) -> *mut u8 {
     crate::arch::Arch::_io(paddr)
 }
 
-pub fn __percpu(paddr: usize) -> *mut u8 {
-    crate::arch::Arch::_percpu(paddr)
+pub fn cpu_area_phys_to_virt(paddr: usize) -> *mut u8 {
+    crate::arch::Arch::cpu_area_phys_to_virt(paddr)
 }
 
 /// kernel image 物理地址转换为内核虚拟地址
@@ -87,13 +154,25 @@ pub fn dcache_range(op: DCacheOp, addr: *const u8, size: usize) {
     Arch::dcache_range(op, addr as _, size);
 }
 
+pub fn dma_coherent_before_map_uncached(addr: *const u8, size: usize) {
+    Arch::dma_coherent_before_map_uncached(addr as _, size);
+}
+
+pub fn dma_coherent_before_unmap_uncached(addr: *const u8, size: usize) {
+    Arch::dma_coherent_before_unmap_uncached(addr as _, size);
+}
+
+pub fn dma_coherent_after_mapping_update() {
+    Arch::dma_coherent_after_mapping_update();
+}
+
 /// 物理RAM实际转换为的内核虚拟地址
 pub fn phys_to_virt(paddr: usize) -> *mut u8 {
     if mmu::is_kernel_relocated() {
         if kimage_range().contains(&paddr) {
             __kimage_va(paddr)
-        } else if percpu_range().contains(&paddr) {
-            __percpu(paddr)
+        } else if cpu_area_region().contains(&paddr) {
+            cpu_area_phys_to_virt(paddr)
         } else {
             __va(paddr)
         }
@@ -175,7 +254,7 @@ pub(crate) fn kimage_range() -> core::ops::Range<usize> {
             panic!("Kernel image start is not set");
         };
         let end = KIMAGE_END;
-        start.raw()..end.raw()
+        start.as_usize()..end.as_usize()
     }
 }
 
@@ -224,6 +303,6 @@ pub(crate) fn add_memory_descriptor(
     unsafe { MEMORY_MAP.update(|mem| mem.merge_add(desc)) }
 }
 
-pub fn kernel_space() -> Range<usize> {
-    Arch::kernel_space()
+pub fn virtual_address_space() -> Result<VirtualAddressSpaceLayout, VirtualAddressSpaceError> {
+    Arch::virtual_address_space()
 }

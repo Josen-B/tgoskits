@@ -5,7 +5,7 @@ sidebar_label: "准备环境"
 
 # 调试环境准备
 
-本文档说明当前调试方案依赖哪些宿主机条件，以及这些依赖在实现里分别承担什么角色。
+本地调试依赖 VS Code、目标架构工具链、QEMU/GDB 和项目生成的调试配置。
 
 ## VS Code 扩展
 
@@ -75,7 +75,7 @@ cargo xtask starry rootfs --arch aarch64
 
 ### Axvisor
 
-Axvisor 除了构建本体，还通常依赖 Guest 镜像、VM 配置和 rootfs。当前这些运行资源已经由 `scripts/axbuild` 路径统一接管，因此不再要求开发者在调试前手工执行 `setup_qemu.sh` 一类准备脚本。
+Axvisor 除了构建本体，还通常依赖 Guest 镜像、VM 配置和 rootfs。当前这些运行资源已经由 `scripts/axbuild` 路径统一接管，因此不再要求开发者在调试前手工执行额外的准备脚本。
 
 这里的核心设计点是：调试链路虽然仍然依赖这些运行时资源，但它们的准备逻辑已经被并入 `cargo xtask axvisor ...` 的实现路径，而不是要求开发者额外维护一套独立的预处理步骤。
 

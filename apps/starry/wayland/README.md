@@ -59,7 +59,7 @@ The automated test exercises these kernel paths:
 
 ## Manual Reproduction with VNC
 
-The manual flow intentionally avoids the app test's `shell_init_cmd`; it boots
+The manual flow intentionally avoids the app test's `shell_cmd`; it boots
 the same kernel and Alpine rootfs directly so you can type commands at the
 StarryOS shell and interact with GTK through VNC. The guest-side Weston and GTK
 commands are the same for the direct riscv64 and x86_64 flows. Only the
@@ -114,7 +114,7 @@ qemu-system-riscv64 \
   -device virtio-gpu-pci \
   -device virtio-keyboard-pci \
   -device virtio-mouse-pci \
-  -device virtio-blk-pci,drive=disk0 \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
   -drive id=disk0,if=none,format=raw,file=tmp/wayland-manual/riscv64.img
 ```
 
@@ -133,7 +133,7 @@ args = [
   "-device", "virtio-gpu-pci",
   "-device", "virtio-keyboard-pci",
   "-device", "virtio-mouse-pci",
-  "-device", "virtio-blk-pci,drive=disk0",
+  "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/wayland-manual/x86_64.img",
 ]
 uefi = true

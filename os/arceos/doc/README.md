@@ -22,12 +22,12 @@ Other optional modules and their corresponding features are as follows:
 
 | Modules | Dependent features | Description |
 |-|-|-|
-| [ax-alloc](../modules/axalloc) | alloc | ArceOS global memory allocator. |
+| [ax-alloc](../../../memory/ax-alloc) | alloc | ArceOS global memory allocator. |
 | [ax-display](../modules/axdisplay) | display | ArceOS graphics module. |
-| [ax-fs-ng](../modules/axfs-ng) | fs | ArceOS filesystem module. |
+| [ax-fs-ng](../../../fs/ax-fs-ng) | fs | ArceOS filesystem module. |
 | [ax-net](../modules/ax-net) | net | ArceOS network module. |
 | [axdriver](../modules/axdriver) | driver-*, fs, net, display | ArceOS device drivers. |
-| [ax-task](../modules/axtask) | multitask | ArceOS task management module. |
+| [ax-task](../../../components/ax-task) | multitask | OS-independent task scheduling core; ArceOS integration lives in `ax-runtime::task`. |
 | [axsync](../modules/axsync) | multitask | ArceOS synchronization primitives. |
 
 See [arceos-apps](https://github.com/arceos-org/arceos-apps) for example applications and their required modules and features.

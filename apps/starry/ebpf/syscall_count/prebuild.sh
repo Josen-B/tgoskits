@@ -2,10 +2,9 @@
 # Build the `syscall_count` demo (aya loader + embedded eBPF bytecode) as a
 # static musl binary and install it into the StarryOS rootfs overlay.
 #
-# The loader attaches a kprobe to `syscall::sysno` (whose first argument is the
-# raw syscall number, so the read is arch-independent), drives a fixed number of
-# getpid(2) calls, then reads the per-syscall hit count back from a BPF HashMap
-# and prints SYSCALL_COUNT_PASS / _FAIL.
+# The loader attaches to Linux-compatible `raw_syscalls:sys_enter`, drives a
+# fixed number of getpid(2) calls, then reads the per-syscall hit count back
+# from a BPF HashMap and prints SYSCALL_COUNT_PASS / _FAIL.
 set -euo pipefail
 
 app_dir="${STARRY_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -25,6 +24,35 @@ if [[ -d "$cross_bin" ]]; then
     export PATH="$cross_bin:$PATH"
 fi
 cc_bin="${cross_prefix}-gcc"
+
+if ! command -v rustup >/dev/null 2>&1; then
+    echo "$(basename "$app_dir") prebuild: rustup is required to install Rust target $musl_target" >&2
+    exit 1
+fi
+read -r rust_toolchain _ < <(rustup show active-toolchain)
+echo "$(basename "$app_dir") prebuild: installing Rust target $musl_target for toolchain $rust_toolchain"
+rustup target add --toolchain "$rust_toolchain" "$musl_target"
+export RUSTUP_TOOLCHAIN="$rust_toolchain"
+
+host_tools_dir="${STARRY_WORKSPACE:-$app_dir}/tmp/axbuild/starry-host-tools"
+export PATH="$host_tools_dir/bin:${HOME:-/root}/.cargo/bin:$PATH"
+ensure_bpf_linker() {
+    if command -v bpf-linker >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v apk >/dev/null 2>&1; then
+        echo "$(basename "$app_dir") prebuild: installing bpf-linker with apk"
+        apk add --no-cache bpf-linker || true
+        if command -v bpf-linker >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    echo "$(basename "$app_dir") prebuild: installing bpf-linker 0.10.3 with cargo"
+    cargo install bpf-linker --version 0.10.3 --locked --root "$host_tools_dir"
+}
+ensure_bpf_linker
 
 install_loongarch_loader_link() {
     local rootfs="${STARRY_ROOTFS:-}"

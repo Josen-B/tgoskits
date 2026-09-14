@@ -1,0 +1,39 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.3.1](https://github.com/rcore-os/tgoskits/compare/rdif-msi-v0.3.0...rdif-msi-v0.3.1) - 2026-09-09
+
+### Other
+
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+
+## [0.3.0](https://github.com/rcore-os/tgoskits/compare/rdif-msi-v0.2.2...rdif-msi-v0.3.0) - 2026-08-20
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+
+## [0.2.2](https://github.com/rcore-os/tgoskits/compare/rdif-msi-v0.2.1...rdif-msi-v0.2.2) - 2026-08-09
+
+### Other
+
+- updated the following local packages: axtest, irq-framework, rdif-base
+
+## [0.2.1](https://github.com/rcore-os/tgoskits/compare/rdif-msi-v0.2.0...rdif-msi-v0.2.1) - 2026-08-03
+
+### Other
+
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+## [0.2.0](https://github.com/rcore-os/tgoskits/compare/rdif-msi-v0.1.0...rdif-msi-v0.2.0) - 2026-07-10
+
+### Added
+
+- *(msi)* add hierarchical MSI-X irq domains ([#1526](https://github.com/rcore-os/tgoskits/pull/1526))

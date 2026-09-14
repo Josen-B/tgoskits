@@ -2,7 +2,6 @@
 
 [![Crates.io](https://img.shields.io/crates/v/some-serial.svg)](https://crates.io/crates/some-serial)
 [![Documentation](https://docs.rs/some-serial/badge.svg)](https://docs.rs/some-serial)
-[![Test CI](https://github.com/drivercraft/some-serial/actions/workflows/test.yml/badge.svg)](https://github.com/drivercraft/some-serial/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 一个为嵌入式和裸机环境设计的 **统一串口驱动集合**，提供多种常见串口硬件的高性能、可靠驱动实现。
@@ -24,7 +23,6 @@
 - 🛡️ **无标准库设计** (`no_std`) - 适用于裸机和嵌入式系统
 - 📦 **模块化架构** - 每个驱动独立模块，按需选择
 - 🔒 **类型安全** - 使用 Rust 类型系统确保内存安全
-- 🧪 **全面测试** - 包含完整的测试套件，覆盖各种使用场景
 
 ### 驱动功能特性
 
@@ -65,15 +63,16 @@
 some-serial = "0.1.0"
 ```
 
-### Raw 单对象 polling 使用
+### 单对象 polling 使用
 
-raw concrete 驱动直接持有寄存器和状态；读、写、poll、IRQ sync 都通过同一个对象完成。
-someboot 等 allocator 初始化前路径直接保存这个对象，不需要 `Box`、rdif trait object 或内部锁。
+concrete 驱动直接持有寄存器和状态；allocator 初始化前的 early console 通过
+`PollingUart` 轮询收发，不需要 `Box`、trait object、软件队列或内部锁。
 
 ```rust
 use core::ptr::NonNull;
 use some_serial::{
-    ns16550::Ns16550, Config, DataBits, Parity, RawUart as _, StopBits,
+    Config, DataBits, Parity, PollingUart as _, StopBits, UartPort as _,
+    ns16550::Ns16550,
 };
 
 let base_addr = NonNull::new(0x9000000 as *mut u8).unwrap();
@@ -143,44 +142,60 @@ let mut uart = some_serial::ns16550::Ns16550::new_mmio(
 #### 中断驱动通信
 
 ```rust
-use rdif_serial::{InterruptMask, RawUart as _};
+use rdif_serial::{
+    Config, SplitUart as _, UartIrq as _, UartPort as _, UartRegisterGate,
+};
 use some_serial::pl011::Pl011;
 
-// 创建并配置 UART
-let mut uart = Pl011::new(base_addr, clock_freq);
-uart.startup(&config).unwrap();
+// 运行时取得三个不可克隆、职责互斥的端点。
+let uart = Pl011::new(base_addr, clock_freq);
+let parts = uart.split();
+let mut control = parts.control;
+let mut irq = parts.irq;
+let emergency_gate = UartRegisterGate::new(parts.emergency_tx);
+control.startup(&Config::new().baudrate(115200)).unwrap();
 
-// 启用中断
-uart.set_irq_mask(InterruptMask::RX | InterruptMask::TX_SPACE);
-
-// 在中断控制器回调中同步硬件 IRQ 状态
-let snapshot = uart.take_irq_snapshot();
-if snapshot.claimed {
-    // 上层 runtime 决定是否读取 RX FIFO、推进 TX FIFO、唤醒任务。
+// IRQ callback 取得固定容量值报告，再发布到预分配队列。
+if let Some(report) = irq.handle() {
+    for sample in report.rx.as_slice() {
+        // 将 sample 放入预分配的有界 SPSC 队列；满时只记溢出状态。
+        let _ = sample;
+    }
+    // 维护线程根据事件通过 control 处理数据，完成后重新使能来源。
+    control.rearm(report.event.rearm);
 }
+
+// panic 路径只能在永久取得 emergency ownership 后访问寄存器。
+let _written = emergency_gate
+    .try_begin_emergency()
+    .map_or(0, |access| access.try_write(b"panic\n"));
 ```
 
 #### 平台检测与适配
 
-需要运行时动态分发的 rdrive/Starry 路径应在 OS glue 层把 concrete raw driver 包装进
-`rdif_serial::SerialCore`，再由目标内核提供端口锁。`some-serial` 自身不包含 mutex、
-wait queue、poll set 或任务唤醒逻辑。
+需要运行时动态分发的 rdrive/Starry 路径应在驱动探测层调用 `SplitUart::split()`，并且
+仅在那里把三个端点分别擦除为 `Box<dyn UartPort>`、`Box<dyn UartIrq>` 与
+`Box<dyn UartEmergencyTx>`。软件队列、寄存器 gate、维护线程、IRQ 注册、wait
+queue 和 poll source 均由 OS runtime 提供；`some-serial` 不包含这些调度策略。
 
 ```rust
 use core::ptr::NonNull;
-use rdif_serial::{Config, SerialCore};
+use rdif_serial::{Config, SplitUart as _, UartPort as _};
 use some_serial::ns16550::Ns16550;
 
-let raw = Ns16550::new_mmio(
+let uart = Ns16550::new_mmio(
     NonNull::new(0x40000000 as *mut u8).unwrap(),
     16_000_000,
     1,
 );
-let mut core = SerialCore::new(raw);
-core.startup(&Config::new().baudrate(115200)).unwrap();
+let parts = uart.split();
+let mut control = parts.control;
+control
+    .startup(&Config::new().baudrate(115200))
+    .unwrap();
 
-let accepted = core.enqueue_tx(b"runtime serial\n").accepted;
-assert!(accepted > 0);
+let accepted = control.write_tx(b"runtime serial\n");
+assert!(accepted <= b"runtime serial\n".len());
 ```
 
 #### 平台特定配置获取
@@ -235,31 +250,6 @@ let event = uart.poll_status();
 let can_write = event.tx_ready();
 ```
 
-## 测试
-
-这个库包含了一个全面的测试套件，使用 `bare-test` 框架在裸机环境中运行。
-
-### 运行测试
-
-```bash
-# 安装 ostool 用于裸机测试
-cargo install ostool
-
-# 运行测试
-cargo test --test test --  --show-output
-# 真机测试
-cargo test --test test --  --show-output --uboot
-```
-
-### 测试覆盖
-
-- **基础回环测试** - 验证基本的发送/接收功能
-- **资源管理测试** - 验证 RAII 和资源生命周期
-- **配置测试** - 验证各种配置选项
-- **中断测试** - 验证中断功能和掩码控制
-- **压力测试** - 高频数据传输测试
-- **多模式测试** - 不同数据模式的测试
-
 ## 性能特性
 
 - **低延迟** - 直接硬件寄存器访问
@@ -283,23 +273,23 @@ cargo test --test test --  --show-output --uboot
 ### 添加新驱动支持
 
 1. **创建驱动模块**：在 `src/` 目录下创建新的驱动文件
-2. **实现 raw 接口**：驱动对象实现 `RawUart` 的配置、IRQ mask、IRQ snapshot、RX sample、TX ready/write 等寄存器级方法
-3. **添加测试**：为新驱动编写完整的测试套件
-4. **更新文档**：在 README 中添加驱动说明和使用示例
-5. **提交 PR**：详细描述新驱动的功能和使用方法
+2. **拆分运行时端点**：驱动实现 `SplitUart`，数据面实现 `UartPort`，中断面实现
+   `UartIrq`，紧急输出面实现 `UartEmergencyTx`
+3. **更新文档**：在 README 中添加驱动说明和使用示例
+4. **提交 PR**：详细描述新驱动的功能和使用方法
 
 ### 参考实现
 
-可以参考现有的 `src/pl011.rs` 作为新驱动的实现模板：
+可以参考现有的 `src/pl011/` 模块作为新驱动的实现模板：
 
 ```rust
 // 新驱动的基本结构示例
 pub struct NewDriver {
-    // 驱动寄存器句柄、时钟、saved status、IRQ mask shadow 等状态
+    // 驱动寄存器句柄、时钟和配置状态
 }
 
-impl RawUart for NewDriver {
-    // 实现配置、IRQ mask、take_irq_snapshot、read_rx、tx_ready、write_tx 等方法
+impl SplitUart for NewDriver {
+    // 将共享寄存器 core 拆成 task、hard-IRQ 与 emergency-TX 三个端点。
 }
 ```
 
@@ -309,7 +299,6 @@ impl RawUart for NewDriver {
 
 - [ARM PL011 Technical Reference Manual](https://developer.arm.com/documentation/ddi0183/g/) - PL011 硬件规格
 - [rdif-serial](https://github.com/rdif-rs/rdif-serial) - 统一串口接口抽象
-- [bare-test](https://github.com/bare-test/bare-test) - 裸机测试框架
 
 ### 硬件参考
 
@@ -331,7 +320,6 @@ impl RawUart for NewDriver {
   - ✅ 支持 FIFO、中断、回环等完整功能
 - ✅ 基于 rdif-serial 的统一接口抽象
 - ✅ 中断驱动通信和 FIFO 功能
-- ✅ 全面测试套件和文档
 - ✅ **性能优化和类型安全改进**
 - 🏗️ 模块化架构，支持多平台驱动选择
 

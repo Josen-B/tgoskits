@@ -1,4 +1,4 @@
-//! Shared socket options and blocking helpers.
+//! Shared socket options and protocol wake registration.
 //!
 //! Protocol-specific sockets embed `GeneralOptions` for common POSIX socket
 //! state such as nonblocking mode, reuse-address, timeouts, socket identity, and
@@ -6,13 +6,9 @@
 //! different getsockopt/setsockopt behavior in TCP, UDP, raw, Unix, and vsock
 //! transports.
 //!
-//! # Blocking Semantics
-//!
-//! The helpers in this module bridge poll-based readiness with synchronous
-//! socket operations. They should only wait on protocol-specific pollers and
-//! must not drive the smoltcp interface directly. Progress is requested through
-//! the net-poll worker so application threads do not become temporary protocol
-//! stack owners.
+//! Blocking, timeout, and signal semantics belong to the consuming OS.  This
+//! module only stores the corresponding socket policy and registers protocol
+//! wake sources.
 
 use core::{
     sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering},
@@ -20,11 +16,8 @@ use core::{
     time::Duration,
 };
 
-use ax_errno::{AxError, AxResult, LinuxError};
-use ax_task::future::{block_on, poll_io, timeout};
-use axpoll::{IoEvents, Pollable};
-
 use crate::{
+    NetError, NetResult,
     config::{DeviceBinding, InterfaceId},
     get_service, interface_by_id,
     options::{Configurable, GetSocketOption, SetSocketOption},
@@ -32,6 +25,12 @@ use crate::{
 
 const SO_PRIORITY_UNPRIVILEGED_MAX: i32 = 6;
 const IP_TOS_ECN_MASK: u8 = 0x03;
+
+/// Linux IP_PMTUDISC_WANT: use per-route path-MTU discovery. Default for a fresh
+/// socket, echoed back by getsockopt(IP_MTU_DISCOVER).
+const IP_PMTUDISC_WANT: u8 = 1;
+/// Highest valid IP_PMTUDISC_* mode Linux accepts (IP_PMTUDISC_OMIT).
+const IP_PMTUDISC_MAX: u8 = 5;
 
 /// General options for all sockets.
 pub(crate) struct GeneralOptions {
@@ -52,6 +51,9 @@ pub(crate) struct GeneralOptions {
 
     /// IP_TOS value used by protocol sockets when marking outgoing packets.
     ip_tos: AtomicU8,
+    /// IP_MTU_DISCOVER mode (IP_PMTUDISC_*). Stored for Linux ABI compatibility;
+    /// smoltcp does not model path-MTU discovery, so it has no wire effect.
+    ip_mtu_discover: AtomicU8,
     /// Whether recvmsg should report IPv4 TOS as IP_TOS ancillary data.
     recv_tos: AtomicBool,
     /// Whether recvmsg should report IPv6 traffic class as IPV6_TCLASS ancillary data.
@@ -84,6 +86,7 @@ impl GeneralOptions {
             bound_if: AtomicU32::new(0),
 
             ip_tos: AtomicU8::new(0),
+            ip_mtu_discover: AtomicU8::new(IP_PMTUDISC_WANT),
             recv_tos: AtomicBool::new(false),
             recv_traffic_class: AtomicBool::new(false),
             priority: AtomicI32::new(0),
@@ -113,18 +116,6 @@ impl GeneralOptions {
         self.reuse_port.load(Ordering::Relaxed)
     }
 
-    /// Returns the configured send timeout, or `None` for blocking forever.
-    pub fn send_timeout(&self) -> Option<Duration> {
-        let nanos = self.send_timeout_nanos.load(Ordering::Relaxed);
-        (nanos > 0).then(|| Duration::from_nanos(nanos))
-    }
-
-    /// Returns the configured receive timeout, or `None` for blocking forever.
-    pub fn recv_timeout(&self) -> Option<Duration> {
-        let nanos = self.recv_timeout_nanos.load(Ordering::Relaxed);
-        (nanos > 0).then(|| Duration::from_nanos(nanos))
-    }
-
     /// Updates the interface binding used by route selection.
     pub fn set_device_binding(&self, binding: DeviceBinding) {
         self.bound_if.store(
@@ -149,6 +140,21 @@ impl GeneralOptions {
     /// Updates the IPv4 TOS / IPv6 traffic-class byte configured on this socket.
     pub fn set_ip_tos(&self, tos: u8) {
         self.ip_tos.store(tos & !IP_TOS_ECN_MASK, Ordering::Relaxed);
+    }
+
+    /// Returns the IP_MTU_DISCOVER (IP_PMTUDISC_*) mode configured on this socket.
+    pub fn ip_mtu_discover(&self) -> u8 {
+        self.ip_mtu_discover.load(Ordering::Relaxed)
+    }
+
+    /// Updates the IP_MTU_DISCOVER mode. Rejects modes Linux does not define so a
+    /// probing client sees the same EINVAL, then stores the mode for readback.
+    pub fn set_ip_mtu_discover(&self, mode: u8) -> NetResult<()> {
+        if mode > IP_PMTUDISC_MAX {
+            return Err(NetError::InvalidInput);
+        }
+        self.ip_mtu_discover.store(mode, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Returns whether IPv4 TOS ancillary data is enabled for receive calls.
@@ -177,79 +183,23 @@ impl GeneralOptions {
     }
 
     /// Updates SO_PRIORITY using Linux's ordinary unprivileged range.
-    pub fn set_priority(&self, priority: i32) -> AxResult<()> {
+    pub fn set_priority(&self, priority: i32) -> NetResult<()> {
         if !(0..=SO_PRIORITY_UNPRIVILEGED_MAX).contains(&priority) {
-            return Err(AxError::from(LinuxError::EPERM));
+            return Err(NetError::OperationNotPermitted);
         }
         self.priority.store(priority, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Registers a waker with the service/device path for the bound interface.
+    /// Publishes protocol work and registers any protocol deadline for this
+    /// socket. Queue IRQs independently schedule their exact poll group.
     pub fn register_waker(&self, waker: &Waker) {
         get_service().register_waker(self.device_binding(), waker);
-    }
-
-    /// Runs a send operation through the standard blocking/nonblocking poller.
-    pub fn send_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
-        &self,
-        pollable: &P,
-        f: F,
-    ) -> AxResult<T> {
-        self.send_poller_with(pollable, false, f)
-    }
-
-    /// Runs a receive operation through the standard blocking/nonblocking poller.
-    pub fn recv_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
-        &self,
-        pollable: &P,
-        f: F,
-    ) -> AxResult<T> {
-        self.recv_poller_with(pollable, false, f)
-    }
-
-    /// Like [`send_poller`] but lets the caller force non-blocking
-    /// behavior for this call only (e.g. `MSG_DONTWAIT`). The effective
-    /// non-blocking state is the OR of the socket's own `nonblocking()`
-    /// and `extra_nonblocking`.
-    pub fn send_poller_with<P: Pollable, F: FnMut() -> AxResult<T>, T>(
-        &self,
-        pollable: &P,
-        extra_nonblocking: bool,
-        f: F,
-    ) -> AxResult<T> {
-        block_on(timeout(
-            self.send_timeout(),
-            poll_io(
-                pollable,
-                IoEvents::OUT,
-                self.nonblocking() || extra_nonblocking,
-                f,
-            ),
-        ))?
-    }
-
-    /// Like [`recv_poller`] but lets the caller force non-blocking
-    /// behavior for this call only (e.g. `MSG_DONTWAIT`).
-    pub fn recv_poller_with<P: Pollable, F: FnMut() -> AxResult<T>, T>(
-        &self,
-        pollable: &P,
-        extra_nonblocking: bool,
-        f: F,
-    ) -> AxResult<T> {
-        block_on(timeout(
-            self.recv_timeout(),
-            poll_io(
-                pollable,
-                IoEvents::IN,
-                self.nonblocking() || extra_nonblocking,
-                f,
-            ),
-        ))?
+        crate::request_poll();
     }
 }
 impl Configurable for GeneralOptions {
-    fn get_option_inner(&self, option: &mut GetSocketOption) -> AxResult<bool> {
+    fn get_option_inner(&self, option: &mut GetSocketOption) -> NetResult<bool> {
         use GetSocketOption as O;
         match option {
             O::Error(error) => {
@@ -277,6 +227,9 @@ impl Configurable for GeneralOptions {
             O::IpTos(tos) => {
                 **tos = self.ip_tos.load(Ordering::Relaxed);
             }
+            O::IpMtuDiscover(mode) => {
+                **mode = self.ip_mtu_discover();
+            }
             O::RecvTos(enabled) => {
                 **enabled = self.recv_tos();
             }
@@ -303,7 +256,7 @@ impl Configurable for GeneralOptions {
         Ok(true)
     }
 
-    fn set_option_inner(&self, option: SetSocketOption) -> AxResult<bool> {
+    fn set_option_inner(&self, option: SetSocketOption) -> NetResult<bool> {
         use SetSocketOption as O;
 
         match option {
@@ -331,7 +284,7 @@ impl Configurable for GeneralOptions {
                 if let Some(id) = *interface_id
                     && interface_by_id(id).is_none()
                 {
-                    return Err(AxError::NoSuchDevice);
+                    return Err(NetError::NoSuchDevice);
                 }
                 self.set_device_binding(DeviceBinding {
                     bound_if: *interface_id,
@@ -342,6 +295,9 @@ impl Configurable for GeneralOptions {
             }
             O::IpTos(tos) => {
                 self.set_ip_tos(*tos);
+            }
+            O::IpMtuDiscover(mode) => {
+                self.set_ip_mtu_discover(*mode)?;
             }
             O::RecvTos(enabled) => {
                 self.set_recv_tos(*enabled);
@@ -354,7 +310,7 @@ impl Configurable for GeneralOptions {
             }
             O::SocketType(_) | O::SocketProtocol(_) | O::SocketDomain(_) => {
                 // Read-only options
-                return Err(AxError::from(LinuxError::ENOPROTOOPT));
+                return Err(NetError::ProtocolOptionUnsupported);
             }
             _ => return Ok(false),
         }
@@ -365,26 +321,6 @@ impl Configurable for GeneralOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn device_binding_round_trips_none_and_some_interface() {
-        let options = GeneralOptions::new(1, 2, 6);
-        assert_eq!(options.device_binding(), DeviceBinding { bound_if: None });
-
-        let interface_id = InterfaceId::new(7);
-        options.set_device_binding(DeviceBinding {
-            bound_if: Some(interface_id),
-        });
-        assert_eq!(
-            options.device_binding(),
-            DeviceBinding {
-                bound_if: Some(interface_id)
-            }
-        );
-
-        options.set_device_binding(DeviceBinding { bound_if: None });
-        assert_eq!(options.device_binding(), DeviceBinding { bound_if: None });
-    }
 
     #[test]
     fn reuse_address_and_reuse_port_are_independent_flags() {
@@ -421,11 +357,11 @@ mod tests {
 
         assert_eq!(
             options.set_priority(7).unwrap_err(),
-            AxError::from(LinuxError::EPERM)
+            NetError::OperationNotPermitted
         );
         assert_eq!(
             options.set_priority(-1).unwrap_err(),
-            AxError::from(LinuxError::EPERM)
+            NetError::OperationNotPermitted
         );
         assert_eq!(options.priority(), 6);
     }

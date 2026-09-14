@@ -31,13 +31,26 @@ pub unsafe extern "C" fn kernel_entry(_fdt_addr: usize) {
         asm_sym_addr!(x8, "{fdt}"),
         "str  x9, [x8]",
 
+        "b {enter_with_boot_state}",
+        fdt = sym crate::fdt::FDT_ADDR,
+        enter_with_boot_state = sym enter_with_boot_state,
+
+    )
+}
+
+/// Enters the common exception-level setup after preserving the boot state.
+///
+/// # Safety
+///
+/// The caller must initialize BSS and preserve either the direct-boot FDT or
+/// the UEFI service state before entering this function.
+#[unsafe(naked)]
+pub(super) unsafe extern "C" fn enter_with_boot_state() -> ! {
+    naked_asm!(
         asm_sym_addr!(x8, "__cpu0_stack_top"),
         "mov sp, x8",
-
-        "bl {switch_to_elx}",
-        fdt = sym crate::fdt::FDT_ADDR,
+        "b {switch_to_elx}",
         switch_to_elx = sym switch_to_elx,
-
     )
 }
 
@@ -58,21 +71,6 @@ pub extern "C" fn el_entry(timer_mode_raw: usize) -> ! {
     println!("EL: {}", CurrentEL.read(CurrentEL::EL));
 
     crate::arch::paging::enable_mmu()
-}
-
-#[inline(always)]
-pub(crate) fn eret_with_timer_mode_arg(timer_mode: ArchTimerMode) -> ! {
-    let timer_mode = timer_mode as usize;
-
-    unsafe {
-        core::arch::asm!(
-            "mov x0, {timer_mode}",
-            "isb",
-            "eret",
-            timer_mode = in(reg) timer_mode,
-            options(noreturn, nostack),
-        );
-    }
 }
 
 pub(crate) fn mmu_entry() -> ! {
@@ -104,6 +102,7 @@ pub(crate) unsafe extern "C" fn _secondary_entry(_arg: usize) -> ! {
 pub(crate) unsafe extern "C" fn secondary_el_entry(_cpu_meta_paddr: usize) -> ! {
     naked_asm!(
         "bl {init_mmu}",
+        "mov x20, x0",
         "ldr x8, [x20, {stack_top_virt_offset}]",
         "mov sp, x8",
         "ldr x8, [x20, {entry_offset}]",

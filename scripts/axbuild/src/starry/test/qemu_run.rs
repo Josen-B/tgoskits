@@ -17,7 +17,7 @@ use super::{
     start_qemu_case_host_http_server,
 };
 use crate::{
-    build::{append_encoded_rustflags, env_truthy},
+    build::{append_cargo_rustflags, env_truthy},
     context::{ResolvedStarryRequest, SnapshotPersistence},
     starry::{Starry, board, build, rootfs},
     test::{case, qemu as qemu_test, timing},
@@ -226,7 +226,6 @@ impl Starry {
                     ("phase", "prepare-qemu-config".to_string()),
                 ],
             );
-            qemu_test::apply_dynamic_platform_qemu_boot(&mut qemu, cargo);
             Self::rewrite_qemu_case_managed_rootfs_paths(self.app.workspace_root(), &mut qemu)?;
             let rootfs_path =
                 Self::qemu_case_rootfs_path(self.app.workspace_root(), &qemu, default_rootfs_path)?;
@@ -358,7 +357,7 @@ impl Starry {
         let request = Self::request_for_qemu_case_build_config(request, build_config_path);
         let mut cargo = build::load_cargo_config(&request)?;
         if env_truthy(&cargo.env, "AXTEST") {
-            append_encoded_rustflags(&mut cargo, AXTEST_RUSTFLAGS);
+            append_cargo_rustflags(&mut cargo, AXTEST_RUSTFLAGS);
         }
         if crate::support::axtest_coverage::enabled(&cargo) {
             crate::support::axtest_coverage::prepare_cargo(&mut cargo);
@@ -391,7 +390,7 @@ impl Starry {
     ) -> anyhow::Result<()> {
         let case = &prepared_case.case;
         let mut qemu = prepared_case.qemu.clone();
-        case::apply_grouped_qemu_config(&mut qemu, case, &asset_config.grouped_runner);
+        case::apply_grouped_qemu_config(&mut qemu, case, &asset_config.grouped_execution);
 
         qemu_test::apply_smp_qemu_arg(&mut qemu, Some(prepared_case.requirements.smp));
         qemu_test::apply_timeout_scale(&mut qemu);
@@ -427,6 +426,7 @@ impl Starry {
                 suppress_terminal_raw_blocks: false,
                 write_log_during_capture: keep_qemu_log,
                 captured_blocks: Arc::new(std::sync::Mutex::new(Vec::new())),
+                success_output: None,
             })
         } else {
             None
@@ -495,10 +495,12 @@ impl Starry {
         rootfs::patch_rootfs(
             &mut qemu,
             &prepared_assets.rootfs_path,
-            rootfs::RootfsPatchMode::EnsureDiskBootNet,
-        );
+            rootfs::RootfsPatchOptions {
+                mode: rootfs::RootfsPatchMode::EnsureDiskBootNet,
+                write_policy: rootfs::RootfsWritePolicy::Discard,
+            },
+        )?;
         timing_stage.finish();
-        qemu.args.extend(prepared_assets.extra_qemu_args.clone());
         let timing_stage = timing::TimingStage::new(
             "qemu-case",
             [
@@ -506,7 +508,6 @@ impl Starry {
                 ("phase", "apply-dynamic-boot".to_string()),
             ],
         );
-        qemu_test::apply_dynamic_platform_qemu_boot(&mut qemu, cargo);
         timing_stage.finish();
         let timing_stage = timing::TimingStage::new(
             "qemu-case",

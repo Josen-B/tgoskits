@@ -24,7 +24,7 @@ impl<T: DmaPod> CoherentBox<T> {
     }
 
     pub fn dma_addr(&self) -> DmaAddr {
-        self.data.handle.dma_addr()
+        self.data.handle().dma_addr()
     }
 
     pub fn read_cpu(&self) -> T {
@@ -42,7 +42,7 @@ impl<T: DmaPod> CoherentBox<T> {
     }
 
     pub fn as_ptr(&self) -> NonNull<T> {
-        self.data.handle.as_ptr().cast::<T>()
+        self.data.handle().as_ptr().cast::<T>()
     }
 
     /// # Safety
@@ -80,7 +80,7 @@ impl<T: DmaPod> ContiguousBox<T> {
     }
 
     pub fn dma_addr(&self) -> DmaAddr {
-        self.data.handle.dma_addr()
+        self.data.handle().dma_addr()
     }
 
     pub fn read_cpu(&self) -> T {
@@ -97,39 +97,31 @@ impl<T: DmaPod> ContiguousBox<T> {
         self.write_cpu(value);
     }
 
-    pub fn sync_for_device_all(&self) {
+    pub fn prepare_for_device(&self) {
         self.data.sync_for_device(0, core::mem::size_of::<T>());
     }
 
-    pub fn sync_for_cpu_all(&self) {
+    pub fn complete_for_cpu(&self) {
         self.data.sync_for_cpu(0, core::mem::size_of::<T>());
-    }
-
-    pub fn prepare_for_device_all(&self) {
-        self.sync_for_device_all();
-    }
-
-    pub fn complete_for_cpu_all(&self) {
-        self.sync_for_cpu_all();
     }
 
     pub fn write_for_device(&mut self, value: T) {
         self.write_cpu(value);
-        self.prepare_for_device_all();
+        self.prepare_for_device();
     }
 
     pub fn modify_for_device(&mut self, f: impl FnOnce(&mut T)) {
         self.modify_cpu(f);
-        self.prepare_for_device_all();
+        self.prepare_for_device();
     }
 
     pub fn read_from_device(&self) -> T {
-        self.complete_for_cpu_all();
+        self.complete_for_cpu();
         self.read_cpu()
     }
 
     pub fn as_ptr(&self) -> NonNull<T> {
-        self.data.handle.as_ptr().cast::<T>()
+        self.data.handle().as_ptr().cast::<T>()
     }
 
     /// # Safety

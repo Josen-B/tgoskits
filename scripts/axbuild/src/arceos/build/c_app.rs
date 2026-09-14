@@ -12,11 +12,14 @@ pub(crate) fn load_arceos_build_file(path: &Path) -> anyhow::Result<ArceosBuildF
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read ArceOS build config {}", path.display()))?;
     build::reject_removed_std_field(path, &content)?;
-    toml::from_str(&content)
-        .with_context(|| format!("failed to parse ArceOS build config {}", path.display()))
+    let config: ArceosBuildFile = toml::from_str(&content)
+        .with_context(|| format!("failed to parse ArceOS build config {}", path.display()))?;
+    config.config.validate_runtime()?;
+    Ok(config)
 }
 
 pub(crate) fn load_arceos_build_config(path: &Path) -> anyhow::Result<ArceosBuildConfig> {
+    build::ensure_build_info(path, ArceosBuildConfig::default_config)?;
     Ok(load_arceos_build_file(path)?.config)
 }
 
@@ -24,7 +27,7 @@ pub(crate) fn load_arceos_build_mode(path: &Path) -> anyhow::Result<ArceosBuildM
     let config = load_arceos_build_config(path)?;
     match config.app_c {
         Some(app_c) => super::resolve_app_c_mode(path, &app_c),
-        None => Ok(ArceosBuildMode::RustStd),
+        None => Ok(ArceosBuildMode::Rust),
     }
 }
 

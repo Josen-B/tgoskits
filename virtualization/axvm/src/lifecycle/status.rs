@@ -1,5 +1,4 @@
-use alloc::string::String;
-use core::fmt;
+use std::{fmt, string::String};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -11,7 +10,6 @@ pub enum StopReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
-    Uninit,
     Ready,
     Running,
     Pausing,
@@ -26,7 +24,6 @@ pub enum VmStatus {
 impl VmStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
-            VmStatus::Uninit => "uninit",
             VmStatus::Ready => "ready",
             VmStatus::Running => "running",
             VmStatus::Pausing => "pausing",
@@ -45,7 +42,6 @@ impl VmStatus {
 
     pub const fn as_str_with_icon(self) -> &'static str {
         match self {
-            VmStatus::Uninit => "[..] uninit",
             VmStatus::Ready => "[OK] ready",
             VmStatus::Running => "[RUN] running",
             VmStatus::Pausing => "[..] pausing",

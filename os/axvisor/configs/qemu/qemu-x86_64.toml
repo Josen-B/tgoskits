@@ -9,13 +9,12 @@ args = [
   "-accel",
   "kvm",
   "-device",
-  "virtio-blk-pci,drive=disk0",
+  "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive",
   "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
   "-m",
   "512M",
 ]
 fail_regex = []
-success_regex = []
-to_bin = false
-uefi = false
+to_bin = true
+uefi = true

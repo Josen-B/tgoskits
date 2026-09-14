@@ -40,12 +40,34 @@ impl MsiMessage {
 pub struct MsiVector {
     pub index: MsiVectorIndex,
     pub event: MsiEventId,
+    /// IRQ registered by the device driver.
     pub irq: IrqId,
+    /// IRQ owned by the parent MSI interrupt controller.
+    pub parent_irq: IrqId,
 }
 
 impl MsiVector {
     pub const fn new(index: MsiVectorIndex, event: MsiEventId, irq: IrqId) -> Self {
-        Self { index, event, irq }
+        Self {
+            index,
+            event,
+            irq,
+            parent_irq: irq,
+        }
+    }
+
+    pub const fn with_parent(
+        index: MsiVectorIndex,
+        event: MsiEventId,
+        irq: IrqId,
+        parent_irq: IrqId,
+    ) -> Self {
+        Self {
+            index,
+            event,
+            irq,
+            parent_irq,
+        }
     }
 }
 
@@ -286,6 +308,10 @@ mod tests {
         assert_eq!(allocation.device(), MsiDeviceId(0x1234));
         assert_eq!(allocation.vectors().len(), 2);
         assert_eq!(allocation.vectors()[1].index, MsiVectorIndex(1));
+        assert_eq!(
+            allocation.vectors()[1].parent_irq,
+            allocation.vectors()[1].irq
+        );
         assert_eq!(
             msi.compose_message(&allocation.vectors()[1]).unwrap(),
             MsiMessage::new(0x0808_0000, 33)

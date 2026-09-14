@@ -1,17 +1,16 @@
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::any::Any;
 
-use ax_errno::LinuxError;
+use ax_cgroup::{CgroupError, CgroupNode};
 use axfs_ng_vfs::{
-    DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, Filesystem, FilesystemOps, Metadata,
-    MetadataUpdate, NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult,
-    WeakDirEntry,
+    DirEntry, DirEntrySink, DirNode, DirNodeOps, DirectoryCursor, FileNode, Filesystem,
+    FilesystemOps, Location, Metadata, MetadataUpdate, NodeOps, NodePermission, NodeType,
+    Reference, RenameOptions, VfsError, VfsResult, WeakDirEntry,
     path::{DOT, DOTDOT},
 };
 use inherit_methods_macro::inherit_methods;
 
 use super::{DirMaker, DirectRwFsFileOps, SimpleFs, SimpleFsNode, SpecialFsFile};
-use crate::cgroup::{CgroupId, root_id};
 
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 
@@ -20,6 +19,10 @@ enum CgroupFileKind {
     Controllers,
     Procs,
     SubtreeControl,
+    PidsMax,
+    PidsCurrent,
+    PidsPeak,
+    PidsEvents,
 }
 
 impl CgroupFileKind {
@@ -28,6 +31,10 @@ impl CgroupFileKind {
             "cgroup.controllers" => Some(Self::Controllers),
             "cgroup.procs" => Some(Self::Procs),
             "cgroup.subtree_control" => Some(Self::SubtreeControl),
+            "pids.max" => Some(Self::PidsMax),
+            "pids.current" => Some(Self::PidsCurrent),
+            "pids.peak" => Some(Self::PidsPeak),
+            "pids.events" => Some(Self::PidsEvents),
             _ => None,
         }
     }
@@ -37,39 +44,65 @@ impl CgroupFileKind {
             Self::Controllers => "cgroup.controllers",
             Self::Procs => "cgroup.procs",
             Self::SubtreeControl => "cgroup.subtree_control",
+            Self::PidsMax => "pids.max",
+            Self::PidsCurrent => "pids.current",
+            Self::PidsPeak => "pids.peak",
+            Self::PidsEvents => "pids.events",
         }
     }
 
     fn permission(self) -> NodePermission {
         let mode = match self {
-            Self::Controllers => 0o444,
-            Self::Procs | Self::SubtreeControl => 0o644,
+            Self::Controllers | Self::PidsCurrent | Self::PidsPeak | Self::PidsEvents => 0o444,
+            Self::Procs | Self::SubtreeControl | Self::PidsMax => 0o644,
         };
         NodePermission::from_bits_truncate(mode)
     }
+
+    fn is_available(self, cgroup: &CgroupNode) -> bool {
+        !matches!(
+            self,
+            Self::PidsMax | Self::PidsCurrent | Self::PidsPeak | Self::PidsEvents
+        ) || cgroup.has_pids_interface()
+    }
 }
 
-const CGROUP_FILES: [CgroupFileKind; 3] = [
+const CGROUP_FILES: [CgroupFileKind; 7] = [
     CgroupFileKind::Controllers,
     CgroupFileKind::Procs,
     CgroupFileKind::SubtreeControl,
+    CgroupFileKind::PidsMax,
+    CgroupFileKind::PidsCurrent,
+    CgroupFileKind::PidsPeak,
+    CgroupFileKind::PidsEvents,
 ];
 
 struct CgroupFile {
-    id: CgroupId,
+    cgroup: Arc<CgroupNode>,
     kind: CgroupFileKind,
 }
 
 impl CgroupFile {
     fn read_content(&self) -> VfsResult<Vec<u8>> {
         Ok(match self.kind {
-            CgroupFileKind::Controllers => crate::cgroup::controllers_text(self.id)?
+            CgroupFileKind::Controllers => crate::cgroup::controllers_text(&self.cgroup)
                 .as_bytes()
                 .to_vec(),
-            CgroupFileKind::Procs => crate::cgroup::procs_text(self.id)?.into_bytes(),
-            CgroupFileKind::SubtreeControl => crate::cgroup::subtree_control_text(self.id)?
+            CgroupFileKind::Procs => {
+                let current = crate::task::current_user_task();
+                crate::cgroup::procs_text(&current, &self.cgroup).into_bytes()
+            }
+            CgroupFileKind::SubtreeControl => crate::cgroup::subtree_control_text(&self.cgroup)
                 .as_bytes()
                 .to_vec(),
+            CgroupFileKind::PidsMax => crate::cgroup::pids_max_text(&self.cgroup)?.into_bytes(),
+            CgroupFileKind::PidsCurrent => {
+                crate::cgroup::pids_current_text(&self.cgroup)?.into_bytes()
+            }
+            CgroupFileKind::PidsPeak => crate::cgroup::pids_peak_text(&self.cgroup)?.into_bytes(),
+            CgroupFileKind::PidsEvents => {
+                crate::cgroup::pids_events_text(&self.cgroup)?.into_bytes()
+            }
         })
     }
 }
@@ -91,11 +124,19 @@ impl DirectRwFsFileOps for CgroupFile {
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
         match self.kind {
             CgroupFileKind::Controllers => {
-                crate::cgroup::ensure_node_exists(self.id)?;
-                return Err(VfsError::from(LinuxError::EACCES));
+                return Err(VfsError::PermissionDenied);
             }
-            CgroupFileKind::Procs => crate::cgroup::write_procs(self.id, buf)?,
-            CgroupFileKind::SubtreeControl => crate::cgroup::write_subtree_control(self.id, buf)?,
+            CgroupFileKind::Procs => {
+                let current = crate::task::current_user_task();
+                crate::cgroup::write_procs(&current, self.cgroup.clone(), buf)?
+            }
+            CgroupFileKind::SubtreeControl => {
+                crate::cgroup::write_subtree_control(&self.cgroup, buf)?
+            }
+            CgroupFileKind::PidsMax => crate::cgroup::write_pids_max(&self.cgroup, buf)?,
+            CgroupFileKind::PidsCurrent | CgroupFileKind::PidsPeak | CgroupFileKind::PidsEvents => {
+                return Err(VfsError::OperationNotPermitted);
+            }
         }
         Ok(buf.len())
     }
@@ -105,12 +146,11 @@ struct CgroupDir {
     node: SimpleFsNode,
     this: WeakDirEntry,
     fs: Arc<SimpleFs>,
-    id: CgroupId,
+    cgroup: Arc<CgroupNode>,
 }
 
 impl CgroupDir {
-    fn new(fs: Arc<SimpleFs>, id: CgroupId, this: WeakDirEntry) -> Arc<Self> {
-        debug_assert!(crate::cgroup::path(id).is_ok());
+    fn new(fs: Arc<SimpleFs>, cgroup: Arc<CgroupNode>, this: WeakDirEntry) -> Arc<Self> {
         Arc::new(Self {
             node: SimpleFsNode::new(
                 fs.clone(),
@@ -119,12 +159,12 @@ impl CgroupDir {
             ),
             this,
             fs,
-            id,
+            cgroup,
         })
     }
 
-    fn new_maker(fs: Arc<SimpleFs>, id: CgroupId) -> DirMaker {
-        Arc::new(move |this| Self::new(fs.clone(), id, this))
+    fn new_maker(fs: Arc<SimpleFs>, cgroup: Arc<CgroupNode>) -> DirMaker {
+        Arc::new(move |this| Self::new(fs.clone(), cgroup.clone(), this))
     }
 
     fn this_entry(&self) -> VfsResult<DirEntry> {
@@ -132,9 +172,15 @@ impl CgroupDir {
     }
 
     fn file_entry(&self, kind: CgroupFileKind) -> VfsResult<DirEntry> {
+        if !kind.is_available(&self.cgroup) {
+            return Err(VfsError::NotFound);
+        }
         let file = SpecialFsFile::new_regular_with_perm(
             self.fs.clone(),
-            CgroupFile { id: self.id, kind },
+            CgroupFile {
+                cgroup: self.cgroup.clone(),
+                kind,
+            },
             kind.permission(),
         );
         let reference = Reference::new(self.this.upgrade(), kind.name().to_string());
@@ -145,8 +191,8 @@ impl CgroupDir {
         ))
     }
 
-    fn child_dir_entry(&self, name: &str, id: CgroupId) -> DirEntry {
-        let maker = Self::new_maker(self.fs.clone(), id);
+    fn child_dir_entry(&self, name: &str, cgroup: Arc<CgroupNode>) -> DirEntry {
+        let maker = Self::new_maker(self.fs.clone(), cgroup);
         let reference = Reference::new(self.this.upgrade(), name.to_string());
         DirEntry::new_dir(|this| DirNode::new(maker(this)), reference)
     }
@@ -170,19 +216,21 @@ impl NodeOps for CgroupDir {
 }
 
 impl DirNodeOps for CgroupDir {
-    fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+    fn read_dir(&self, cursor: DirectoryCursor, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
         let mut names = Vec::new();
         names.push(DOT.to_string());
         names.push(DOTDOT.to_string());
         for kind in CGROUP_FILES {
-            names.push(kind.name().to_string());
+            if kind.is_available(&self.cgroup) {
+                names.push(kind.name().to_string());
+            }
         }
-        names.extend(crate::cgroup::child_names(self.id)?);
+        names.extend(self.cgroup.child_names());
 
         let this_entry = self.this_entry()?;
         let this_dir = this_entry.as_dir()?;
         let mut count = 0;
-        for (i, name) in names.iter().enumerate().skip(offset as usize) {
+        for (i, name) in names.iter().enumerate().skip(cursor.offset() as usize) {
             let metadata = match name.as_str() {
                 DOT => this_entry.metadata(),
                 DOTDOT => this_entry
@@ -190,7 +238,12 @@ impl DirNodeOps for CgroupDir {
                     .map_or_else(|| this_entry.metadata(), |parent| parent.metadata()),
                 other => this_dir.lookup(other)?.metadata(),
             }?;
-            if !sink.accept(name, metadata.inode, metadata.node_type, i as u64 + 1) {
+            if !sink.accept(
+                name.as_bytes(),
+                metadata.inode,
+                metadata.node_type,
+                DirectoryCursor::new(i as u64 + 1),
+            ) {
                 break;
             }
             count += 1;
@@ -203,8 +256,11 @@ impl DirNodeOps for CgroupDir {
             return self.file_entry(kind);
         }
 
-        let child_id = crate::cgroup::lookup_child(self.id, name)?;
-        Ok(self.child_dir_entry(name, child_id))
+        let child = self
+            .cgroup
+            .lookup_child(name)
+            .map_err(cgroup_error_to_vfs_error)?;
+        Ok(self.child_dir_entry(name, child))
     }
 
     fn is_cacheable(&self) -> bool {
@@ -212,7 +268,7 @@ impl DirNodeOps for CgroupDir {
     }
 
     fn has_children(&self) -> VfsResult<bool> {
-        Ok(!crate::cgroup::child_names(self.id)?.is_empty())
+        Ok(!self.cgroup.child_names().is_empty())
     }
 
     fn create(
@@ -230,8 +286,22 @@ impl DirNodeOps for CgroupDir {
             return Err(VfsError::OperationNotPermitted);
         }
 
-        let child_id = crate::cgroup::create_child(self.id, name)?;
-        Ok(self.child_dir_entry(name, child_id))
+        let child = self
+            .cgroup
+            .create_child(name)
+            .map_err(cgroup_error_to_vfs_error)?;
+        Ok(self.child_dir_entry(name, child))
+    }
+
+    fn create_symlink(
+        &self,
+        _name: &str,
+        _target: &str,
+        _permission: NodePermission,
+        _uid: u32,
+        _gid: u32,
+    ) -> VfsResult<DirEntry> {
+        Err(VfsError::OperationNotPermitted)
     }
 
     fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
@@ -242,19 +312,46 @@ impl DirNodeOps for CgroupDir {
         if crate::cgroup::is_interface_file_name(name) {
             return Err(VfsError::OperationNotPermitted);
         }
-        crate::cgroup::remove_child(self.id, name)
+        self.cgroup
+            .remove_child(name)
+            .map_err(cgroup_error_to_vfs_error)
     }
 
-    fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+    fn rename(
+        &self,
+        _src_name: &str,
+        _dst_dir: &DirNode,
+        _dst_name: &str,
+        _options: RenameOptions,
+    ) -> VfsResult<()> {
         Err(VfsError::OperationNotPermitted)
     }
 }
 
-/// Creates a cgroup v2 pseudo filesystem backed by the global cgroup hierarchy.
-pub(crate) fn new_cgroup2fs() -> Filesystem {
-    SimpleFs::new_with("cgroup2".into(), CGROUP2_SUPER_MAGIC, cgroup2fs_builder)
+fn cgroup_error_to_vfs_error(error: CgroupError) -> VfsError {
+    match error {
+        CgroupError::NotInitialized | CgroupError::InvalidInput => VfsError::InvalidInput,
+        CgroupError::NotFound => VfsError::NotFound,
+        CgroupError::AlreadyExists => VfsError::AlreadyExists,
+        CgroupError::ResourceBusy => VfsError::ResourceBusy,
+        CgroupError::LimitExceeded => VfsError::WouldBlock,
+        CgroupError::NoSuchProcess => VfsError::NotFound,
+        CgroupError::DirectoryNotEmpty => VfsError::DirectoryNotEmpty,
+    }
 }
 
-fn cgroup2fs_builder(fs: Arc<SimpleFs>) -> DirMaker {
-    CgroupDir::new_maker(fs, root_id())
+/// Create a cgroup2 filesystem rooted at a stable namespace snapshot.
+pub(crate) fn new_cgroup2fs(root: Arc<CgroupNode>) -> Filesystem {
+    SimpleFs::new_with("cgroup2".into(), CGROUP2_SUPER_MAGIC, move |fs| {
+        CgroupDir::new_maker(fs, root)
+    })
+}
+
+/// Return the cgroup node represented by an open cgroup2 directory.
+pub(crate) fn node_from_location(location: &Location) -> Option<Arc<CgroupNode>> {
+    location
+        .entry()
+        .downcast::<CgroupDir>()
+        .ok()
+        .map(|directory| directory.cgroup.clone())
 }

@@ -7,7 +7,7 @@ sidebar_label: "命令索引"
 
 所有命令由 `scripts/axbuild` 实现，通过 `cargo xtask` 统一入口调用。本文是**完整的命令参考**：列出每个 `cargo xtask` 顶层命令及其全部子命令、参数和用法示例，并提供到详细原理文档的链接。
 
-## 调用方式与别名
+## 1. 调用方式
 
 默认调用方式为 `cargo xtask <cmd>`，经 `tg-xtask` 包转发到 `axbuild::run()`：
 
@@ -31,7 +31,7 @@ cargo xtask arceos qemu --package arceos-httpserver
 cargo arceos qemu --package arceos-httpserver   # 同上
 ```
 
-## 顶层命令一览
+## 2. 顶层命令
 
 `cargo xtask` 的顶层命令（与 `tg-xtask --help` 输出一致），按职能分组：
 
@@ -39,26 +39,28 @@ cargo arceos qemu --package arceos-httpserver   # 同上
 |------|------|----------|
 | **代码质量检查** | | |
 | `cargo xtask test` | workspace std 白名单测试 | [Std 白名单测试](./test) |
+| `cargo xtask ktest` | 在 QEMU 或板卡运行 harness=false 内核 axtest | [内核测试](./ktest) |
 | `cargo xtask clippy` | workspace clippy（feature × target 矩阵） | [Clippy 检查](./clippy) |
 | `cargo xtask sync-lint` | 可疑 `Relaxed` 原子序检查 | [Sync Lint](./sync_lint) |
-| `cargo xtask spin-lint` | vendored `spin` 迁移守护 | [Spin Lint](./spin_lint) |
 | **辅助工具** | | |
 | `cargo xtask board` | 远程板卡管理（ls/connect/config） | [板卡管理](./board) |
 | `cargo xtask backtrace` | host 端 backtrace 符号化 | [Backtrace 符号化](./backtrace) |
 | `cargo xtask image` | TGOS rootfs/guest 镜像管理 | [镜像管理](./image) |
+| `cargo xtask ovmf` | 获取经校验的 OVMF CODE/VARS 路径 | 本节 |
 | `cargo xtask axloader` | UEFI bootloader 构建与 HTTP smoke 测试 | [Axloader](./axloader) |
+| `cargo xtask agent-review-bench` | 历史拉取请求快照的离线评审基准 | [评审基准](./agent-review-bench) |
 | **OS 子系统** | | |
 | `cargo xtask arceos` | ArceOS 构建/运行/测试 | [ArceOS](./arceos/overview) |
 | `cargo xtask starry` | StarryOS 构建/运行/测试/app/perf/kmod | [StarryOS](./starry/overview) |
 | `cargo xtask axvisor` | Axvisor 构建/运行/测试（含 `test uboot`） | [Axvisor](./axvisor/overview) |
 
-通用的参数解析、Snapshot、Build Info 和动态平台构建约定见 [参数与配置](./configuration)；CI 自动化见 [自动 CI 测试](./ci)。
+通用的参数解析、Snapshot、Build Info、feature 校验和 QEMU `to_bin` 契约见 [参数与配置](./configuration)；三套系统共享的 QEMU/板卡测试编排（用例发现、build wrapper、pipeline 类型、rootfs 缓存、grouped runner）见 [测试基础设施](./test_infra)；CI 自动化见 [自动 CI 测试](./ci)。
 
 ---
 
-## 代码质量检查
+## 3. 质量检查
 
-### `test`
+### 3.1 标准测试
 
 对 `scripts/test/std_crates.csv` 白名单中的每个 crate 执行 `cargo test -p <package>`。无参数。
 
@@ -68,7 +70,19 @@ cargo xtask test
 
 详见 [Std 白名单测试](./test)。
 
-### `clippy`
+### 3.2 内核测试
+
+构建并运行确实依赖 QEMU/板卡的 `harness = false` Cargo 集成 axtest target；宿主可运行的测试应使用普通 `#[test]` 和 `cargo xtask test`。无参数时从 Cargo metadata 选择所有直接声明 workspace axtest dev-dependency 的 package；`--workspace`、可重复 `-p/--package`、`--exclude`、`--test` 与构建参数采用 Cargo 风格。`--arch` 会过滤到支持该架构的执行单元，每个 test bin 独立构建并启动一次 QEMU。
+
+```bash
+cargo xtask ktest qemu --workspace --arch x86_64
+cargo xtask ktest qemu -p starry-kernel --test axtest_kernel --arch x86_64
+cargo xtask ktest board -p arceos-axtest-sg2002-usb-msc --test axtest -b aka-00-sg2002
+```
+
+详见 [内核测试](./ktest)。
+
+### 3.3 Clippy 检查
 
 对 workspace 包按 feature × target 矩阵执行 clippy。三种模式互斥：`--all` 或无参数 = 全量；`--package` = 显式；`--since` = 增量。
 
@@ -86,7 +100,7 @@ cargo xtask clippy --since origin/main
 
 详见 [Clippy 检查](./clippy)。
 
-### `sync-lint`
+### 3.4 并发检查
 
 用 `syn` 识别可疑的 `Relaxed` 原子序同步模式。
 
@@ -101,33 +115,21 @@ cargo xtask sync-lint --since origin/main # 增量
 
 详见 [Sync Lint](./sync_lint)。
 
-### `spin-lint`
+## 4. 工程工具
 
-守护 vendored `spin` 迁移结果，禁止外部 `spin` 与 `spin::RwLock`。无参数。
-
-```bash
-cargo xtask spin-lint
-```
-
-详见 [Spin Lint](./spin_lint)。
-
----
-
-## 辅助工具
-
-### `board`
+### 4.1 板卡管理
 
 远程板卡管理，通过 ostool-server 交互。
 
 | 子命令 | 用法 | 说明 |
 |--------|------|------|
 | `ls` | `board ls [--server <H>] [--port <P>]` | 列出可用板卡类型 |
-| `connect` | `board connect -b <TYPE> [--server <H>] [--port <P>]` | 分配板卡并连接串口 |
+| `connect` | `board connect -b <TYPE> [--server <H>] [--port <P>] [--session-file <REL=LOCAL>...]` | 分配板卡并连接串口，可上传一次性会话文件 |
 | `config` | `board config` | 编辑板卡服务器配置 |
 
 详见 [板卡管理](./board)。
 
-### `backtrace symbolize`
+### 4.2 回溯符号化
 
 从日志中提取并符号化 `BACKTRACE_BEGIN/BT/BACKTRACE_END` 块。
 
@@ -149,22 +151,35 @@ cargo xtask backtrace symbolize --elf target/x86_64/debug/arceos-httpserver --lo
 
 详见 [Backtrace 符号化](./backtrace)。
 
-### `image`
+### 4.3 镜像管理
 
-TGOS rootfs/guest 镜像管理。**全局选项**（所有子命令可用）：`-S/--local-storage <PATH>`、`-R/--registry <URL>`、`-N/--no-auto-sync`、`--auto-sync-threshold <SECS>`
+TGOS rootfs/guest 镜像管理。**全局选项**（所有子命令可用）：`-R/--registry <URL>`、`-D/--download-dir <PATH>`、`-E/--extract-dir <PATH>`。
 
 | 子命令 | 用法 | 说明 |
 |--------|------|------|
 | `ls` | `image ls [-v] [PATTERN]` | 列出注册表镜像（`-v` 详情，`PATTERN` 正则过滤） |
-| `pull` | `image pull [<IMAGE>] [--arch <ARCH>] [-o <DIR>] [--no-extract]` | 拉取镜像并校验 SHA-256 |
+| `pull` | `image pull [<IMAGE>] [--arch <ARCH>] [--no-extract]` | 拉取镜像并校验 SHA-256 |
 | `resize` | `image resize <IMAGE> --size-mib <MIB> [-o <OUT>]` | 扩容 ext rootfs（不支持缩容） |
 | `check` | `image check <IMAGE> [--sha256 <HASH>]` | 输出并可选校验本地镜像 SHA-256 |
 
-`pull` 的 `<IMAGE>` 可选带 `:version`（如 `rootfs-riscv64-alpine.img:v0.0.6`）；省略时配合 `--arch` 拉取该架构默认 rootfs。
+`pull` 的 `<IMAGE>` 可选带 `:version`（如 `rootfs-riscv64-alpine.img:0.0.11`）；省略时配合 `--arch` 拉取该架构默认 rootfs。
 
 详见 [镜像管理](./image)。
 
-### `axloader`
+### 4.4 OVMF 固件
+
+通过 Ostool 的固定版本、镜像探测和 SHA-256 校验流程准备 OVMF，并在 stdout 输出一个
+仅包含 `code`、`vars` 路径的 JSON 对象：
+
+```bash
+cargo xtask ovmf --arch x86_64
+TGOS_OVMF_DIR=/path/to/cache cargo xtask ovmf --arch aarch64
+```
+
+`--arch` 支持 `x86_64`、`aarch64`、`riscv64`、`loongarch64` 和 `ia32`。默认缓存根目录为
+`$TMPDIR/ostool/ovmf`；`TGOS_OVMF_DIR` 只覆盖缓存根目录，不绕过版本选择和校验。
+
+### 4.5 UEFI 引导
 
 UEFI bootloader（axloader）构建与 HTTP smoke 测试。
 
@@ -175,9 +190,21 @@ UEFI bootloader（axloader）构建与 HTTP smoke 测试。
 
 详见 [Axloader](./axloader)。
 
+### 4.6 评审基准
+
+离线回放 `scripts/agent-review-bench/cases/*.toml` 中登记的历史拉取请求快照，并对评审问题评分。该命令用于维护评审基准，不参与日常构建：
+
+```bash
+cargo xtask agent-review-bench list
+cargo xtask agent-review-bench check
+cargo xtask agent-review-bench run --case <id> --agent codex --min-recall 100
+```
+
+详见 [评审基准](./agent-review-bench)。
+
 ---
 
-## ArceOS
+## 5. ArceOS 命令
 
 `cargo xtask arceos` 的全部子命令。详细原理见 [ArceOS 概述](./arceos/overview)、[构建](./arceos/build)、[运行](./arceos/runtime)、[测试](./arceos/test)。
 
@@ -218,17 +245,17 @@ UEFI bootloader（axloader）构建与 HTTP smoke 测试。
 | `test qemu` | `[--arch \| -t/--target \| --list] [-g/--test-group <G>] [-c/--test-case <C>] [--no-symbolize] [--keep-qemu-log]`（三选一） |
 | `test board` | `[-c/--test-case <C>] [--board <B>] [-b/--board-type <T>] [--server <H>] [--port <P>] [--list]` |
 
-动态平台加载固定启用，Build Info 中不再提供平台选择开关。旧 `plat_dyn` 字段会被拒绝。
+ArceOS Build Config 通过 `features`、`log`、`max_cpu_num` 与 `[env]` 描述构建能力；`BuildInfo::validate_features()` 验证输入，构建命令输出 ELF，QEMU TOML 的 `to_bin` 决定运行阶段是否准备 BIN。
 
 ```bash
-cargo arceos build --package arceos-helloworld --arch aarch64
-cargo arceos qemu  --package arceos-httpserver
-cargo arceos test qemu --arch riscv64 -g rust -c task-yield
+cargo xtask arceos build --package arceos-helloworld --arch aarch64
+cargo xtask arceos qemu  --package arceos-httpserver
+cargo xtask arceos test qemu --arch riscv64 -g rust -c task-yield
 ```
 
 ---
 
-## StarryOS
+## 6. StarryOS 命令
 
 `cargo xtask starry` 的全部子命令，命令面最广。详细原理见 [StarryOS 概述](./starry/overview)、[构建](./starry/build)、[运行](./starry/runtime)、[测试](./starry/test)、[应用运行](./starry/app)、[性能剖析](./starry/perf)、[内核模块](./starry/kmod)、[rootfs 准备](./starry/rootfs)。
 
@@ -254,7 +281,7 @@ cargo arceos test qemu --arch riscv64 -g rust -c task-yield
 | `kmod build` | 编译内核模块 |
 | `rootfs` | 准备默认 managed rootfs |
 | `defconfig <BOARD>` / `config ls` | 板卡配置 |
-| `quick-start ...` | 旧版便捷入口（后续废弃） |
+| `quick-start ...` | 兼容便捷入口 |
 
 **各运行目标的额外参数**：
 
@@ -277,7 +304,7 @@ cargo arceos test qemu --arch riscv64 -g rust -c task-yield
 |--------|------|----------|
 | `app list` | `app list [--kind qemu\|board]` | — |
 | `app qemu` | `app qemu [--all] [-t <CASE>] [--cap <CAP>...] [--arch <A>] [--qemu-config <P>] [--debug]` | `--all` 跑全部；`--cap` 声明能力 |
-| `app board` | `app board -t <CASE> [--board-config <P>] [-b <T>] [--server <H>] [--port <P>] [--debug]` | `-t` 必需 |
+| `app board` | `app board -t <CASE> [--board-config <P>] [-b <T>] [--server <H>] [--port <P>] [--debug] [--linux-stage]` | `-t` 必需 |
 
 **性能剖析**（`perf`）：
 
@@ -306,9 +333,9 @@ cargo xtask starry perf [options]
 | `--flamegraph` | — | 即使 `--format` 非 SVG 也生成火焰图 |
 | `--flamegraph-kind` | `svg` | `svg`/`html`/`folded` |
 | `--full-stack` | — | 保留最深栈 |
-| `--callchain`（别名 `--perf-callchain`） | — | `leaf`/`fp`/`logical` |
-| `--debuginfo`（别名 `--perf-debuginfo`） | — | 添加 DWARF 调试信息 |
-| `--force-frame-pointers`（别名 `--perf-force-frame-pointers`） | — | 强制帧指针 |
+| `--perf-callchain`（别名 `--callchain`） | — | `leaf`/`fp`/`logical` |
+| `--perf-debuginfo` | — | 添加 DWARF 调试信息 |
+| `--perf-force-frame-pointers` | — | 强制帧指针 |
 | `--demangle` | — | 强制 Rust demangle |
 | `--no-truncate` | — | 火焰图保留极小帧 |
 | `--include-kernel-symbols` | 开 | 包含内核符号 |
@@ -341,20 +368,20 @@ cargo xtask starry kmod build [--arch <A>] [--target <T>] [--config <P>] [--smp 
 | `rootfs` | `rootfs [--arch <ARCH>]`（准备默认 managed rootfs） |
 | `defconfig` | `defconfig <BOARD>` |
 | `config ls` | `config ls` |
-| `quick-start` | `quick-start <platform> {build\|run}`（支持 `qemu-{aarch64,riscv64,loongarch64,x86_64}`/`orangepi-5-plus`/`licheerv-nano-sg2002`，后续废弃） |
+| `quick-start` | `quick-start <platform> {build\|run}`（支持 `qemu-{aarch64,riscv64,loongarch64,x86_64}`/`orangepi-5-plus`/`licheerv-nano-sg2002`） |
 
 ```bash
-cargo starry build
-cargo starry qemu
-cargo starry test qemu --arch riscv64
-cargo starry app qemu --all
-cargo starry perf --format Svg
-cargo starry kmod build --all
+cargo xtask starry build
+cargo xtask starry qemu
+cargo xtask starry test qemu --arch riscv64
+cargo xtask starry app qemu --all
+cargo xtask starry perf --format Svg
+cargo xtask starry kmod build --all
 ```
 
-### perf
+### 6.1 性能剖析
 
-`cargo starry perf` 构建 StarryOS 并通过 qperf 进行性能剖析，输出火焰图或 callchain 数据：
+`cargo xtask starry perf` 构建 StarryOS 并通过 qperf 进行性能剖析，输出火焰图或 callchain 数据：
 
 ```text
 cargo xtask starry perf [options]
@@ -381,9 +408,9 @@ cargo xtask starry perf [options]
 | `--flamegraph` | 即使 `--format` 非 SVG 也生成火焰图 |
 | `--flamegraph-kind` | 火焰图格式：`Svg`（默认）/`Html`/`Folded` |
 | `--full-stack` | 保留本构建可采集的最深栈 |
-| `--callchain`/`--perf-callchain` | qperf callchain 模式：`Leaf`（最快）/`Fp`（需帧指针）/`Logical` |
-| `--debuginfo`/`--perf-debuginfo` | 添加 DWARF 调试信息并保留符号 |
-| `--force-frame-pointers`/`--perf-force-frame-pointers` | 强制帧指针以支持 FP 解栈 |
+| `--perf-callchain`（别名 `--callchain`） | qperf callchain 模式：`Leaf`（最快）/`Fp`（需帧指针）/`Logical` |
+| `--perf-debuginfo` | 添加 DWARF 调试信息并保留符号 |
+| `--perf-force-frame-pointers` | 强制帧指针以支持 FP 解栈 |
 | `--demangle` | 在 qperf-analyzer 中强制 Rust demangle |
 | `--no-truncate` | 火焰图中保留极小帧（min width 设为 0） |
 | `--include-kernel-symbols` | 包含内核符号（StarryOS 默认开启） |
@@ -394,9 +421,9 @@ cargo xtask starry perf [options]
 | `--smp` | CPU 核数 |
 | `--debug` | debug 构建 |
 
-### kmod build
+### 6.2 内核模块
 
-`cargo starry kmod build` 编译 StarryOS 可加载内核模块（`.ko`）：
+`cargo xtask starry kmod build` 编译 StarryOS 可加载内核模块（`.ko`）：
 
 ```text
 cargo xtask starry kmod build [--arch <ARCH>] [--target <TARGET>] [--config <PATH>] [--smp <N>] [--debug] \
@@ -409,7 +436,7 @@ cargo xtask starry kmod build [--arch <ARCH>] [--target <TARGET>] [--config <PAT
 
 ---
 
-## Axvisor
+## 7. Axvisor 命令
 
 `cargo xtask axvisor` 的全部子命令。详细原理见 [Axvisor 概述](./axvisor/overview)、[构建](./axvisor/build)、[运行](./axvisor/runtime)、[测试](./axvisor/test)。
 
@@ -452,10 +479,10 @@ cargo xtask starry kmod build [--arch <ARCH>] [--target <TARGET>] [--config <PAT
 | `test uboot` | `-b/--board <BOARD> [--guest <GUEST>] [--uboot-config <P>]` | `--guest` 默认 `linux` |
 | `test board` | `[-g/--test-group <G>] [-c/--test-case <C>] [--board <B>] [-b/--board-type <T>] [--server <H>] [--port <P>] [--list]` | — |
 
-动态平台加载固定启用，旧平台选择 feature 会在构建配置读取和最终 Cargo 配置组装时过滤。
+Axvisor 的平台与 x86 虚拟化后端由 Build Config 的 feature 声明，QEMU CPU、UEFI 和设备参数由所选 TOML 定义。`vmx` 与 `svm` 分别对应 Intel 和 AMD 的虚拟化构建能力。
 
 ```bash
-cargo axvisor build
-cargo axvisor qemu --vmconfigs os/axvisor/configs/vm/aarch64-linux.toml
-cargo axvisor test uboot --board OrangePi-5-Plus
+cargo xtask axvisor build
+cargo xtask axvisor qemu --vmconfigs os/axvisor/configs/vms/qemu/aarch64/linux-smp1.toml
+cargo xtask axvisor test uboot --board OrangePi-5-Plus
 ```

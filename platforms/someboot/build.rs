@@ -6,6 +6,13 @@ mod linker;
 use linker::{LinkerArch, LinkerConfig, render_linker_script, source_paths};
 
 fn main() {
+    let kernel_tls = std::env::var_os("CARGO_FEATURE_TLS").is_some()
+        && std::env::var_os("CARGO_FEATURE_USPACE").is_none();
+    println!("cargo::rustc-check-cfg=cfg(kernel_tls)");
+    if kernel_tls {
+        println!("cargo::rustc-cfg=kernel_tls");
+    }
+
     println!("cargo::rustc-check-cfg=cfg(efi)");
     println!("cargo::rustc-check-cfg=cfg(page_size_4k)");
     println!("cargo::rustc-check-cfg=cfg(page_size_16k)");
@@ -30,6 +37,7 @@ fn main() {
         kernel_paddr: 0x200000,
         efi_image_base: 0,
         uspace,
+        kernel_tls,
         hv,
         page_size: 4096,
     };
@@ -77,6 +85,7 @@ struct Build {
     kernel_paddr: u64,
     efi_image_base: u64,
     uspace: bool,
+    kernel_tls: bool,
     hv: bool,
     page_size: usize,
 }
@@ -153,6 +162,7 @@ impl Build {
             LinkerConfig {
                 kernel_load_vaddr: self.kernel_vaddr,
                 kernel_load_paddr: self.kernel_paddr,
+                kernel_tls: self.kernel_tls,
             },
         );
         let ld_dst = self.out_dir.join(Self::LD_NAME);

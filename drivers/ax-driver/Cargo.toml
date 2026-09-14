@@ -1,6 +1,6 @@
 [package]
 name = "ax-driver"
-version = "0.11.2"
+version = "0.16.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -12,84 +12,83 @@ name = "ax_driver"
 
 [features]
 default = []
+host-test = ["ax-sync?/host-test"]
 
-irq = []
-pci = ["dep:ax-kspin", "dep:pcie", "dep:rdif-msi", "dep:rdif-pcie"]
+pci = ["dep:ax-sync", "dep:pcie", "dep:rdif-msi", "dep:rdif-pcie"]
 
-block = ["dep:ax-errno", "dep:ax-kspin", "dep:rdif-block"]
-net = ["dep:ax-kspin", "dep:rd-net"]
-display = ["dep:ax-errno", "dep:rdif-display"]
-input = ["dep:ax-errno", "dep:rdif-input"]
-vsock = ["dep:ax-errno", "dep:rdif-vsock"]
+block = ["dep:ax-sync", "dep:rdif-block"]
+net = ["dep:ax-sync", "dep:rd-net"]
+display = ["dep:rdif-display"]
+input = ["dep:rdif-input"]
+vsock = ["dep:rdif-vsock"]
 rtc = []
 pinctrl = ["dep:rdif-pinctrl", "rdif-pinctrl/fdt"]
 
 virtio-core = ["dep:ax-alloc", "dep:virtio-drivers", "virtio-drivers/alloc"]
 virtio = ["virtio-core"]
-virtio-blk = ["block", "virtio", "pci", "dep:ax-kernel-guard"]
-virtio-net = ["net", "virtio", "pci", "dep:ax-kernel-guard"]
+virtio-net = ["net", "virtio", "pci", "dep:ax-sync"]
 virtio-gpu = ["display", "virtio", "pci"]
 virtio-input = ["input", "virtio", "pci"]
-virtio-socket = ["vsock", "virtio", "pci"]
+virtio-socket = ["vsock", "virtio", "pci", "dep:bitflags", "dep:zerocopy"]
 
-ramdisk = ["block", "dep:ramdisk"]
-bcm2835-sdhci = ["block", "dep:bcm2835-sdhci"]
-ahci = ["block", "pci", "dep:simple-ahci"]
-ls2k1000-ahci = ["block", "dep:simple-ahci"]
-ls2k1000-gmac = ["net", "dep:ax-kspin"]
+ls2k1000-gmac = ["net", "dep:ax-sync"]
+ahci = ["block", "pci", "dep:ahci-driver"]
+ahci-fdt = ["block", "dep:ahci-driver"]
+ls2k1000-ahci = ["ahci-fdt"]
 nvme = ["block", "pci", "dep:nvme-driver"]
-cvsd = [
-    "block",
-    "dep:cv181x-sdhci",
-    "dep:sdmmc-protocol",
-    "sdmmc-protocol/rdif",
-]
-fxmac = ["net", "dep:ax-alloc", "dep:ax-crate-interface", "dep:fxmac_rs"]
+fxmac = ["net", "dep:fxmac_rs"]
 intel-net = ["net", "pci", "dep:eth-intel"]
 realtek-rtl8125 = ["net", "pci", "dep:realtek-rtl8125"]
 aic8800-wifi = [
     "net",
     "dep:aic8800",
-    "dep:sdhci-cv1800",
-    "dep:sdio-host",
+    "aic8800/rdif",
+    "dep:cv181x-sdhci",
+    "dep:pbkdf2",
+    "dep:sdhci-host",
+    "dep:sdmmc-host",
+    "dep:sha1",
 ]
 
 usb = ["dep:crab-usb"]
 rockchip-dwc-xhci = ["usb", "rockchip-soc", "rockchip-pm"]
 rockchip-ehci = ["usb", "rockchip-soc", "rockchip-pm"]
+sg2002-dwc2 = ["usb", "dep:sg200x-bsp"]
 xhci-mmio = ["usb"]
 xhci-pci = ["usb", "pci"]
-serial = [
-    "dep:ax-errno",
-    "dep:ax-kernel-guard",
-    "dep:ax-kspin",
-    "dep:rdif-serial",
-    "dep:some-serial",
-]
+serial = ["dep:rdif-serial", "dep:some-serial"]
 rknpu = ["rockchip-pm", "rockchip-soc", "dep:rockchip-npu"]
-rga = ["dep:rockchip-rga"]
+rga = ["rockchip-pm", "rockchip-soc", "dep:rockchip-rga"]
 jpeg = ["rockchip-pm", "rockchip-soc", "dep:rockchip-jpeg"]
 jpu-selftest = ["jpeg"]
 rockchip-sdhci = [
     "block",
     "rockchip-pm",
     "rockchip-soc",
-    "dep:ax-kspin",
+    "dep:ax-sync",
     "dep:rdif-clk",
+    "dep:sdhci-host",
+    "dep:sdmmc-protocol",
+    "sdmmc-protocol/rdif",
+]
+cv181x-sdhci = [
+    "block",
+    "dep:cv181x-sdhci",
+    "dep:sdhci-host",
+    "dep:sdmmc-host",
+    "dep:sdmmc-protocol",
+    "sdmmc-protocol/rdif",
+]
+cvsd = ["cv181x-sdhci"]
+k230-sdhci = [
+    "block",
     "dep:sdhci-host",
     "dep:sdmmc-protocol",
     "sdmmc-protocol/rdif",
 ]
 phytium-mci = [
     "block",
-    "dep:ax-kspin",
     "dep:phytium-mci-host",
-    "dep:sdmmc-protocol",
-    "sdmmc-protocol/rdif",
-]
-k230-sdhci = [
-    "block",
-    "dep:sdhci-host",
     "dep:sdmmc-protocol",
     "sdmmc-protocol/rdif",
 ]
@@ -98,7 +97,6 @@ rockchip-dwmmc = [
     "rockchip-pm",
     "rockchip-soc",
     "dep:arm-scmi-rs",
-    "dep:ax-kspin",
     "dep:dwmmc-host",
     "dep:rdif-clk",
     "dep:sdmmc-protocol",
@@ -107,6 +105,7 @@ rockchip-dwmmc = [
 starfive-jh7110-dwmmc = [
     "block",
     "starfive-soc",
+    "dep:dwmmc-host",
     "dep:sdmmc-protocol",
     "dep:starfive-jh7110-dwmmc",
     "sdmmc-protocol/rdif",
@@ -130,10 +129,16 @@ rk3588-pcie = [
 ]
 rockchip-soc = [
     "pinctrl",
-    "dep:ax-kspin",
+    "dep:ax-sync",
     "dep:rdif-clk",
     "dep:rdif-reset",
     "dep:rockchip-soc",
+]
+# RK3588 fixed-OPP-at-boot CPU DVFS (voltage-free rung): raises the CPU cluster
+# clocks via the SCMI seam at probe time. Board-only policy; keep it opt-in.
+rk3588-cpufreq = [
+    "rockchip-soc",
+    "dep:arm-scmi-rs",
 ]
 rockchip-pm = ["rockchip-soc", "dep:rdif-power", "dep:rockchip-pm"]
 list-pci-devices = ["pci"]
@@ -141,15 +146,13 @@ pci-list-devices = ["list-pci-devices"]
 
 [dependencies]
 aic8800 = { workspace = true, optional = true }
+ahci-driver = { workspace = true, optional = true }
 anyhow = { workspace = true }
 arm-scmi-rs = { workspace = true, optional = true }
 ax-alloc = { workspace = true, optional = true }
-ax-crate-interface = { workspace = true, optional = true }
-ax-errno = { workspace = true, optional = true }
-ax-kernel-guard = { workspace = true, optional = true }
-ax-kspin = { workspace = true, optional = true }
+ax-sync = { workspace = true, optional = true }
 axklib.workspace = true
-bcm2835-sdhci = { workspace = true, optional = true }
+bitflags = { workspace = true, optional = true }
 crab-usb = { workspace = true, optional = true }
 cv181x-sdhci = { workspace = true, optional = true }
 dma-api.workspace = true
@@ -163,7 +166,8 @@ log.workspace = true
 mmio-api.workspace = true
 nvme-driver = { workspace = true, optional = true }
 pcie = { workspace = true, optional = true }
-ramdisk = { workspace = true, optional = true }
+pbkdf2 = { workspace = true, optional = true }
+phytium-mci-host = { workspace = true, optional = true }
 rd-net = { workspace = true, optional = true }
 rdif-block = { workspace = true, optional = true }
 rdif-clk = { workspace = true, optional = true }
@@ -188,20 +192,20 @@ rockchip-rga = { workspace = true, optional = true }
 rockchip-jpeg = { workspace = true, optional = true }
 rockchip-pm = { workspace = true, optional = true }
 rockchip-soc = { workspace = true, optional = true }
-phytium-mci-host = { workspace = true, optional = true }
 sdhci-host = { workspace = true, optional = true }
-sdhci-cv1800 = { workspace = true, optional = true }
-sdio-host = { workspace = true, optional = true }
+sdmmc-host = { workspace = true, optional = true }
 sdmmc-protocol = { workspace = true, default-features = false, optional = true }
-starfive-jh7110-dwmmc = { workspace = true, optional = true }
-simple-ahci = { workspace = true, optional = true }
+sg200x-bsp = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
 some-serial = { workspace = true, optional = true }
-spin.workspace = true
+starfive-jh7110-dwmmc = { workspace = true, optional = true }
 tock-registers = { workspace = true, optional = true }
+thiserror.workspace = true
 virtio-drivers = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
 
 [dev-dependencies]
-ax-kernel-guard = { workspace = true, features = ["host-test"] }
+ax-sync = { path = "../../os/arceos/modules/axsync", features = ["host-test"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv_goldfish = "0.1"
@@ -211,3 +215,7 @@ ax-arm-pl031.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86.workspace = true
+
+[[test]]
+name = "std"
+path = "tests/std.rs"

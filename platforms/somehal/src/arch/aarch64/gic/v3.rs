@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use aarch64_cpu::registers::ID_AA64PFR0_EL1;
+use aarch64_cpu::{asm::barrier, registers::ID_AA64PFR0_EL1};
 use arm_gic_driver::{checked_intid, v3::*};
 use irq_framework::IrqId;
 use kernutil::StaticCell;
@@ -12,6 +12,7 @@ use rdrive::{module_driver, probe::OnProbeError, register::ProbeFdt};
 
 use crate::common::ioremap;
 
+static CPU_IF_INIT: StaticCell<CpuInterfaceInit> = StaticCell::uninit();
 static CPU_IF: StaticCell<BTreeMap<usize, CpuInterfaceSlot>> = StaticCell::uninit();
 static PRIMARY_GICR_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 
@@ -85,10 +86,11 @@ fn probe_gic(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     gic.init();
     super::set_backend(super::GicBackend::V3);
 
+    CPU_IF_INIT.init(gic.cpu_interface_init());
     init_cpu_interface_map();
     let cpu_idx =
         crate::cpu::current_cpu_idx().unwrap_or_else(someboot::smp::early_current_cpu_idx);
-    init_cpu_interface(&gic, cpu_idx);
+    init_cpu(cpu_idx);
 
     let domain = crate::irq::alloc_irq_domain(
         dev.descriptor.device_id(),
@@ -110,18 +112,33 @@ pub fn is_support_icc() -> bool {
 pub struct ActiveIrq {
     irq: rdrive::IrqId,
     ack: IntId,
+    priority_drop_pending: bool,
+    two_step_eoi: bool,
 }
 
 impl ActiveIrq {
     pub fn id(&self) -> rdrive::IrqId {
         self.irq
     }
+
+    pub fn acknowledge_ipi(&mut self) {
+        if self.two_step_eoi {
+            self.drop_priority();
+        }
+    }
+
+    fn drop_priority(&mut self) {
+        if self.priority_drop_pending {
+            eoi1(self.ack);
+            self.priority_drop_pending = false;
+        }
+    }
 }
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
-        eoi1(self.ack);
-        if eoi_mode() {
+        self.drop_priority();
+        if self.two_step_eoi {
             dir(self.ack);
         }
     }
@@ -136,6 +153,8 @@ pub fn begin_irq() -> Option<ActiveIrq> {
     Some(ActiveIrq {
         irq: (ack.to_u32() as usize).into(),
         ack,
+        priority_drop_pending: true,
+        two_step_eoi: eoi_mode(),
     })
 }
 
@@ -156,6 +175,26 @@ pub fn irq_set_enable(irq: IrqId, enable: bool) -> Result<(), crate::irq::IrqErr
     })?
 }
 
+pub fn irq_set_trigger(irq: IrqId, trigger: Trigger) -> Result<(), crate::irq::IrqError> {
+    super::trigger::dispatch_trigger_configuration(
+        irq.hwirq.0,
+        Some(super::its::LPI_INTID_BASE as u32),
+        |raw| {
+            let intid = checked_private_intid(raw)?;
+            current_cpu_interface().set_cfg(intid, trigger);
+            Ok(())
+        },
+        |raw| {
+            super::with_gic_domain::<Gic, _>(irq.domain, |gic| {
+                let intid = checked_runtime_intid(raw, gic.max_intid())?;
+                gic.set_cfg(intid, trigger);
+                Ok(())
+            })?
+        },
+        || crate::irq::IrqError::Unsupported,
+    )
+}
+
 pub fn irq_set_affinity(
     irq: IrqId,
     affinity: crate::irq::IrqAffinity,
@@ -163,10 +202,13 @@ pub fn irq_set_affinity(
     if irq.hwirq.0 < 32 {
         return Err(crate::irq::IrqError::Unsupported);
     }
+    if irq.hwirq.0 >= super::its::LPI_INTID_BASE {
+        return super::its::set_lpi_affinity(irq, affinity);
+    }
     let target = match affinity {
         crate::irq::IrqAffinity::Any => None,
         crate::irq::IrqAffinity::Fixed { cpu_id } => {
-            Some(affinity_from_mpidr(super::hardware_cpu_id(cpu_id)))
+            Some(affinity_from_mpidr(super::hardware_cpu_id(cpu_id)?))
         }
     };
     super::with_gic_domain::<Gic, _>(irq.domain, |gic| {
@@ -185,16 +227,24 @@ fn checked_runtime_intid(raw: u32, max_intid: u32) -> Result<IntId, crate::irq::
     checked_intid(raw, max_intid).map_err(|_| crate::irq::IrqError::InvalidIrq)
 }
 
-pub fn send_ipi(raw: usize, target: crate::irq::IpiTarget) {
-    let sgi = IntId::sgi(raw as u32);
+pub fn send_ipi(raw: usize, target: crate::irq::IpiTarget) -> Result<(), crate::irq::IrqError> {
+    let raw = u32::try_from(raw).map_err(|_| crate::irq::IrqError::InvalidIrq)?;
+    if raw >= 16 {
+        return Err(crate::irq::IrqError::InvalidIrq);
+    }
+    let sgi = IntId::sgi(raw);
     let target = match target {
-        crate::irq::IpiTarget::Current { cpu_id: _ } => SGITarget::current(),
-        crate::irq::IpiTarget::Other { cpu_id: cpu_idx } => {
-            SGITarget::list([affinity_from_mpidr(super::hardware_cpu_id(cpu_idx))])
+        crate::irq::IpiTarget::Current => SGITarget::current(),
+        crate::irq::IpiTarget::Cpu(cpu) => {
+            SGITarget::list([affinity_from_mpidr(super::hardware_cpu_id(cpu.0)?)])
         }
-        crate::irq::IpiTarget::AllExceptCurrent { .. } => SGITarget::All,
     };
+    // ICC_SGI1R_EL1 is the IPI doorbell. Complete prior Inner-Shareable
+    // Normal-memory stores before issuing the SGI; the driver's trailing ISB
+    // only forces execution of the system-register write.
+    barrier::dsb(barrier::ISHST);
     current_cpu_interface().send_sgi(sgi, target);
+    Ok(())
 }
 
 fn affinity_from_mpidr(mpidr: usize) -> Affinity {
@@ -209,7 +259,12 @@ pub(super) fn primary_gicr_phys_base() -> Option<u64> {
 }
 
 pub fn init_cpu(cpu_idx: usize) {
-    if let Err(err) = super::with_primary_gic::<Gic, _>(|gic| init_cpu_interface(gic, cpu_idx)) {
+    if !CPU_IF_INIT.is_init() {
+        warn!("failed to initialize GICv3 CPU interface for CPU {cpu_idx}: missing GICv3 state");
+        return;
+    }
+
+    if let Err(err) = init_cpu_interface(cpu_idx) {
         warn!("failed to initialize GICv3 CPU interface for CPU {cpu_idx}: {err:?}");
     }
 
@@ -224,15 +279,22 @@ fn init_cpu_interface_map() {
     CPU_IF.init(cpu_if);
 }
 
-fn init_cpu_interface(gic: &Gic, cpu_idx: usize) {
-    let mut cpu = gic.cpu_interface();
-    cpu.init_current_cpu().unwrap();
+fn init_cpu_interface(cpu_idx: usize) -> Result<(), &'static str> {
+    let mut cpu = CPU_IF_INIT.cpu_interface();
+    cpu.init_current_cpu()?;
     #[cfg(feature = "hv")]
-    cpu.set_eoi_mode(true);
+    {
+        // Hypervisor-owned physical interrupts must remain active after EOIR
+        // until the guest completes the corresponding virtual interrupt. The
+        // normal host path still performs both operations in `ActiveIrq::drop`.
+        cpu.set_eoi_mode(true);
+        info!("GICv3 CPU {cpu_idx} EOI mode: two_step={}", cpu.eoi_mode());
+    }
 
     // SAFETY: CPU_IF was preallocated during BSP probe. Each CPU initializes
     // only its own logical CPU slot before it can send SGIs through that slot.
     unsafe { cpu_interface_slot(cpu_idx).set(cpu_idx, cpu) };
+    Ok(())
 }
 
 fn current_cpu_interface() -> &'static CpuInterface {

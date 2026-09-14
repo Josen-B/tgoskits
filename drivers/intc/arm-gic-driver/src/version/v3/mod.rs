@@ -1,19 +1,19 @@
 use core::ptr::NonNull;
 
-use aarch64_cpu::{
-    asm::barrier,
-    registers::{CurrentEL, MPIDR_EL1},
-};
 use log::*;
 pub use tock_registers::{LocalRegisterCopy, interfaces::*};
 
+use crate::arch;
+
 mod gicd;
-mod gicr;
+pub(crate) mod gicr;
 mod its;
+mod nmi;
 
 use gicd::*;
 use gicr::*;
 pub use its::*;
+pub use nmi::*;
 
 use crate::version::{IrqVecReadable, IrqVecWriteable};
 pub use crate::{IntId, VirtAddr, define::Trigger, sys_reg::*};
@@ -180,12 +180,11 @@ impl Affinity {
     /// let affinity = Affinity::from_mpidr(mpidr_value);
     /// ```
     pub fn from_mpidr(mpidr: u64) -> Self {
-        let val = LocalRegisterCopy::<u64, MPIDR_EL1::Register>::new(mpidr);
         Self {
-            aff0: val.read(MPIDR_EL1::Aff0) as u8,
-            aff1: val.read(MPIDR_EL1::Aff1) as u8,
-            aff2: val.read(MPIDR_EL1::Aff2) as u8,
-            aff3: val.read(MPIDR_EL1::Aff3) as u8,
+            aff0: mpidr as u8,
+            aff1: (mpidr >> 8) as u8,
+            aff2: (mpidr >> 16) as u8,
+            aff3: (mpidr >> 32) as u8,
         }
     }
 
@@ -210,7 +209,7 @@ impl Affinity {
     /// );
     /// ```
     pub fn current() -> Self {
-        Self::from_mpidr(MPIDR_EL1.get())
+        Self::from_mpidr(arch::mpidr())
     }
 }
 
@@ -257,6 +256,39 @@ pub struct Gic {
 
 unsafe impl Send for Gic {}
 
+/// Lock-free access to GICv3 Distributor state used by IRQ completion paths.
+#[derive(Clone, Copy)]
+pub struct DistributorOperations {
+    gicd: *mut DistributorReg,
+}
+
+// SAFETY: the pointer names the immutable, permanently mapped GICD register
+// block. Individual Distributor registers provide the required MMIO
+// synchronization; this capability does not expose ordinary Rust memory.
+unsafe impl Send for DistributorOperations {}
+// SAFETY: see the `Send` implementation. Concurrent reads of GICD_ISPENDR are
+// architecturally supported and do not create Rust aliases to mutable memory.
+unsafe impl Sync for DistributorOperations {}
+
+impl DistributorOperations {
+    fn gicd(&self) -> &DistributorReg {
+        // SAFETY: `Gic::distributor_operations` only constructs this capability
+        // from the live GICD mapping established during platform discovery.
+        unsafe { &*self.gicd }
+    }
+
+    /// Returns the Distributor pending state for one interrupt.
+    pub fn is_pending(&self, intid: IntId) -> bool {
+        self.gicd().ISPENDR.get_irq_bit(intid.into())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CpuInterfaceInit {
+    gicr: VirtAddr,
+    security_state: SecurityState,
+}
+
 impl Gic {
     /// Create a new GICv3 driver instance.
     ///
@@ -302,6 +334,24 @@ impl Gic {
     pub fn gicd_addr(&self) -> VirtAddr {
         self.gicd
     }
+
+    /// Returns an IRQ-safe view of stable Distributor state.
+    ///
+    /// The returned capability does not own the register mapping. It remains
+    /// valid for the lifetime of the initialized GIC driver.
+    pub fn distributor_operations(&self) -> DistributorOperations {
+        DistributorOperations {
+            gicd: self.gicd.as_ptr(),
+        }
+    }
+
+    pub fn cpu_interface_init(&self) -> CpuInterfaceInit {
+        CpuInterfaceInit {
+            gicr: self.gicr,
+            security_state: self.security_state,
+        }
+    }
+
     /// Initialize the GICv3 Distributor according to ARM GIC Architecture Specification v3/v4
     ///
     /// This function implements the initialization sequence described in section 12.9.4
@@ -348,7 +398,7 @@ impl Gic {
 
         // 1. Disable all interrupt groups before configuration
         self.disable();
-        barrier::isb(barrier::SY);
+        arch::isb();
 
         // Wait for register write to complete
         if let Err(e) = self.gicd().wait_for_rwp() {
@@ -378,7 +428,7 @@ impl Gic {
         };
         self.gicd().CTLR.set(ctrl);
 
-        barrier::isb(barrier::SY);
+        arch::isb();
 
         // Wait for final configuration to complete
         if let Err(e) = self.gicd().wait_for_rwp() {
@@ -425,6 +475,29 @@ impl Gic {
         }
     }
 
+    pub fn collection_target_for_affinity(
+        &self,
+        gicr_phys_base: u64,
+        use_physical_target: bool,
+        affinity: Affinity,
+    ) -> Option<u64> {
+        let affinity = affinity.affinity();
+        self.rd_slice()
+            .iter()
+            .enumerate()
+            .find_map(|(index, redistributor)| {
+                let redistributor = unsafe { redistributor.as_ref() };
+                if redistributor.lpi.get_affinity() != affinity {
+                    return None;
+                }
+                if use_physical_target {
+                    Some(gicr_phys_base + (index * core::mem::size_of::<RedistributorV3>()) as u64)
+                } else {
+                    Some(u64::from(redistributor.lpi.processor_number()) << 16)
+                }
+            })
+    }
+
     pub fn init_lpi_tables(
         &self,
         property_table_phys: u64,
@@ -440,7 +513,7 @@ impl Gic {
                 pending,
             )?;
         }
-        barrier::dsb(barrier::SY);
+        arch::dsb();
         Ok(())
     }
 
@@ -461,11 +534,11 @@ impl Gic {
             }
         };
         self.gicd().CTLR.set(old & !val);
-        barrier::isb(barrier::SY);
+        arch::isb();
     }
 
     fn rd_slice(&self) -> RDv3Slice {
-        RDv3Slice::new(unsafe { NonNull::new_unchecked(self.gicr.as_ptr()) })
+        rd_slice_from(self.gicr)
     }
 
     fn current_rd_ref(&self) -> &RedistributorV3 {
@@ -473,18 +546,7 @@ impl Gic {
     }
 
     fn current_rd(&self) -> NonNull<RedistributorV3> {
-        let want = (MPIDR_EL1.get() & 0xFFFFFF) as u32;
-
-        for rd in self.rd_slice().iter() {
-            let affi = unsafe { rd.as_ref() }
-                .lpi_ref()
-                .TYPER
-                .read(gicr::TYPER::Affinity) as u32;
-            if affi == want {
-                return rd;
-            }
-        }
-        panic!("No current redistributor")
+        current_rd_from(self.gicr)
     }
 
     /// Get a CPU interface for the current CPU.
@@ -507,7 +569,7 @@ impl Gic {
     /// ```
     pub fn cpu_interface(&self) -> CpuInterface {
         CpuInterface {
-            rd: self.current_rd().as_ptr(),
+            rd: current_rd_from(self.gicr).as_ptr(),
             security_state: self.security_state,
         }
     }
@@ -880,6 +942,41 @@ impl Gic {
     }
 }
 
+impl CpuInterfaceInit {
+    pub fn cpu_interface(&self) -> CpuInterface {
+        CpuInterface {
+            rd: current_rd_from(self.gicr).as_ptr(),
+            security_state: self.security_state,
+        }
+    }
+}
+
+fn rd_slice_from(gicr: VirtAddr) -> RDv3Slice {
+    RDv3Slice::new(unsafe { NonNull::new_unchecked(gicr.as_ptr()) })
+}
+
+fn current_rd_from(gicr: VirtAddr) -> NonNull<RedistributorV3> {
+    let affinity = Affinity::current();
+    redistributor_for_affinity_from(gicr, affinity)
+        .unwrap_or_else(|| panic!("No redistributor for current CPU affinity {affinity:?}"))
+}
+
+fn redistributor_for_affinity_from(
+    gicr: VirtAddr,
+    affinity: Affinity,
+) -> Option<NonNull<RedistributorV3>> {
+    let want = affinity.affinity();
+    rd_slice_from(gicr).iter().find(|rd| {
+        // SAFETY: every pointer comes from the Redistributor region whose
+        // mapping and lifetime are guaranteed by the `Gic::new` contract.
+        let affi = unsafe { rd.as_ref() }
+            .lpi_ref()
+            .TYPER
+            .read(gicr::TYPER::Affinity) as u32;
+        affi == want
+    })
+}
+
 /// Every CPU interface has its own GICC registers
 pub struct CpuInterface {
     rd: *mut RedistributorV3,
@@ -916,7 +1013,7 @@ impl CpuInterface {
         self.rd().lpi.wait_for_rwp()?;
 
         // 3. Configure CPU interface system registers
-        if CurrentEL.read(CurrentEL::EL) == 2 {
+        if arch::current_el() == 2 {
             ICC_SRE_EL2.write(
                 ICC_SRE_EL2::SRE::SET
                     + ICC_SRE_EL2::DFB::SET
@@ -953,7 +1050,7 @@ impl CpuInterface {
         }
 
         // 6. Configure EOI mode
-        if CurrentEL.read(CurrentEL::EL) == 2 {
+        if arch::current_el() == 2 {
             ICC_CTLR_EL1.modify(ICC_CTLR_EL1::EOIMODE::SET);
         }
 
@@ -1196,5 +1293,5 @@ pub fn send_sgi(sgi_id: IntId, target: SGITarget) {
             ICC_SGI1R_EL1.write(value);
         }
     }
-    barrier::isb(barrier::SY);
+    arch::isb();
 }

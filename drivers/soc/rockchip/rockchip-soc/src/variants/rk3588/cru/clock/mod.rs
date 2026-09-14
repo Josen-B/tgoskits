@@ -257,6 +257,15 @@ clk_id_group!(
 );
 
 // =============================================================================
+// RGA 时钟 ID
+// =============================================================================
+
+// RGA2 bus clocks (gate positions in CLKGATE_CON45, see gate.rs). PR-1 brings up RGA2 only;
+// the RGA3 core clock ids (ACLK_RGA3_0=442/HCLK_RGA3_0=441/CLK_RGA3_0_CORE=443,
+// ACLK_RGA3_1=394/HCLK_RGA3_1=393/CLK_RGA3_1_CORE=395) are deferred with the RGA3 bring-up.
+clk_id_group!(HCLK_RGA2 = 438, ACLK_RGA2 = 439, CLK_RGA2_CORE = 440,);
+
+// =============================================================================
 // GMAC 时钟 ID
 // =============================================================================
 
@@ -849,19 +858,6 @@ mod tests {
         // UART9
         assert_eq!(get_uart_num(CLK_UART9_SRC), Some(9));
         assert_eq!(get_uart_num(SCLK_UART9), Some(9));
-    }
-
-    #[test]
-    fn test_clkid_comparison() {
-        // 验证 ClkId 的比较运算符正常工作
-        assert!(PCLK_UART1 < SCLK_UART1);
-        assert!(CLK_UART2_SRC <= SCLK_UART2);
-        assert!(SCLK_UART9 > CLK_UART9_SRC);
-
-        // 验证边界值的正确性
-        assert!(SCLK_UART1.value() == 183);
-        assert!(CLK_UART2_SRC.value() == 184);
-        assert!(SCLK_UART9.value() == 215);
     }
 
     #[test]

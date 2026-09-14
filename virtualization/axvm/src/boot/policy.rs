@@ -14,9 +14,32 @@
 
 //! Guest boot-description ownership for AxVM.
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use axvm_types::GuestPhysAddr;
+
+use super::BootImageProvider;
+
+/// Selects the guest address-adjustment policy for the current architecture.
+pub fn guest_boot_policy(
+    config: &axvmconfig::GuestConfig,
+    provider: &dyn BootImageProvider,
+) -> crate::config::GuestBootPolicy {
+    crate::arch::current::guest_boot_policy(config, provider)
+}
+
+/// Resolves the configured or architecture-default boot firmware load address.
+pub fn boot_firmware_load_gpa(config: &axvmconfig::GuestConfig) -> Option<GuestPhysAddr> {
+    if !config.kernel.enable_bios {
+        return None;
+    }
+
+    config
+        .kernel
+        .bios_load_addr
+        .map(GuestPhysAddr::from)
+        .or_else(|| crate::arch::current::default_boot_firmware_load_gpa(config))
+}
 
 /// Device-tree boot description owned by the VM lifecycle.
 #[derive(Debug, Clone)]

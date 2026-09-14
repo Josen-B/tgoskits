@@ -3,6 +3,11 @@
 #[cfg(any(windows, unix))]
 pub mod elf_image;
 
+pub mod boot_offer;
+pub mod integrity;
+pub mod network_policy;
+pub mod smbios;
+
 #[cfg(any(windows, unix))]
 pub use elf_image::{
     ElfImageReport, SegmentInfo, hex, inspect_elf, parse_hex_u64, validate_manifest_address,

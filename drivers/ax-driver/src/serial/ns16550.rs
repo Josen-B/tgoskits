@@ -1,6 +1,8 @@
 use alloc::format;
 
 use log::info;
+#[cfg(target_arch = "x86_64")]
+use rdrive::probe::acpi::AcpiResourceAddress;
 use rdrive::{
     probe::{
         OnProbeError,
@@ -10,13 +12,19 @@ use rdrive::{
 };
 use some_serial::ns16550 as serial_ns16550;
 
+#[cfg(target_arch = "x86_64")]
+use super::BindingIrq;
 use super::{
-    PlatformSerialDevice, SerialProbeRuntime, acpi_serial_device_info, prop_u32,
-    serial_device_info, serial_runtime,
+    PlatformSerialDevice, ProbedUart, acpi_serial_device_info, erase_uart, prop_u32,
+    serial_device_info,
 };
 
 const ACPI_NS16550_CLOCK: u32 = 1_843_200;
 const ACPI_NS16550_REG_WIDTH: usize = 1;
+#[cfg(target_arch = "x86_64")]
+const LEGACY_COM1_PORT: u16 = 0x3f8;
+#[cfg(target_arch = "x86_64")]
+const LEGACY_COM1_ISA_IRQ: u8 = 4;
 
 model_register!(
     name: "NS16550 serial",
@@ -40,8 +48,40 @@ model_register!(
             ],
             on_probe: probe_acpi
         },
+        #[cfg(target_arch = "x86_64")]
+        ProbeKind::Acpi {
+            ids: &[],
+            on_probe: probe_legacy_com1
+        },
     ],
 );
+
+#[cfg(target_arch = "x86_64")]
+fn probe_legacy_com1(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
+    let route = probe
+        .info()
+        .root
+        .routing()
+        .resolve_isa_irq(LEGACY_COM1_ISA_IRQ)
+        .ok_or_else(|| OnProbeError::other("legacy COM1 IRQ4 has no ACPI I/O APIC route"))?;
+    let serial = erase_uart(serial_ns16550::Ns16550::new_port(
+        LEGACY_COM1_PORT,
+        ACPI_NS16550_CLOCK,
+    ));
+
+    info!("Legacy x86 COM1 fallback registered successfully");
+    probe.register_root_resource_device(
+        AcpiResourceAddress::io(u64::from(LEGACY_COM1_PORT)),
+        PlatformSerialDevice::new(
+            serial,
+            "legacy/com1".into(),
+            Some(0),
+            usize::from(LEGACY_COM1_PORT),
+            Some(BindingIrq::from(route)),
+        ),
+    );
+    Ok(())
+}
 
 fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let (info, plat_dev) = probe.into_parts();
@@ -60,44 +100,52 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let reg_width = prop_u32(node, "reg-io-width").unwrap_or(1) as usize;
     let reg_shift = prop_u32(node, "reg-shift").map(|shift| 1usize << shift);
     let ns16550_width = reg_shift.unwrap_or(reg_width);
-    let mut serial: Option<SerialProbeRuntime> = None;
+    let mut serial: Option<ProbedUart> = None;
 
     for compatible in node.compatibles() {
         if compatible == "snps,dw-apb-uart" {
-            let clock_freq = prop_u32(node, "clock-frequency")
-                .unwrap_or(serial_ns16550::dw_apb::SG2002_UART_CLOCK);
+            let default_clock = if node
+                .compatibles()
+                .any(|compatible| compatible == "rockchip,rk3588-uart")
+            {
+                serial_ns16550::dw_apb::RK3588_UART_CLOCK
+            } else {
+                serial_ns16550::dw_apb::SG2002_UART_CLOCK
+            };
+            let clock_freq = prop_u32(node, "clock-frequency").unwrap_or(default_clock);
             let raw = serial_ns16550::DwApbUart::new_raw(mmio_base, clock_freq);
-            serial = Some(serial_runtime(raw));
+            serial = Some(erase_uart(raw));
             break;
         }
 
         if matches!(compatible, "ns16550a" | "ns16550") {
             let clock_freq = prop_u32(node, "clock-frequency").unwrap_or(24_000_000);
             let raw = serial_ns16550::Ns16550::new_mmio(mmio_base, clock_freq, ns16550_width);
-            serial = Some(serial_runtime(raw));
+            serial = Some(erase_uart(raw));
             break;
         }
     }
 
     let serial = serial.ok_or(OnProbeError::NotMatch)?;
-    let device_info = serial_device_info(&info, &base_reg, serial.base_addr, serial.baudrate);
+    let device_info = serial_device_info(&info, &base_reg);
 
     info!(
         "NS16550 serial@{:#x} registered successfully",
-        serial.base_addr
+        serial.hardware.register_base
     );
     plat_dev.register(PlatformSerialDevice::new(
-        serial.name.into(),
-        device_info,
-        serial.runtime,
+        serial,
+        device_info.path,
+        device_info.alias_index,
+        device_info.paddr,
+        device_info.irq,
     ));
     Ok(())
 }
 
 struct AcpiSerialResource {
-    serial: SerialProbeRuntime,
+    serial: ProbedUart,
     paddr: usize,
-    mapped_base: usize,
 }
 
 fn probe_acpi(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
@@ -109,13 +157,7 @@ fn probe_acpi(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
     } else {
         acpi_mmio_serial(info)?
     };
-    let device_info = acpi_serial_device_info(
-        info,
-        resource.paddr,
-        resource.mapped_base,
-        resource.serial.baudrate,
-    );
-    let serial_name = resource.serial.name.into();
+    let device_info = acpi_serial_device_info(info, resource.paddr);
     let plat_dev = probe.into_platform_device();
 
     info!(
@@ -123,9 +165,11 @@ fn probe_acpi(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
         resource.paddr
     );
     plat_dev.register(PlatformSerialDevice::new(
-        serial_name,
-        device_info,
-        resource.serial.runtime,
+        resource.serial,
+        device_info.path,
+        device_info.alias_index,
+        device_info.paddr,
+        device_info.irq,
     ));
     Ok(())
 }
@@ -142,12 +186,10 @@ fn acpi_io_serial(info: &AcpiInfo<'_>) -> Result<Option<AcpiSerialResource>, OnP
         ))
     })?;
     let raw = serial_ns16550::Ns16550::new_port(port, ACPI_NS16550_CLOCK);
-    let serial = serial_runtime(raw);
-    let mapped_base = serial.base_addr;
+    let serial = erase_uart(raw);
     Ok(Some(AcpiSerialResource {
         serial,
         paddr: usize::from(port),
-        mapped_base,
     }))
 }
 
@@ -173,11 +215,6 @@ fn acpi_mmio_serial(info: &AcpiInfo<'_>) -> Result<AcpiSerialResource, OnProbeEr
     let mmio_base = crate::mmio::iomap(paddr, mmio_size)?;
     let raw =
         serial_ns16550::Ns16550::new_mmio(mmio_base, ACPI_NS16550_CLOCK, ACPI_NS16550_REG_WIDTH);
-    let serial = serial_runtime(raw);
-    let mapped_base = serial.base_addr;
-    Ok(AcpiSerialResource {
-        serial,
-        paddr,
-        mapped_base,
-    })
+    let serial = erase_uart(raw);
+    Ok(AcpiSerialResource { serial, paddr })
 }

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/rcore-os/tgoskits/compare/rdif-serial-v0.10.0...rdif-serial-v0.10.1) - 2026-09-09
+
+### Other
+
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+
+## [0.10.0](https://github.com/rcore-os/tgoskits/compare/rdif-serial-v0.9.3...rdif-serial-v0.10.0) - 2026-08-20
+
+### Fixed
+
+- *(console)* unify sleepable runtime console arbitration ([#2113](https://github.com/rcore-os/tgoskits/pull/2113))
+- *(tty)* handle input flush and wakeups ([#1922](https://github.com/rcore-os/tgoskits/pull/1922))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(serial)* establish bounded owner-affine UART runtime ([#2076](https://github.com/rcore-os/tgoskits/pull/2076))
+
+## [0.9.3](https://github.com/rcore-os/tgoskits/compare/rdif-serial-v0.9.2...rdif-serial-v0.9.3) - 2026-08-09
+
+### Other
+
+- updated the following local packages: axtest
+
+## [0.9.2](https://github.com/rcore-os/tgoskits/compare/rdif-serial-v0.9.1...rdif-serial-v0.9.2) - 2026-08-03
+
+### Other
+
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+## [0.9.1](https://github.com/rcore-os/tgoskits/compare/rdif-serial-v0.9.0...rdif-serial-v0.9.1) - 2026-07-23
+
+### Other
+
+- *(ax-runtime)* centralize UART scheduling ([#1675](https://github.com/rcore-os/tgoskits/pull/1675))
+
 ## [0.9.0](https://github.com/rcore-os/tgoskits/compare/rdif-serial-v0.8.2...rdif-serial-v0.9.0) - 2026-06-27
 
 ### Other

@@ -1,23 +1,15 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
-use core::{any::Any, cmp::Ordering, task::Context};
+use core::{any::Any, cmp::Ordering};
 
-use ax_sync::Mutex;
 use axfs_ng_vfs::{
-    FileNodeOps, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, NodeFlags,
-    NodeOps, NodePermission, NodeType, VfsError, VfsResult,
+    FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
+    NodeType, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
 
 use super::fs::{SimpleFs, SimpleFsNode};
-
-fn fs_events_to_io(events: FsIoEvents) -> IoEvents {
-    IoEvents::from_bits_truncate(events.bits())
-}
-
-fn io_events_to_fs(events: IoEvents) -> FsIoEvents {
-    FsIoEvents::from_bits_truncate(events.bits())
-}
+use crate::sync::Mutex;
 
 /// Operations for a simple file.
 pub trait SimpleFileOps: Send + Sync + 'static {
@@ -125,6 +117,41 @@ impl SimpleFile {
     pub fn new_regular(fs: Arc<SimpleFs>, ops: impl SimpleFileOps) -> Arc<Self> {
         Self::new(fs, NodeType::RegularFile, ops)
     }
+
+    /// Overwrite the node's stored ownership, permission bits and timestamps.
+    /// Pseudo-filesystems that back a real kernel object (e.g. `/dev/mqueue`,
+    /// whose files carry the owning queue's `i_mode`/`i_uid`/`i_gid` and inode
+    /// times) use this to report those instead of the defaults. The node's
+    /// `size` still comes from the live content length.
+    pub fn set_attrs(
+        &self,
+        mode: NodePermission,
+        uid: u32,
+        gid: u32,
+        atime: core::time::Duration,
+        mtime: core::time::Duration,
+        ctime: core::time::Duration,
+    ) {
+        let mut metadata = self.node.metadata.lock();
+        metadata.mode = mode;
+        metadata.uid = uid;
+        metadata.gid = gid;
+        metadata.atime = atime;
+        metadata.mtime = mtime;
+        metadata.ctime = ctime;
+    }
+
+    /// Report a fixed `st_size` from `stat` instead of the live content length.
+    /// For pseudo files that mirror a kernel object whose inode size is a fixed
+    /// documented width (e.g. `/dev/mqueue/<name>` = `FILENT_SIZE` 80), so
+    /// `stat` matches Linux regardless of the current status-line length.
+    ///
+    /// Stored on the node's metadata because `stat` reads the size through
+    /// [`SimpleFsNode::metadata`], which now honors a non-zero stored size
+    /// instead of always recomputing from the live content length.
+    pub fn set_fixed_size(&self, size: u64) {
+        self.node.metadata.lock().size = size;
+    }
 }
 
 #[inherit_methods(from = "self.node")]
@@ -199,27 +226,18 @@ impl FileNodeOps for SimpleFile {
             _ => Ok(()),
         }
     }
-
-    fn set_symlink(&self, target: &str) -> VfsResult<()> {
-        self.ops.write_all(target.as_bytes())
-    }
-}
-
-impl FsPollable for SimpleFile {
-    fn poll(&self) -> FsIoEvents {
-        FsIoEvents::IN | FsIoEvents::OUT
-    }
-
-    fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
 }
 
 impl Pollable for SimpleFile {
     fn poll(&self) -> IoEvents {
-        fs_events_to_io(FsPollable::poll(self))
+        IoEvents::IN | IoEvents::OUT
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        FsPollable::register(self, context, io_events_to_fs(events));
+    unsafe fn register_shared(
+        &self,
+        _sink: &mut dyn axpoll::SharedRegistrationSink,
+        _events: IoEvents,
+    ) {
     }
 }
 
@@ -285,28 +303,22 @@ impl<T: DirectRwFsFileOps> NodeOps for SpecialFsFile<T> {
     }
 }
 
-impl<T: DirectRwFsFileOps> FsPollable for SpecialFsFile<T> {
-    fn poll(&self) -> FsIoEvents {
+impl<T: DirectRwFsFileOps> Pollable for SpecialFsFile<T> {
+    fn poll(&self) -> IoEvents {
         // TODO: support poll for special files when needed
-        FsIoEvents::IN | FsIoEvents::OUT
+        IoEvents::IN | IoEvents::OUT
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {
+    unsafe fn register_shared(
+        &self,
+        _sink: &mut dyn axpoll::SharedRegistrationSink,
+        _events: IoEvents,
+    ) {
         // SpecialFsFile reports itself as always-ready via `poll()` (IN|OUT),
         // so registration is a no-op. Matches `SimpleFile::register` above —
         // turning this into `unimplemented!()` was a regression that panicked
         // the kernel on any `epoll_ctl` against debugfs/procfs special files
         // (tracepoint trace_pipe, saved_cmdlines, dyn_debug controls, …).
-    }
-}
-
-impl<T: DirectRwFsFileOps> Pollable for SpecialFsFile<T> {
-    fn poll(&self) -> IoEvents {
-        fs_events_to_io(FsPollable::poll(self))
-    }
-
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        FsPollable::register(self, context, io_events_to_fs(events));
     }
 }
 
@@ -329,10 +341,6 @@ impl<T: DirectRwFsFileOps> FileNodeOps for SpecialFsFile<T> {
             // Shell redirection usually opens these files with O_TRUNC.
             return Ok(());
         }
-        Err(VfsError::InvalidInput)
-    }
-
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
         Err(VfsError::InvalidInput)
     }
 }

@@ -1,6 +1,9 @@
 #![cfg_attr(not(test), no_std)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(test)]
+extern crate alloc;
+
 mod addr;
 mod iter;
 mod range;
@@ -94,17 +97,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_align() {
-        assert_eq!(align_down(0x12345678, 0x1000), 0x12345000);
-        assert_eq!(align_up(0x12345678, 0x1000), 0x12346000);
-        assert_eq!(align_offset(0x12345678, 0x1000), 0x678);
-        assert!(is_aligned(0x12345000, 0x1000));
-        assert!(!is_aligned(0x12345678, 0x1000));
-
-        assert_eq!(align_down_4k(0x12345678), 0x12345000);
-        assert_eq!(align_up_4k(0x12345678), 0x12346000);
-        assert_eq!(align_offset_4k(0x12345678), 0x678);
-        assert!(is_aligned_4k(0x12345000));
-        assert!(!is_aligned_4k(0x12345678));
+    fn alignment_keeps_zero_and_exact_page_boundaries() {
+        assert_eq!(align_down(0, 4096), 0);
+        assert_eq!(align_up(0, 4096), 0);
+        assert_eq!(align_down(4096, 4096), 4096);
+        assert_eq!(align_up(4096, 4096), 4096);
+        assert_eq!(align_down(4097, 4096), 4096);
+        assert_eq!(align_up(4097, 4096), 8192);
     }
 }

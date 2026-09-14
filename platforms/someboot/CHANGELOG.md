@@ -7,6 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/rcore-os/tgoskits/compare/someboot-v0.6.0...someboot-v0.7.0) - 2026-09-13
+
+### Other
+
+- *(someboot)* publish Linux-style CPU capacity through topology ([#2386](https://github.com/rcore-os/tgoskits/pull/2386))
+
+## [0.6.0](https://github.com/rcore-os/tgoskits/compare/someboot-v0.5.1...someboot-v0.6.0) - 2026-09-11
+
+### Other
+
+- *(ax-cpu)* [**breaking**] centralize CPU mechanisms and architecture backends ([#2363](https://github.com/rcore-os/tgoskits/pull/2363))
+
+## [0.5.1](https://github.com/rcore-os/tgoskits/compare/someboot-v0.5.0...someboot-v0.5.1) - 2026-09-09
+
+### Fixed
+
+- *(runtime)* prefer userspace over kernel TLS through build cfg ([#2339](https://github.com/rcore-os/tgoskits/pull/2339))
+
+## [0.5.0](https://github.com/rcore-os/tgoskits/compare/someboot-v0.4.2...someboot-v0.5.0) - 2026-09-09
+
+### Added
+
+- *(starry-mm)* redesign VMA lifecycle and transactional updates ([#2261](https://github.com/rcore-os/tgoskits/pull/2261))
+
+### Other
+
+- *(repo)* remove duplicated tests and configuration snapshots ([#2326](https://github.com/rcore-os/tgoskits/pull/2326))
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+
+### Changed
+
+- **Breaking:** publish a validated virtual-address-space layout instead of a
+  fixed kernel range, and derive LoongArch canonical halves from CPUCFG VALEN.
+
+## [0.4.2](https://github.com/rcore-os/tgoskits/compare/someboot-v0.4.1...someboot-v0.4.2) - 2026-08-27
+
+### Added
+
+- *(loongarch-intc-driver)* extract OS-independent interrupt controllers ([#2174](https://github.com/rcore-os/tgoskits/pull/2174))
+
+## [0.4.1](https://github.com/rcore-os/tgoskits/compare/someboot-v0.4.0...someboot-v0.4.1) - 2026-08-25
+
+### Other
+
+- *(x86-apic-driver)* extract x86 interrupt controllers with rdif-intc support ([#2118](https://github.com/rcore-os/tgoskits/pull/2118))
+
+## [0.4.0](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.8...someboot-v0.4.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+- *(starry-nixos)* add Stage-2 NixOS userspace baseline ([#1923](https://github.com/rcore-os/tgoskits/pull/1923))
+
+### Fixed
+
+- *(console)* unify sleepable runtime console arbitration ([#2113](https://github.com/rcore-os/tgoskits/pull/2113))
+- *(someboot)* [**breaking**] expose queryable secondary CPU startup ([#1981](https://github.com/rcore-os/tgoskits/pull/1981))
+- *(someboot)* harden timer boundary arithmetic ([#1982](https://github.com/rcore-os/tgoskits/pull/1982))
+- *(some-serial)* bound PL011 early-console startup ([#1983](https://github.com/rcore-os/tgoskits/pull/1983))
+- *(visionfive2)* restore booti and SD rootfs boot ([#1954](https://github.com/rcore-os/tgoskits/pull/1954))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(serial)* establish bounded owner-affine UART runtime ([#2076](https://github.com/rcore-os/tgoskits/pull/2076))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+### Changed
+
+- **Breaking:** replace blocking `cpu_on()` with a non-blocking, typed
+  `start_secondary_cpu()`/`status()`/`release()` lifecycle, keeping transport ownership claimed
+  across dropped handles, timeouts, and possibly partial architecture errors.
+
+## [0.3.8](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.7...someboot-v0.3.8) - 2026-08-09
+
+### Fixed
+
+- *(ax-plat)* add corrected scheduler clock source ([#1900](https://github.com/rcore-os/tgoskits/pull/1900))
+
+### Other
+
+- *(memory)* unify page-table execution on page-table-generic ([#1911](https://github.com/rcore-os/tgoskits/pull/1911))
+- *(repo)* unify workspace dependencies ([#1860](https://github.com/rcore-os/tgoskits/pull/1860))
+
+## [0.3.7](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.6...someboot-v0.3.7) - 2026-08-03
+
+### Fixed
+
+- *(someboot)* clamp x86 LAPIC timer delta ([#1794](https://github.com/rcore-os/tgoskits/pull/1794))
+- *(someboot)* repair AArch64 EFI handoff ([#1782](https://github.com/rcore-os/tgoskits/pull/1782))
+- *(someboot)* use 64-bit AArch64 timer deadlines ([#1720](https://github.com/rcore-os/tgoskits/pull/1720))
+- *(someboot)* establish runtime CPU topology mapping ([#1710](https://github.com/rcore-os/tgoskits/pull/1710))
+
+### Other
+
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+## [0.3.6](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.5...someboot-v0.3.6) - 2026-07-23
+
+### Other
+
+- *(ax-runtime)* centralize UART scheduling ([#1675](https://github.com/rcore-os/tgoskits/pull/1675))
+- *(cpu-local)* extract per-CPU register ownership ([#1662](https://github.com/rcore-os/tgoskits/pull/1662))
+
+### Changed
+
+- *(cpu-local)* allocate one runtime CPU area per discovered CPU from the single ELF template and
+  publish the layout only after typed initialization completes; the final-image handoff is the
+  unversioned scalar `__percpu_initialize_layout(base, stride, count)` entry.
+
+### Removed
+
+- *(cpu-local)* remove the alternate preallocated layout and legacy per-CPU linker aliases.
+
+## [0.3.5](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.4...someboot-v0.3.5) - 2026-07-10
+
+### Added
+
+- *(msi)* add hierarchical MSI-X irq domains ([#1526](https://github.com/rcore-os/tgoskits/pull/1526))
+
+## [0.3.4](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.3...someboot-v0.3.4) - 2026-07-08
+
+### Fixed
+
+- *(platforms)* route DMA cache sync through platform cache ops ([#1542](https://github.com/rcore-os/tgoskits/pull/1542))
+
 ## [0.3.3](https://github.com/rcore-os/tgoskits/compare/someboot-v0.3.2...someboot-v0.3.3) - 2026-07-08
 
 ### Added

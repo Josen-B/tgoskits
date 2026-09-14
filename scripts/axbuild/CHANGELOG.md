@@ -7,6 +7,302 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.7.1...axbuild-v0.8.0) - 2026-09-13
+
+### Added
+
+- *(starry)* add AArch64 Linux perf support ([#2274](https://github.com/rcore-os/tgoskits/pull/2274))
+
+### Other
+
+- *(someboot)* publish Linux-style CPU capacity through topology ([#2386](https://github.com/rcore-os/tgoskits/pull/2386))
+
+## [0.7.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.7.0...axbuild-v0.7.1) - 2026-09-12
+
+### Fixed
+
+- *(ax-task)* allow per-CPU timer wakes during CPU deactivation ([#2382](https://github.com/rcore-os/tgoskits/pull/2382))
+
+## [0.7.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.6.1...axbuild-v0.7.0) - 2026-09-11
+
+### Added
+
+- *(axbuild)* reuse cross-tool wrappers for native binutils ([#2280](https://github.com/rcore-os/tgoskits/pull/2280))
+- *(virtio)* add synchronized VirtIO block PCI ramdisk ([#2070](https://github.com/rcore-os/tgoskits/pull/2070))
+- *(axloader)* move boot control to UEFI networking ([#2354](https://github.com/rcore-os/tgoskits/pull/2354))
+- *(axbuild)* support to_bin in ArceOS build configs and log bin path ([#2336](https://github.com/rcore-os/tgoskits/pull/2336))
+
+### Fixed
+
+- *(some-serial)* preserve PL011 RX interrupts and add a real QEMU regression ([#2328](https://github.com/rcore-os/tgoskits/pull/2328))
+- *(axbuild)* validate rootfs extraction and drop broken fakeroot wrap on non-Linux hosts ([#2279](https://github.com/rcore-os/tgoskits/pull/2279))
+- *(rknpu)* add timeout error handling and update ioctl error mapping ([#2324](https://github.com/rcore-os/tgoskits/pull/2324))
+
+### Other
+
+- Merge pull request #2374 from rcore-os/arm-blk
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+- *(axbuild)* drop non-functional tests that pin instance parameters ([#2371](https://github.com/rcore-os/tgoskits/pull/2371))
+- *(ax-cpu)* [**breaking**] centralize CPU mechanisms and architecture backends ([#2363](https://github.com/rcore-os/tgoskits/pull/2363))
+- *(axbuild)* migrate test execution to shell check steps ([#2361](https://github.com/rcore-os/tgoskits/pull/2361))
+
+## [0.6.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.5.3...axbuild-v0.6.1) - 2026-09-09
+
+### Added
+
+- *(axvm)* service virtio block images with on-demand file I/O ([#2310](https://github.com/rcore-os/tgoskits/pull/2310))
+- *(nixos-tests)* add local StarryOS-backed nixosTest framework ([#2226](https://github.com/rcore-os/tgoskits/pull/2226))
+- *(starry-mm)* redesign VMA lifecycle and transactional updates ([#2261](https://github.com/rcore-os/tgoskits/pull/2261))
+- *(aic8800)* integrate AKA WPA2 Wi-Fi and iperf validation ([#2222](https://github.com/rcore-os/tgoskits/pull/2222))
+- *(axvisor)* add generic vPCI foundation with x86 PCI enumeration ([#2197](https://github.com/rcore-os/tgoskits/pull/2197))
+
+### Fixed
+
+- *(release)* make package baselines and CI inputs reproducible ([#2331](https://github.com/rcore-os/tgoskits/pull/2331))
+- *(release)* restore release-plz dependency updates ([#2329](https://github.com/rcore-os/tgoskits/pull/2329))
+- *(starry-kernel)* limit clippy to package features ([#2312](https://github.com/rcore-os/tgoskits/pull/2312))
+- *(net)* prevent Wi-Fi transmit and receive starvation ([#2299](https://github.com/rcore-os/tgoskits/pull/2299))
+- *(qperf)* support QEMU 11.1.1 plugin API v7 ([#2293](https://github.com/rcore-os/tgoskits/pull/2293))
+- *(starry-kernel)* support setting the realtime clock ([#2237](https://github.com/rcore-os/tgoskits/pull/2237))
+- *(ax-fs-ng)* linearize block runtime lifecycle ([#2256](https://github.com/rcore-os/tgoskits/pull/2256))
+- *(starry-test)* keep AKA Wi-Fi smoke to one transfer ([#2257](https://github.com/rcore-os/tgoskits/pull/2257))
+- *(axvisor)* preserve structured console output ([#2204](https://github.com/rcore-os/tgoskits/pull/2204))
+- *(starry)* enforce warning-free builds ([#2244](https://github.com/rcore-os/tgoskits/pull/2244))
+- *(test)* separate host and QEMU test layers ([#2240](https://github.com/rcore-os/tgoskits/pull/2240))
+
+### Other
+
+- release ([#2210](https://github.com/rcore-os/tgoskits/pull/2210))
+- *(repo)* remove duplicated tests and configuration snapshots ([#2326](https://github.com/rcore-os/tgoskits/pull/2326))
+- *(ax-task)* [**breaking**] organize scheduler namespaces and unify runtime APIs ([#2313](https://github.com/rcore-os/tgoskits/pull/2313))
+- *(axbuild)* retain general behavior tests and remove configuration-specific checks ([#2320](https://github.com/rcore-os/tgoskits/pull/2320))
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+- *(ci)* update Rust nightly to 2026-09-04 ([#2273](https://github.com/rcore-os/tgoskits/pull/2273))
+- *(axbuild)* keep executable helpers off noexec tmpfs ([#2243](https://github.com/rcore-os/tgoskits/pull/2243))
+- *(axbuild)* streamline test coverage ([#2245](https://github.com/rcore-os/tgoskits/pull/2245))
+- *(repo)* migrate guidelines into project skills ([#2236](https://github.com/rcore-os/tgoskits/pull/2236))
+- *(repo)* standardize project skill layout ([#2215](https://github.com/rcore-os/tgoskits/pull/2215))
+- *(rsext4)* [**breaking**] align ext4 semantics with Linux 7.1 ([#1957](https://github.com/rcore-os/tgoskits/pull/1957))
+
+## [0.6.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.5.3...axbuild-v0.6.0) - 2026-09-09
+
+### Added
+
+- *(axvm)* service virtio block images with on-demand file I/O ([#2310](https://github.com/rcore-os/tgoskits/pull/2310))
+- *(nixos-tests)* add local StarryOS-backed nixosTest framework ([#2226](https://github.com/rcore-os/tgoskits/pull/2226))
+- *(starry-mm)* redesign VMA lifecycle and transactional updates ([#2261](https://github.com/rcore-os/tgoskits/pull/2261))
+- *(aic8800)* integrate AKA WPA2 Wi-Fi and iperf validation ([#2222](https://github.com/rcore-os/tgoskits/pull/2222))
+- *(axvisor)* add generic vPCI foundation with x86 PCI enumeration ([#2197](https://github.com/rcore-os/tgoskits/pull/2197))
+
+### Fixed
+
+- *(release)* restore release-plz dependency updates ([#2329](https://github.com/rcore-os/tgoskits/pull/2329))
+- *(starry-kernel)* limit clippy to package features ([#2312](https://github.com/rcore-os/tgoskits/pull/2312))
+- *(net)* prevent Wi-Fi transmit and receive starvation ([#2299](https://github.com/rcore-os/tgoskits/pull/2299))
+- *(qperf)* support QEMU 11.1.1 plugin API v7 ([#2293](https://github.com/rcore-os/tgoskits/pull/2293))
+- *(starry-kernel)* support setting the realtime clock ([#2237](https://github.com/rcore-os/tgoskits/pull/2237))
+- *(ax-fs-ng)* linearize block runtime lifecycle ([#2256](https://github.com/rcore-os/tgoskits/pull/2256))
+- *(starry-test)* keep AKA Wi-Fi smoke to one transfer ([#2257](https://github.com/rcore-os/tgoskits/pull/2257))
+- *(axvisor)* preserve structured console output ([#2204](https://github.com/rcore-os/tgoskits/pull/2204))
+- *(starry)* enforce warning-free builds ([#2244](https://github.com/rcore-os/tgoskits/pull/2244))
+- *(test)* separate host and QEMU test layers ([#2240](https://github.com/rcore-os/tgoskits/pull/2240))
+
+### Other
+
+- *(repo)* remove duplicated tests and configuration snapshots ([#2326](https://github.com/rcore-os/tgoskits/pull/2326))
+- *(ax-task)* [**breaking**] organize scheduler namespaces and unify runtime APIs ([#2313](https://github.com/rcore-os/tgoskits/pull/2313))
+- *(axbuild)* retain general behavior tests and remove configuration-specific checks ([#2320](https://github.com/rcore-os/tgoskits/pull/2320))
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+- *(ci)* update Rust nightly to 2026-09-04 ([#2273](https://github.com/rcore-os/tgoskits/pull/2273))
+- *(axbuild)* keep executable helpers off noexec tmpfs ([#2243](https://github.com/rcore-os/tgoskits/pull/2243))
+- *(axbuild)* streamline test coverage ([#2245](https://github.com/rcore-os/tgoskits/pull/2245))
+- *(repo)* migrate guidelines into project skills ([#2236](https://github.com/rcore-os/tgoskits/pull/2236))
+- *(repo)* standardize project skill layout ([#2215](https://github.com/rcore-os/tgoskits/pull/2215))
+- *(rsext4)* [**breaking**] align ext4 semantics with Linux 7.1 ([#1957](https://github.com/rcore-os/tgoskits/pull/1957))
+
+## [0.5.3](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.5.2...axbuild-v0.5.3) - 2026-08-27
+
+### Other
+
+- *(sdmmc)* unify SDIO protocol and AIC8800 driver ([#2201](https://github.com/rcore-os/tgoskits/pull/2201))
+- *(runtime)* make IRQ and multitasking mandatory ([#2188](https://github.com/rcore-os/tgoskits/pull/2188))
+- *(ax-net)* add queue-level NAPI runtime ([#2178](https://github.com/rcore-os/tgoskits/pull/2178))
+
+## [0.5.2](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.5.1...axbuild-v0.5.2) - 2026-08-25
+
+### Fixed
+
+- *(ci)* stabilize recent dev test failures ([#2189](https://github.com/rcore-os/tgoskits/pull/2189))
+- *(ax-driver)* attribute RK3588 governor busy by FDT cpu topology ([#2165](https://github.com/rcore-os/tgoskits/pull/2165))
+
+### Other
+
+- *(test)* consolidate Starry and ArceOS test suites ([#2173](https://github.com/rcore-os/tgoskits/pull/2173))
+
+## [0.5.1](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.5.0...axbuild-v0.5.1) - 2026-08-25
+
+### Fixed
+
+- *(axbuild)* use executable probe test fixtures ([#2183](https://github.com/rcore-os/tgoskits/pull/2183))
+- *(axvisor)* restore runtime counter builds and probe shutdown ([#2181](https://github.com/rcore-os/tgoskits/pull/2181))
+- *(ax-fs-ng)* stabilize block runtime lifecycle publication ([#2135](https://github.com/rcore-os/tgoskits/pull/2135))
+- *(axbuild)* unify qperf support contracts ([#2123](https://github.com/rcore-os/tgoskits/pull/2123))
+- *(axbuild)* narrow clippy for workspace dependency changes ([#2134](https://github.com/rcore-os/tgoskits/pull/2134))
+
+### Other
+
+- FDT IRQ binding validation ([#2062](https://github.com/rcore-os/tgoskits/pull/2062))
+
+## [0.5.0](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.23...axbuild-v0.5.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+- *(ci)* add impact-based PR test matrix ([#2097](https://github.com/rcore-os/tgoskits/pull/2097))
+- add feature development and syscall compatibility guidelines ([#2095](https://github.com/rcore-os/tgoskits/pull/2095))
+- *(axvisor)* axum management HTTP control plane with VM lifecycle API ([#1909](https://github.com/rcore-os/tgoskits/pull/1909))
+- *(starry-nixos)* add Stage-2 NixOS userspace baseline ([#1923](https://github.com/rcore-os/tgoskits/pull/1923))
+- *(axvisor)* Implement inter-VM communication (IVC) demo and protocol enhancements ([#1834](https://github.com/rcore-os/tgoskits/pull/1834))
+
+### Fixed
+
+- *(axvisor)* tighten aarch64 smoke failure matching ([#2112](https://github.com/rcore-os/tgoskits/pull/2112))
+- *(axtask)* preserve scheduler-frame ownership across switches ([#2101](https://github.com/rcore-os/tgoskits/pull/2101))
+- *(starry-kernel)* unify PID namespace identity ownership ([#2023](https://github.com/rcore-os/tgoskits/pull/2023))
+- *(axbuild)* lint host-test targets with clippy ([#2022](https://github.com/rcore-os/tgoskits/pull/2022))
+- *(axbuild)* isolate managed QEMU rootfs writes ([#2018](https://github.com/rcore-os/tgoskits/pull/2018))
+- *(arm-gic-driver)* handle implicit GICv2 uniprocessor targets ([#2007](https://github.com/rcore-os/tgoskits/pull/2007))
+- *(rdrive)* make FDT assigned-clocks best-effort, not probe-fatal ([#2002](https://github.com/rcore-os/tgoskits/pull/2002))
+- *(axbuild)* preserve Axvisor QEMU group artifacts ([#1969](https://github.com/rcore-os/tgoskits/pull/1969))
+- *(axbuild)* suppress debugfs copy noise in Starry image builds ([#1964](https://github.com/rcore-os/tgoskits/pull/1964))
+- *(visionfive2)* restore booti and SD rootfs boot ([#1954](https://github.com/rcore-os/tgoskits/pull/1954))
+
+### Other
+
+- *(repo)* simplify internal dependency release checks ([#2127](https://github.com/rcore-os/tgoskits/pull/2127))
+- *(ci)* narrow clippy and deduplicate event runs ([#2126](https://github.com/rcore-os/tgoskits/pull/2126))
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(serial)* establish bounded owner-affine UART runtime ([#2076](https://github.com/rcore-os/tgoskits/pull/2076))
+- Refactor image storage and update CI output directory options ([#2025](https://github.com/rcore-os/tgoskits/pull/2025))
+- *(errors)* introduce domain-owned error boundaries ([#2024](https://github.com/rcore-os/tgoskits/pull/2024))
+- *(arceos)* guard task IPI progress under constrained TCG ([#2019](https://github.com/rcore-os/tgoskits/pull/2019))
+- *(repo)* move starry-process, starry-signal, and starry-vm to os/StarryOS ([#1974](https://github.com/rcore-os/tgoskits/pull/1974))
+- *(sync)* move lock implementation into ax-task ([#1962](https://github.com/rcore-os/tgoskits/pull/1962))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+- *(axvm)* layer RISC-V SBI IPI routing ([#1920](https://github.com/rcore-os/tgoskits/pull/1920))
+- *(axvisor)* validate x86 OVMF ACPI on VMX and SVM ([#1931](https://github.com/rcore-os/tgoskits/pull/1931))
+
+### Fixed
+
+- *(axvisor)* preserve one QEMU executable per VM configuration build group
+
+## [0.4.23](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.22...axbuild-v0.4.23) - 2026-08-09
+
+### Added
+
+- *(axvisor)* build VMs from a resolved device graph ([#1718](https://github.com/rcore-os/tgoskits/pull/1718))
+- *(axvm)* migrate to real Rust std ([#1910](https://github.com/rcore-os/tgoskits/pull/1910))
+- *(posix)* implement eventfd and bridge epoll for std async ([#1887](https://github.com/rcore-os/tgoskits/pull/1887))
+- *(axvisor)* support ROCK 4D guest boot ([#1880](https://github.com/rcore-os/tgoskits/pull/1880))
+- *(axvisor)* adopt shlex command tokenization ([#1862](https://github.com/rcore-os/tgoskits/pull/1862))
+
+### Fixed
+
+- *(axdevice)* correct fw_cfg DMA fault handling ([#1918](https://github.com/rcore-os/tgoskits/pull/1918))
+- *(riscv-vcpu)* handle virtual interrupt injection for SMP guests ([#1681](https://github.com/rcore-os/tgoskits/pull/1681))
+- *(ci)* restore and stabilize QEMU smoke tests ([#1907](https://github.com/rcore-os/tgoskits/pull/1907))
+- *(axloader)* tighten HTTP boot kernel URL validation ([#1882](https://github.com/rcore-os/tgoskits/pull/1882))
+- *(axbuild)* scope grouped prebuild to selected tests ([#1841](https://github.com/rcore-os/tgoskits/pull/1841))
+
+### Other
+
+- *(axbuild)* reuse ostool OVMF assets and paths ([#1917](https://github.com/rcore-os/tgoskits/pull/1917))
+- *(repo)* move filesystem crates to fs/ directory ([#1867](https://github.com/rcore-os/tgoskits/pull/1867))
+- *(axvisor)* remove NimbOS guest, legacy CI, and standalone scripts ([#1866](https://github.com/rcore-os/tgoskits/pull/1866))
+- *(repo)* unify workspace dependencies ([#1860](https://github.com/rcore-os/tgoskits/pull/1860))
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
+## [0.4.22](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.21...axbuild-v0.4.22) - 2026-08-03
+
+### Added
+
+- *(ahci-driver)* add portable multi-disk AHCI support ([#1795](https://github.com/rcore-os/tgoskits/pull/1795))
+- *(qperf)* support Starry x86_64 profiling ([#1785](https://github.com/rcore-os/tgoskits/pull/1785))
+- *(starry-nix)* activate nixpkgs on StarryOS (with sandboxed nix) ([#1520](https://github.com/rcore-os/tgoskits/pull/1520))
+- *(axbuild)* support session-shared board files ([#1701](https://github.com/rcore-os/tgoskits/pull/1701))
+- *(axbuild)* run might_sleep tests in std CI ([#1689](https://github.com/rcore-os/tgoskits/pull/1689))
+- *(axvisor)* support StarryOS guest on Orange Pi 5 Plus ([#1684](https://github.com/rcore-os/tgoskits/pull/1684))
+
+### Fixed
+
+- *(dma-api)* retire legacy axdma release paths ([#1796](https://github.com/rcore-os/tgoskits/pull/1796))
+- *(axvisor)* standalone xtask CLI compatibility ([#1651](https://github.com/rcore-os/tgoskits/pull/1651))
+- *(ax-task)* initialize tasks before scheduling ([#1783](https://github.com/rcore-os/tgoskits/pull/1783))
+- *(axbuild)* lint Starry aarch64 configurations ([#1778](https://github.com/rcore-os/tgoskits/pull/1778))
+- *(axbuild)* guard Starry ktest no_std features ([#1777](https://github.com/rcore-os/tgoskits/pull/1777))
+- *(axbuild)* reduce Starry test-suit log noise ([#1779](https://github.com/rcore-os/tgoskits/pull/1779))
+- *(axbuild)* enforce QEMU success markers ([#1719](https://github.com/rcore-os/tgoskits/pull/1719))
+
+### Other
+
+- *(block)* adopt IRQ-driven multi-queue runtime ([#1768](https://github.com/rcore-os/tgoskits/pull/1768))
+- *(qemu)* migrate block devices to NVMe ([#1784](https://github.com/rcore-os/tgoskits/pull/1784))
+- *(axvisor)* implement unified emulated device framework ([#1722](https://github.com/rcore-os/tgoskits/pull/1722))
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+### Added
+
+- Allow Starry app board cases with a `rust/` helper to cross-compile the
+  static binary into the per-run session upload root and share it through the
+  board-visible HTTP endpoint without modifying the persistent rootfs.
+- Add `board connect --session-file` and `starry app board --linux-stage` so
+  one board session can upload the exact app assets, print their board-visible
+  HTTP URLs, and open the board's default Linux console before a Starry run.
+
+## [0.4.21](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.20...axbuild-v0.4.21) - 2026-07-23
+
+### Added
+
+- Add HTML report generation and CI coverage tests ([#1627](https://github.com/rcore-os/tgoskits/pull/1627))
+- *(review)* add PR 1631 syscall benchmark guidance ([#1633](https://github.com/rcore-os/tgoskits/pull/1633))
+- *(axbuild)* grade review bench cases with same agent ([#1625](https://github.com/rcore-os/tgoskits/pull/1625))
+- *(axbuild)* add offline agent review benchmark ([#1615](https://github.com/rcore-os/tgoskits/pull/1615))
+- *(arceos)* unify QEMU config layout with StarryOS and Axvisor ([#1613](https://github.com/rcore-os/tgoskits/pull/1613))
+- *(starry)* run x86_64 self-build through the Starry app ([#1076](https://github.com/rcore-os/tgoskits/pull/1076))
+
+### Fixed
+
+- *(axbuild)* disable RISC-V global pointer relaxation ([#1617](https://github.com/rcore-os/tgoskits/pull/1617))
+
+### Other
+
+- *(cpu-local)* extract per-CPU register ownership ([#1662](https://github.com/rcore-os/tgoskits/pull/1662))
+- *(x86_vcpu)* select VMX/SVM backend at runtime from CPUID, rem… ([#1629](https://github.com/rcore-os/tgoskits/pull/1629))
+- *(ci)* update Rust nightly to 2026-07-15 ([#1626](https://github.com/rcore-os/tgoskits/pull/1626))
+- *(axbuild)* 将构建与启动能力收敛到显式配置 ([#1620](https://github.com/rcore-os/tgoskits/pull/1620))
+- *(repo)* update spin to 0.12.2 ([#1619](https://github.com/rcore-os/tgoskits/pull/1619))
+- *(axvmconfig)* introduce configuration errors ([#1597](https://github.com/rcore-os/tgoskits/pull/1597))
+
+## [0.4.20](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.19...axbuild-v0.4.20) - 2026-07-10
+
+### Added
+
+- *(crab-usb)* add SG2002 DWC2 host axtest ([#1496](https://github.com/rcore-os/tgoskits/pull/1496))
+
+### Other
+
+- *(x86_vcpu)* make x86 virtualization OS-neutral ([#1550](https://github.com/rcore-os/tgoskits/pull/1550))
+
+## [0.4.19](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.18...axbuild-v0.4.19) - 2026-07-08
+
+### Other
+
+- *(starry)* unify qemu-smp1 and qemu-smp4 into single qemu test ([#1544](https://github.com/rcore-os/tgoskits/pull/1544))
+
 ## [0.4.18](https://github.com/rcore-os/tgoskits/compare/axbuild-v0.4.17...axbuild-v0.4.18) - 2026-07-08
 
 ### Added
