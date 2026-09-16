@@ -27,6 +27,90 @@ def main_test_rows(plan: dict) -> list[dict]:
 
 
 class CiPlanTests(unittest.TestCase):
+    def test_axvisor_nightly_runs_all_registered_checks_with_artifact_producer(self):
+        catalog = ci_plan.load_catalog(ci_plan.MAIN_MANIFESTS)
+        expected = {check["id"] for check in catalog if check["group"] == "AxVisor"}
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                context = ci_plan.PlanContext(
+                    repository="rcore-os/tgoskits",
+                    repository_owner="rcore-os",
+                    event_name=event,
+                )
+                plan = ci_plan.build_axvisor_nightly_plan(context)
+                rows = plan["axvisor_matrix"]["include"]
+                self.assertEqual({row["id"] for row in rows}, expected)
+                self.assertEqual(len(rows), len(expected))
+                self.assertTrue(any(
+                    "--board orangepi-5-plus-linux --test-case ping" in row["command"]
+                    for row in rows
+                ))
+                producer, = plan["prepare_matrix"]["include"]
+                self.assertTrue(producer["upload_xtask_bin_artifact"])
+                self.assertEqual(producer["command"], "cargo build -p tg-xtask")
+                for row in rows:
+                    if row["download_xtask_bin_artifact"]:
+                        self.assertEqual(
+                            row["xtask_bin_artifact_name"], producer["xtask_bin_artifact_name"]
+                        )
+                main = ci_plan.build_main_plan(context)
+                nightly_ids = {
+                    check["id"] for check in catalog if check.get("nightly_only", False)
+                }
+                self.assertEqual(
+                    [row for row in rows if row["id"] not in nightly_ids],
+                    main["axvisor_matrix"]["include"],
+                )
+
+    def test_main_ci_never_runs_axvisor_nightly_only_cases(self):
+        for event in ("pull_request", "push", "workflow_dispatch", "schedule"):
+            with self.subTest(event=event):
+                context = ci_plan.replace(self.upstream, event_name=event)
+                rows = ci_plan.build_main_plan(context)["axvisor_matrix"]["include"]
+                commands = "\n".join(row["command"] for row in rows)
+                self.assertNotIn("timer-stress", commands)
+                self.assertNotIn("ivc-benchmark", commands)
+                self.assertNotIn("orangepi-5-plus-vcpu-perf", commands)
+                self.assertNotIn("--test-case ping", commands)
+                self.assertIn("--board orangepi-5-plus-linux --test-case smoke", commands)
+                self.assertNotIn("--board orangepi-5-plus-linux\n", commands)
+                self.assertIn("--test-case qemu-ivc", commands)
+                self.assertIn("--board orangepi-5-plus-starry", commands)
+
+    def test_nightly_only_suite_changes_keep_static_checks_without_running_board(self):
+        for path in (
+            "test-suit/axvisor/normal/qemu-timer-stress/gicv3-timer-stress/qemu-aarch64.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/ivc-benchmark/benchmark/board-orangepi-5-plus-ivc-benchmark.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/pci-network/ping/board-orangepi-5-plus-linux.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/vcpu-perf/performance/board-orangepi-5-plus-vcpu-perf.toml",
+        ):
+            with self.subTest(path=path):
+                context = ci_plan.replace(
+                    self.upstream,
+                    impact=ci_plan.CiImpact(
+                        full=False, reason="fixture", changed_paths=(path,),
+                        test_suite_paths=(path,), exclusive=True,
+                    ),
+                )
+                plan = ci_plan.build_main_plan(context)
+                self.assertTrue(plan["static_required"])
+                self.assertFalse(main_test_rows(plan))
+                self.assertFalse(plan["axvisor_required"])
+
+    def test_axvisor_nightly_rejects_incremental_pr_mode(self):
+        with self.assertRaises(ci_plan.PlanError):
+            ci_plan.build_axvisor_nightly_plan(self.upstream)
+
+    def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
+        context = ci_plan.PlanContext(
+            repository="example/tgoskits",
+            repository_owner="example",
+            event_name="workflow_dispatch",
+        )
+        rows = ci_plan.build_axvisor_nightly_plan(context)["axvisor_matrix"]["include"]
+        self.assertTrue(rows)
+        self.assertTrue(all("self-hosted" not in row["runs_on"] for row in rows))
+
     def setUp(self) -> None:
         self.upstream = ci_plan.PlanContext(
             repository="rcore-os/tgoskits",

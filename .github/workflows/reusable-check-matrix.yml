@@ -3,6 +3,11 @@ name: Reusable Check Matrix
 on:
   workflow_call:
     inputs:
+      checkout_ref:
+        description: Immutable revision to test; defaults to the triggering commit.
+        required: false
+        type: string
+        default: ""
       matrix_json:
         description: JSON matrix emitted by scripts/test/ci_plan.py.
         required: true
@@ -63,6 +68,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
           fetch-depth: ${{ matrix.fetch_depth }}
 
       - name: Preflight self-hosted host runner
