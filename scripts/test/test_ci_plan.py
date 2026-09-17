@@ -13,6 +13,12 @@ SPEC = importlib.util.spec_from_file_location("ci_plan", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 ci_plan = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ci_plan)
+PERF_REPORT_SPEC = importlib.util.spec_from_file_location(
+    "ci_perf_report", MODULE_PATH.with_name("ci_perf_report.py")
+)
+assert PERF_REPORT_SPEC is not None and PERF_REPORT_SPEC.loader is not None
+ci_perf_report = importlib.util.module_from_spec(PERF_REPORT_SPEC)
+PERF_REPORT_SPEC.loader.exec_module(ci_perf_report)
 
 MAIN_TEST_PREFIXES = ("workspace", "arceos", "starry", "axvisor")
 MAIN_TEST_GROUPS = ("Workspace", "ArceOS", "Starry", "AxVisor")
@@ -53,6 +59,18 @@ class CiPlanTests(unittest.TestCase):
                         self.assertEqual(
                             row["xtask_bin_artifact_name"], producer["xtask_bin_artifact_name"]
                         )
+                performance_rows = {
+                    row["id"]
+                    for row in rows
+                    if row["performance_report"]
+                }
+                self.assertEqual(
+                    performance_rows,
+                    {
+                        "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark",
+                        "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf",
+                    },
+                )
                 main = ci_plan.build_main_plan(context)
                 nightly_ids = {
                     check["id"] for check in catalog if check.get("nightly_only", False)
@@ -100,6 +118,35 @@ class CiPlanTests(unittest.TestCase):
     def test_axvisor_nightly_rejects_incremental_pr_mode(self):
         with self.assertRaises(ci_plan.PlanError):
             ci_plan.build_axvisor_nightly_plan(self.upstream)
+
+    def test_performance_report_renders_supported_axvisor_results(self):
+        report = ci_perf_report.render_report(
+            "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf",
+            "Board OrangePi 5 Plus · Single ArceOS guest performance",
+            "\n".join(
+                [
+                    "[VM 1] VCPU_PERF_RESULT blocks_per_second=365334.20 "
+                    "baseline=364822.00 threshold=328339.80 samples=[364474.50,365334.20]",
+                    "[VM 1] VCPU_PERF_PASS",
+                ]
+            ),
+        )
+
+        self.assertIn("vCPU throughput", report)
+        self.assertIn("`blocks_per_second`: `365334.20`", report)
+        self.assertIn("`threshold`: `328339.80`", report)
+
+    def test_performance_report_renders_axivc_benchmark_result(self):
+        report = ci_perf_report.render_report(
+            "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark",
+            "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark",
+            "[VM 1] AXVISOR_IVC_BENCH_RESULT=PASS cases=4 testTime=100 "
+            "bytes=1232076800 chunks=400",
+        )
+
+        self.assertIn("AXIVC benchmark", report)
+        self.assertIn("`status`: `PASS`", report)
+        self.assertIn("`bytes`: `1232076800`", report)
 
     def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
         context = ci_plan.PlanContext(

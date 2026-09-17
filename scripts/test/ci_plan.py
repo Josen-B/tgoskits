@@ -66,6 +66,7 @@ TOP_LEVEL_FIELDS = {
 }
 CHECK_FIELDS = {
     "nightly_only",
+    "performance_report",
     "id",
     "name",
     "runner",
@@ -90,6 +91,7 @@ CHECK_FIELDS = {
 REQUIRED_CHECK_FIELDS = {"id", "name", "command"}
 BOOLEAN_CHECK_FIELDS = {
     "nightly_only",
+    "performance_report",
     "upload_xtask_bin_artifact",
     "download_xtask_bin_artifact",
     "wifi_secrets",
@@ -698,6 +700,7 @@ def _normalize_check(check: dict[str, Any], context: PlanContext) -> dict[str, A
         "fetch_depth": fetch_depth,
         "timeout_minutes": check.get("timeout_minutes", 360),
         "require_kvm": check.get("require_kvm", False),
+        "performance_report": check.get("performance_report", False),
         "upload_xtask_bin_artifact": check.get("upload_xtask_bin_artifact", False),
         "download_xtask_bin_artifact": download_xtask,
         "xtask_bin_artifact_name": check.get("xtask_bin_artifact_name", "tg-xtask-bin"),

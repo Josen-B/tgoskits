@@ -1,9 +1,11 @@
 # AxVisor Nightly
 
 The `AxVisor Nightly` workflow runs the registered AxVisor CI checks daily at
-19:20 UTC (03:20 Beijing time). It also supports `workflow_dispatch` from the
-GitHub Actions page. Both triggers test `dev`; the planner resolves its commit
-once and every build and test checks out that same SHA.
+19:20 UTC (03:20 Beijing time). It also supports `workflow_dispatch`: trigger it
+from the GitHub Actions page ("AxVisor Nightly" → "Run workflow", choose `dev`)
+or with `gh workflow run axvisor-nightly.yml --ref dev`. Both triggers test
+`dev`; the planner resolves its commit once and every build and test checks out
+that same SHA.
 
 The workflow must be merged into the repository's default branch before the
 scheduled run is available. Execution is limited to `rcore-os/tgoskits`, whose
@@ -51,6 +53,16 @@ Matrix fail-fast is disabled. The final job reports the tested SHA and stage
 results in the GitHub job summary, and fails if any required stage did not
 succeed. Detailed output remains in each matrix job's Actions log.
 
+Checks marked `performance_report = true` (currently the OrangePi vCPU
+throughput and AXIVC Zephyr-Starry benchmark board tests) additionally get
+their result lines extracted into the job summary and the workflow summary:
+the runner captures the command log, `scripts/test/ci_perf_report.py` renders
+`VCPU_PERF_RESULT` and `AXVISOR_IVC_BENCH_RESULT=` lines as a Markdown table,
+each matrix job appends its table to its own summary, and the final job
+merges the uploaded per-check report artifacts under a "Performance Results"
+section (retained 30 days). Reports render only when the check succeeds; a
+failed run still exposes its numbers through the matrix job log.
+
 Nightly runs do not cancel one another. Board availability, reservation and
 reset remain the responsibility of the existing board test service, shared
 with PR CI. Scheduling after Starry Apps reduces overlap but does not provide
@@ -58,8 +70,8 @@ cross-workflow board exclusion by itself.
 
 Existing image/rootfs requirements still apply. In particular, the OrangePi
 IVC test requires the matching tgosimages IVC payload in the board Linux rootfs.
-This first version does not add automated rootfs provisioning, performance
-regression thresholds, long-duration stress tests or extra log artifacts.
+This first version does not add automated rootfs provisioning, cross-run
+performance trending, long-duration stress tests or extra log artifacts.
 
 ## Local Planning
 

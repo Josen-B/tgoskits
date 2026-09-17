@@ -67,12 +67,22 @@ jobs:
     needs: [plan, prepare, checks]
     runs-on: ubuntu-latest
     steps:
+      - name: Download performance reports
+        if: always()
+        uses: actions/download-artifact@v8
+        with:
+          pattern: axvisor-nightly-performance-*
+          path: ${{ runner.temp }}/performance-reports
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Report result
         env:
           REVISION: ${{ needs.plan.outputs.revision }}
           PLAN_RESULT: ${{ needs.plan.result }}
           PREPARE_RESULT: ${{ needs.prepare.result }}
           CHECKS_RESULT: ${{ needs.checks.result }}
+          PERFORMANCE_REPORT_DIR: ${{ runner.temp }}/performance-reports
         run: |
           {
             echo "## AxVisor Nightly"
@@ -84,6 +94,15 @@ jobs:
             echo "| Plan | ${PLAN_RESULT} |"
             echo "| Prepare | ${PREPARE_RESULT} |"
             echo "| Checks | ${CHECKS_RESULT} |"
+            if [ -d "${PERFORMANCE_REPORT_DIR}" ] && find "${PERFORMANCE_REPORT_DIR}" -name '*.md' -print -quit | grep -q .; then
+              echo ""
+              echo "## Performance Results"
+              echo ""
+              find "${PERFORMANCE_REPORT_DIR}" -name '*.md' -print | sort | while read -r report; do
+                cat "${report}"
+                echo ""
+              done
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           test "$PLAN_RESULT" = success
           test "$PREPARE_RESULT" = success
