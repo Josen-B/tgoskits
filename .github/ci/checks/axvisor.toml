@@ -337,6 +337,22 @@ arch = "aarch64"
 cases = ["gicv2-timer-stress", "gicv3-timer-stress"]
 
 [[check]]
+id = "test-axvisor-self-hosted-board-orangepi-5-plus-linux-ping"
+impact_targets = ["axvisor:aarch64"]
+name = "Board OrangePi 5 Plus · Linux PCI network ping"
+nightly_only = true
+runner = "board"
+timeout_minutes = 90
+command = '''
+cargo xtask axvisor test board --board orangepi-5-plus-linux --test-case ping
+'''
+
+[[check.suite]]
+kind = "axvisor-board"
+board = "orangepi-5-plus-linux"
+cases = ["ping"]
+
+[[check]]
 id = "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark"
 impact_targets = ["axvisor:aarch64", "starry:aarch64"]
 name = "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark"
@@ -354,22 +370,6 @@ cargo xtask axvisor test board --board orangepi-5-plus-ivc-benchmark
 [[check.suite]]
 kind = "axvisor-board"
 board = "orangepi-5-plus-ivc-benchmark"
-
-[[check]]
-id = "test-axvisor-self-hosted-board-orangepi-5-plus-linux-ping"
-impact_targets = ["axvisor:aarch64"]
-name = "Board OrangePi 5 Plus · Linux PCI network ping"
-nightly_only = true
-runner = "board"
-timeout_minutes = 90
-command = '''
-cargo xtask axvisor test board --board orangepi-5-plus-linux --test-case ping
-'''
-
-[[check.suite]]
-kind = "axvisor-board"
-board = "orangepi-5-plus-linux"
-cases = ["ping"]
 
 [[check]]
 id = "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf"
