@@ -88,12 +88,24 @@ jobs:
 
       - name: Update benchmark history
         if: steps.collect.outputs.metrics != '0'
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: AxVisor Nightly Benchmarks
-          tool: customBiggerIsBetter
-          output-file-path: ${{ runner.temp }}/bench.json
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: axvisor-perf
-          auto-push: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          # Distinct revision per dispatch so repeated verification runs on the
+          # same day show up as separate points on the date axis.
+          NIGHTLY_REVISION: verify-${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages
+          git worktree add --detach "${RUNNER_TEMP}/gh-pages" FETCH_HEAD
+          python3 scripts/test/ci_perf_dashboard.py \
+            --metrics "${RUNNER_TEMP}/bench.json" \
+            --history "${RUNNER_TEMP}/gh-pages/axvisor-perf/history.json" \
+            --date "$(date -u +%F)" \
+            --revision "${NIGHTLY_REVISION}" \
+            --title "AxVisor Nightly Benchmarks" \
+            --output "${RUNNER_TEMP}/gh-pages/axvisor-perf/index.html"
+          cd "${RUNNER_TEMP}/gh-pages"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add axvisor-perf
+          git commit -m "chore: update axvisor-perf dashboard"
+          git push origin HEAD:refs/heads/gh-pages

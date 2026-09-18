@@ -19,6 +19,12 @@ PERF_REPORT_SPEC = importlib.util.spec_from_file_location(
 assert PERF_REPORT_SPEC is not None and PERF_REPORT_SPEC.loader is not None
 ci_perf_report = importlib.util.module_from_spec(PERF_REPORT_SPEC)
 PERF_REPORT_SPEC.loader.exec_module(ci_perf_report)
+PERF_DASHBOARD_SPEC = importlib.util.spec_from_file_location(
+    "ci_perf_dashboard", MODULE_PATH.with_name("ci_perf_dashboard.py")
+)
+assert PERF_DASHBOARD_SPEC is not None and PERF_DASHBOARD_SPEC.loader is not None
+ci_perf_dashboard = importlib.util.module_from_spec(PERF_DASHBOARD_SPEC)
+PERF_DASHBOARD_SPEC.loader.exec_module(ci_perf_dashboard)
 
 MAIN_TEST_PREFIXES = ("workspace", "arceos", "starry", "axvisor")
 MAIN_TEST_GROUPS = ("Workspace", "ArceOS", "Starry", "AxVisor")
@@ -199,6 +205,34 @@ class CiPlanTests(unittest.TestCase):
                 {"name": "ivc-bench/receive/1MiB", "unit": "MB/s", "value": 2045.21},
             ],
         )
+
+    def test_perf_dashboard_groups_by_test_case_with_date_axis_lines(self):
+        metrics = [
+            {"name": "vcpu-perf/blocks_per_second", "unit": "blocks/s", "value": 368008.45},
+            {"name": "ivc-bench/send/256KiB", "unit": "MB/s", "value": 2263.10},
+            {"name": "ivc-bench/receive/256KiB", "unit": "MB/s", "value": 1505.03},
+        ]
+        history = ci_perf_dashboard.update_history([], "2026-09-17", "rev1", metrics)
+        partial = [
+            {"name": "ivc-bench/send/256KiB", "unit": "MB/s", "value": 2287.42},
+        ]
+        history = ci_perf_dashboard.update_history(history, "2026-09-18", "rev2", partial)
+        # Re-running the same nightly replaces instead of appending.
+        history = ci_perf_dashboard.update_history(history, "2026-09-18", "rev2", partial)
+        self.assertEqual(
+            [entry["date"] for entry in history], ["2026-09-17", "2026-09-18"]
+        )
+
+        html = ci_perf_dashboard.render_dashboard("AxVisor Nightly Benchmarks", history)
+        self.assertIn("<h2>vcpu-perf</h2>", html)
+        self.assertIn("<h2>ivc-bench</h2>", html)
+        self.assertIn('"labels": ["2026-09-17", "2026-09-18"]', html)
+        self.assertIn('"fill": false', html)
+        self.assertNotIn('"fill": true', html)
+        self.assertIn('"text": "blocks/s"', html)
+        self.assertIn('"text": "MB/s"', html)
+        # A metric missing on a later day renders as a gap, not a zero.
+        self.assertIn('"data": [368008.45, null]', html)
 
     def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
         context = ci_plan.PlanContext(
