@@ -81,8 +81,21 @@ jobs:
             </body>
           </html>
           HTML
-          blob=$(git hash-object -w "${redirect}")
-          tree=$(printf '100644 blob %s\tindex.html\n' "${blob}" | git mktree)
+          placeholder=$(mktemp)
+          cat > "${placeholder}" <<'HTML'
+          <!DOCTYPE html>
+          <html>
+            <head><meta charset="utf-8"><title>tgoskits performance dashboard</title></head>
+            <body>
+              <h1>No benchmark data yet</h1>
+              <p>This dashboard is populated by the nightly performance-history job.</p>
+            </body>
+          </html>
+          HTML
+          root_blob=$(git hash-object -w "${redirect}")
+          placeholder_blob=$(git hash-object -w "${placeholder}")
+          inner_tree=$(printf '100644 blob %s\tindex.html\n' "${placeholder_blob}" | git mktree)
+          tree=$(printf '100644 blob %s\tindex.html\n040000 tree %s\taxvisor-perf\n' "${root_blob}" "${inner_tree}" | git mktree)
           commit=$(git commit-tree "${tree}" -m "chore: initialize gh-pages for benchmark history")
           git push origin "${commit}:refs/heads/gh-pages"
 
