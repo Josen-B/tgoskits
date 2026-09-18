@@ -170,6 +170,5 @@ jobs:
           tool: customBiggerIsBetter
           output-file-path: ${{ runner.temp }}/bench.json
           gh-pages-branch: gh-pages
-          benchmark-data-dir-path: perf
           auto-push: true
           github-token: ${{ secrets.GITHUB_TOKEN }}

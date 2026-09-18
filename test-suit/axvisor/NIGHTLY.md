@@ -64,10 +64,11 @@ section (retained 30 days). Reports render only when the check succeeds; a
 failed run still exposes its numbers through the matrix job log.
 
 A final `Performance History` job also collects the per-check benchmark JSON
-(`customBiggerIsBetter` metrics) and appends it to the `gh-pages` branch with
-`benchmark-action/github-action-benchmark`, publishing a cross-day chart
+(`customBiggerIsBetter` metrics) and appends it to the `gh-pages` branch root
+with `benchmark-action/github-action-benchmark`, publishing a cross-day chart
 dashboard through GitHub Pages. The dashboard requires Pages to be enabled
-(deploy from `gh-pages`); nightly writes history only in `rcore-os/tgoskits`.
+(deploy from `gh-pages` root); nightly writes history only in
+`rcore-os/tgoskits`.
 
 Nightly runs do not cancel one another. Board availability, reservation and
 reset remain the responsibility of the existing board test service, shared
