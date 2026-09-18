@@ -16,24 +16,24 @@ code { background: #f1f5f9; padding: 0.1rem 0.3rem; border-radius: 4px; }
 </head>
 <body>
 <h1>AxVisor Nightly Benchmarks</h1>
-<p>Last nightly: 2026-09-18 · revision <code>verify-8</code></p>
+<p>Last nightly: 2026-09-18 · revision <code>verify-9</code></p>
 <section>
 <h2>vcpu-perf</h2>
 <div class="chart-wrap"><canvas id="chart-0"></canvas></div>
 <script>
-new Chart(document.getElementById('chart-0'), {"type": "line", "data": {"labels": ["2026-09-18"], "datasets": [{"label": "blocks_per_second", "data": [368008.45], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "blocks/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
+new Chart(document.getElementById('chart-0'), {"type": "line", "data": {"labels": ["2026-09-18", "2026-09-18"], "datasets": [{"label": "blocks_per_second", "data": [368008.45, 368008.45], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "blocks/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
 </script>
 </section><section>
 <h2>ivc-bench/send</h2>
 <div class="chart-wrap"><canvas id="chart-1"></canvas></div>
 <script>
-new Chart(document.getElementById('chart-1'), {"type": "line", "data": {"labels": ["2026-09-18"], "datasets": [{"label": "256KiB", "data": [2263.1], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "512KiB", "data": [2284.72], "borderColor": "#dc2626", "backgroundColor": "#dc2626", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "1MiB", "data": [2287.42], "borderColor": "#16a34a", "backgroundColor": "#16a34a", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "10MiB", "data": [2238.97], "borderColor": "#9333ea", "backgroundColor": "#9333ea", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "MB/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
+new Chart(document.getElementById('chart-1'), {"type": "line", "data": {"labels": ["2026-09-18", "2026-09-18"], "datasets": [{"label": "256KiB", "data": [2263.1, 2263.1], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "512KiB", "data": [2284.72, 2284.72], "borderColor": "#dc2626", "backgroundColor": "#dc2626", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "1MiB", "data": [2287.42, 2287.42], "borderColor": "#16a34a", "backgroundColor": "#16a34a", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "10MiB", "data": [2238.97, 2238.97], "borderColor": "#9333ea", "backgroundColor": "#9333ea", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "MB/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
 </script>
 </section><section>
 <h2>ivc-bench/receive</h2>
 <div class="chart-wrap"><canvas id="chart-2"></canvas></div>
 <script>
-new Chart(document.getElementById('chart-2'), {"type": "line", "data": {"labels": ["2026-09-18"], "datasets": [{"label": "256KiB", "data": [1505.03], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "512KiB", "data": [1959.02], "borderColor": "#dc2626", "backgroundColor": "#dc2626", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "1MiB", "data": [2045.21], "borderColor": "#16a34a", "backgroundColor": "#16a34a", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "10MiB", "data": [2074.69], "borderColor": "#9333ea", "backgroundColor": "#9333ea", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "MB/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
+new Chart(document.getElementById('chart-2'), {"type": "line", "data": {"labels": ["2026-09-18", "2026-09-18"], "datasets": [{"label": "256KiB", "data": [1505.03, 1505.03], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "512KiB", "data": [1959.02, 1959.02], "borderColor": "#dc2626", "backgroundColor": "#dc2626", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "1MiB", "data": [2045.21, 2045.21], "borderColor": "#16a34a", "backgroundColor": "#16a34a", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "10MiB", "data": [2074.69, 2074.69], "borderColor": "#9333ea", "backgroundColor": "#9333ea", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "MB/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
 </script>
 </section>
 </body>
