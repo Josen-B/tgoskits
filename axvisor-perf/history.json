@@ -1,0 +1,53 @@
+[
+  {
+    "date": "2026-09-18",
+    "revision": "verify-8",
+    "metrics": [
+      {
+        "name": "vcpu-perf/blocks_per_second",
+        "unit": "blocks/s",
+        "value": 368008.45
+      },
+      {
+        "name": "ivc-bench/send/256KiB",
+        "unit": "MB/s",
+        "value": 2263.1
+      },
+      {
+        "name": "ivc-bench/receive/256KiB",
+        "unit": "MB/s",
+        "value": 1505.03
+      },
+      {
+        "name": "ivc-bench/send/512KiB",
+        "unit": "MB/s",
+        "value": 2284.72
+      },
+      {
+        "name": "ivc-bench/receive/512KiB",
+        "unit": "MB/s",
+        "value": 1959.02
+      },
+      {
+        "name": "ivc-bench/send/1MiB",
+        "unit": "MB/s",
+        "value": 2287.42
+      },
+      {
+        "name": "ivc-bench/receive/1MiB",
+        "unit": "MB/s",
+        "value": 2045.21
+      },
+      {
+        "name": "ivc-bench/send/10MiB",
+        "unit": "MB/s",
+        "value": 2238.97
+      },
+      {
+        "name": "ivc-bench/receive/10MiB",
+        "unit": "MB/s",
+        "value": 2074.69
+      }
+    ]
+  }
+]
