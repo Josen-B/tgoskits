@@ -53,7 +53,7 @@ Matrix fail-fast is disabled. The final job reports the tested SHA and stage
 results in the GitHub job summary, and fails if any required stage did not
 succeed. Detailed output remains in each matrix job's Actions log.
 
-Checks marked `performance_report = true` (currently the OrangePi vCPU
+checks marked `performance_report = true` (currently the OrangePi vCPU
 throughput and AXIVC Zephyr-Starry benchmark board tests) additionally get
 their result lines extracted into the job summary and the workflow summary:
 the runner captures the command log, `scripts/test/ci_perf_report.py` renders
@@ -62,6 +62,12 @@ each matrix job appends its table to its own summary, and the final job
 merges the uploaded per-check report artifacts under a "Performance Results"
 section (retained 30 days). Reports render only when the check succeeds; a
 failed run still exposes its numbers through the matrix job log.
+
+A final `Performance History` job also collects the per-check benchmark JSON
+(`customBiggerIsBetter` metrics) and appends it to the `gh-pages` branch with
+`benchmark-action/github-action-benchmark`, publishing a cross-day chart
+dashboard through GitHub Pages. The dashboard requires Pages to be enabled
+(deploy from `gh-pages`); nightly writes history only in `rcore-os/tgoskits`.
 
 Nightly runs do not cancel one another. Board availability, reservation and
 reset remain the responsibility of the existing board test service, shared

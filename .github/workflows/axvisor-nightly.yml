@@ -107,3 +107,55 @@ jobs:
           test "$PLAN_RESULT" = success
           test "$PREPARE_RESULT" = success
           test "$CHECKS_RESULT" = success
+
+  perf-history:
+    name: Performance History
+    if: always() && github.repository == 'rcore-os/tgoskits'
+    needs: [plan, checks]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+
+      - name: Download performance reports
+        uses: actions/download-artifact@v8
+        with:
+          pattern: axvisor-nightly-performance-*
+          path: ${{ runner.temp }}/performance-reports
+          merge-multiple: true
+
+      - name: Collect benchmark data
+        id: collect
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP" <<'EOF'
+          import json, pathlib, sys
+          reports = pathlib.Path(sys.argv[1]) / "performance-reports"
+          metrics = [
+              metric
+              for path in sorted(reports.glob("*.json"))
+              for metric in json.loads(path.read_text(encoding="utf-8"))
+          ]
+          output = pathlib.Path(sys.argv[1]) / "bench.json"
+          output.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+          print(f"collected {len(metrics)} metrics")
+          EOF
+          count=$(python3 -c \
+            "import json, os; print(len(json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'bench.json')))))")
+          echo "metrics=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Update benchmark history
+        if: steps.collect.outputs.metrics != '0'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: AxVisor Nightly Benchmarks
+          tool: customBiggerIsBetter
+          output-file-path: ${{ runner.temp }}/bench.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: perf
+          auto-push: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}

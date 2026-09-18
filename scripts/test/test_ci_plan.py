@@ -120,20 +120,21 @@ class CiPlanTests(unittest.TestCase):
             ci_plan.build_axvisor_nightly_plan(self.upstream)
 
     def test_performance_report_renders_supported_axvisor_results(self):
+        log_text = "\n".join(
+            [
+                "[VM 1] VCPU_PERF_SAMPLE index=0 blocks=1099483 "
+                "elapsed_ns=3000001123 timer_wakes=3011 checksum=841832",
+                "[VM 1] VCPU_PERF_SAMPLE index=1 blocks=1100123 "
+                "elapsed_ns=3000000987 timer_wakes=3010 checksum=841890",
+                "[VM 1] VCPU_PERF_RESULT blocks_per_second=365334.20 "
+                "baseline=364822.00 threshold=328339.80 samples=[364474.50,365334.20]",
+                "[VM 1] VCPU_PERF_PASS",
+            ]
+        )
         report = ci_perf_report.render_report(
             "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf",
             "Board OrangePi 5 Plus · Single ArceOS guest performance",
-            "\n".join(
-                [
-                    "[VM 1] VCPU_PERF_SAMPLE index=0 blocks=1099483 "
-                    "elapsed_ns=3000001123 timer_wakes=3011 checksum=841832",
-                    "[VM 1] VCPU_PERF_SAMPLE index=1 blocks=1100123 "
-                    "elapsed_ns=3000000987 timer_wakes=3010 checksum=841890",
-                    "[VM 1] VCPU_PERF_RESULT blocks_per_second=365334.20 "
-                    "baseline=364822.00 threshold=328339.80 samples=[364474.50,365334.20]",
-                    "[VM 1] VCPU_PERF_PASS",
-                ]
-            ),
+            log_text,
         )
 
         self.assertIn("#### vCPU samples (per window)", report)
@@ -148,24 +149,35 @@ class CiPlanTests(unittest.TestCase):
         self.assertIn(
             "| 365334.20 | 364822.00 | 328339.80 | [364474.50,365334.20] |", report
         )
+        self.assertEqual(
+            ci_perf_report.render_benchmarks(log_text),
+            [
+                {
+                    "name": "vcpu-perf/blocks_per_second",
+                    "unit": "blocks/s",
+                    "value": 365334.20,
+                }
+            ],
+        )
 
     def test_performance_report_renders_axivc_benchmark_result(self):
+        log_text = "\n".join(
+            [
+                "[test_output] ========================================",
+                "[test_output] average sendBandwidth = 2263.10 MB/s, "
+                "average receiveBandwidth = 1505.03 MB/s, "
+                "testTime = 100, datasize = 262144",
+                "[test_output] average sendBandwidth = 2287.42 MB/s, "
+                "average receiveBandwidth = 2045.21 MB/s, "
+                "testTime = 100, datasize = 1048576",
+                "AXVISOR_IVC_BENCH_RESULT=PASS cases=4 testTime=100 "
+                "bytes=1232076800 chunks=400",
+            ]
+        )
         report = ci_perf_report.render_report(
             "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark",
             "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark",
-            "\n".join(
-                [
-                    "[test_output] ========================================",
-                    "[test_output] average sendBandwidth = 2263.10 MB/s, "
-                    "average receiveBandwidth = 1505.03 MB/s, "
-                    "testTime = 100, datasize = 262144",
-                    "[test_output] average sendBandwidth = 2287.42 MB/s, "
-                    "average receiveBandwidth = 2045.21 MB/s, "
-                    "testTime = 100, datasize = 1048576",
-                    "AXVISOR_IVC_BENCH_RESULT=PASS cases=4 testTime=100 "
-                    "bytes=1232076800 chunks=400",
-                ]
-            ),
+            log_text,
         )
 
         self.assertIn("#### AXIVC benchmark per-case bandwidth", report)
@@ -178,6 +190,15 @@ class CiPlanTests(unittest.TestCase):
         self.assertIn("#### AXIVC benchmark result", report)
         self.assertIn("| status | cases | testTime | bytes | chunks |", report)
         self.assertIn("| PASS | 4 | 100 | 1232076800 | 400 |", report)
+        self.assertEqual(
+            ci_perf_report.render_benchmarks(log_text),
+            [
+                {"name": "ivc-bench/send/256KiB", "unit": "MB/s", "value": 2263.10},
+                {"name": "ivc-bench/receive/256KiB", "unit": "MB/s", "value": 1505.03},
+                {"name": "ivc-bench/send/1MiB", "unit": "MB/s", "value": 2287.42},
+                {"name": "ivc-bench/receive/1MiB", "unit": "MB/s", "value": 2045.21},
+            ],
+        )
 
     def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
         context = ci_plan.PlanContext(
