@@ -238,6 +238,28 @@ class CiPlanTests(unittest.TestCase):
         # A metric missing on a later day renders as a gap, not a zero.
         self.assertIn('"data": [368008.45, null]', html)
 
+    def test_perf_dashboard_charts_only_the_most_recent_window(self):
+        metrics = [
+            {"name": "vcpu-perf/blocks_per_second", "unit": "blocks/s", "value": 1.0},
+        ]
+        history: list[dict[str, object]] = []
+        for day in range(1, 10):
+            history = ci_perf_dashboard.update_history(
+                history, f"2026-09-0{day}", f"rev{day}", metrics
+            )
+
+        html = ci_perf_dashboard.render_dashboard("Benchmarks", history, window=7)
+        self.assertNotIn('"2026-09-01"', html)
+        self.assertNotIn('"2026-09-02"', html)
+        self.assertIn('"2026-09-03"', html)
+        self.assertIn('"2026-09-09"', html)
+        self.assertIn("showing last 7 of 9 nightly entries", html)
+        # window=0 keeps the full history available for manual inspection.
+        self.assertIn(
+            '"2026-09-01"',
+            ci_perf_dashboard.render_dashboard("Benchmarks", history, window=0),
+        )
+
     def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
         context = ci_plan.PlanContext(
             repository="example/tgoskits",

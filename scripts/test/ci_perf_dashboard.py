@@ -135,14 +135,23 @@ new Chart(document.getElementById('chart-{index}'), {payload});
 </section>"""
 
 
-def render_dashboard(title: str, history: list[dict[str, object]]) -> str:
+def render_dashboard(
+    title: str, history: list[dict[str, object]], window: int = 7
+) -> str:
     if not history:
         raise ValueError("cannot render an empty history")
+    # The JSON keeps every nightly entry; charts show the most recent window.
+    visible = history[-window:] if window > 0 else history
     sections = [
-        render_chart_section(index, prefix, unit, names, history)
-        for index, ((prefix, unit), names) in enumerate(collect_groups(history).items())
+        render_chart_section(index, prefix, unit, names, visible)
+        for index, ((prefix, unit), names) in enumerate(collect_groups(visible).items())
     ]
-    latest = history[-1]
+    latest = visible[-1]
+    window_note = (
+        f" · showing last {len(visible)} of {len(history)} nightly entries"
+        if len(visible) < len(history)
+        else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -161,7 +170,7 @@ code {{ background: #f1f5f9; padding: 0.1rem 0.3rem; border-radius: 4px; }}
 </head>
 <body>
 <h1>{title}</h1>
-<p>Last nightly: {latest['date']} · revision <code>{latest['revision']}</code></p>
+<p>Last nightly: {latest['date']} · revision <code>{latest['revision']}</code>{window_note}</p>
 {''.join(sections)}
 </body>
 </html>
@@ -175,6 +184,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--title", default="Performance Benchmarks")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=7,
+        help="Number of most recent nightly entries to chart; 0 charts all",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -192,9 +207,9 @@ def main() -> int:
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
-            render_dashboard(args.title, history), encoding="utf-8"
+            render_dashboard(args.title, history, args.window), encoding="utf-8"
         )
-        print(f"dashboard now covers {len(history)} nightly entries")
+        print(f"dashboard covers {len(history)} nightly entries")
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"performance dashboard failed: {error}", file=sys.stderr)
         return 1

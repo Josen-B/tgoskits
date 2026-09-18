@@ -192,6 +192,7 @@ jobs:
             --date "$(date -u +%F)" \
             --revision "${NIGHTLY_REVISION}" \
             --title "AxVisor Nightly Benchmarks" \
+            --window 7 \
             --output "${RUNNER_TEMP}/gh-pages/axvisor-perf/index.html"
           cd "${RUNNER_TEMP}/gh-pages"
           git config user.name "github-actions[bot]"
