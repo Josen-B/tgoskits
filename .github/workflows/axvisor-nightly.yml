@@ -148,6 +148,20 @@ jobs:
             "import json, os; print(len(json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'bench.json')))))")
           echo "metrics=${count}" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure gh-pages branch exists
+        run: |
+          set -euo pipefail
+          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+            echo "gh-pages already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # git's well-known empty tree object; creates the branch without a checkout.
+          empty_tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+          commit=$(git commit-tree "${empty_tree}" -m "chore: initialize gh-pages for benchmark history")
+          git push origin "${commit}:refs/heads/gh-pages"
+
       - name: Update benchmark history
         if: steps.collect.outputs.metrics != '0'
         uses: benchmark-action/github-action-benchmark@v1
