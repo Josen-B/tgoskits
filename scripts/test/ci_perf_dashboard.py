@@ -78,14 +78,17 @@ def entry_value(entry: dict[str, object], name: str) -> float | None:
 def collect_groups(
     history: list[dict[str, object]],
 ) -> dict[tuple[str, str], list[str]]:
+    # The last path segment of a metric name is the series label; everything
+    # before it is the chart group (e.g. "ivc-bench/send" vs "ivc-bench/receive").
     groups: dict[tuple[str, str], list[str]] = {}
     for entry in history:
         for metric in entry["metrics"]:
-            prefix = str(metric["name"]).partition("/")[0]
-            key = (prefix, str(metric["unit"]))
+            name = str(metric["name"])
+            group = name.rpartition("/")[0] or name
+            key = (group, str(metric["unit"]))
             groups.setdefault(key, [])
             if metric["name"] not in groups[key]:
-                groups[key].append(str(metric["name"]))
+                groups[key].append(name)
     return groups
 
 
@@ -102,7 +105,7 @@ def render_chart_section(
         color = COLORS[position % len(COLORS)]
         datasets.append(
             {
-                "label": name.partition("/")[2] or name,
+                "label": name.rpartition("/")[2] or name,
                 "data": [entry_value(entry, name) for entry in history],
                 "borderColor": color,
                 "backgroundColor": color,

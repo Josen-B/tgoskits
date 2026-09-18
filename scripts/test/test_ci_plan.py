@@ -225,7 +225,11 @@ class CiPlanTests(unittest.TestCase):
 
         html = ci_perf_dashboard.render_dashboard("AxVisor Nightly Benchmarks", history)
         self.assertIn("<h2>vcpu-perf</h2>", html)
-        self.assertIn("<h2>ivc-bench</h2>", html)
+        # Send and receive bandwidth get separate charts.
+        self.assertIn("<h2>ivc-bench/send</h2>", html)
+        self.assertIn("<h2>ivc-bench/receive</h2>", html)
+        self.assertNotIn("<h2>ivc-bench</h2>", html)
+        self.assertIn('"label": "256KiB"', html)
         self.assertIn('"labels": ["2026-09-17", "2026-09-18"]', html)
         self.assertIn('"fill": false', html)
         self.assertNotIn('"fill": true', html)
