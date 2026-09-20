@@ -63,6 +63,10 @@ jobs:
           # Distinct revision per dispatch so repeated verification runs on the
           # same day show up as separate points on the date axis.
           NIGHTLY_REVISION: verify-${{ github.run_number }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
           set -euo pipefail
           dashboard="${RUNNER_TEMP}/dashboard"
