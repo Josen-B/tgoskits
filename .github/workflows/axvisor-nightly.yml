@@ -115,6 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - name: Checkout tested revision
         uses: actions/checkout@v6
@@ -148,68 +149,36 @@ jobs:
             "import json, os; print(len(json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'bench.json')))))")
           echo "metrics=${count}" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure gh-pages branch exists
-        run: |
-          set -euo pipefail
-          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
-            echo "gh-pages already exists"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Seed the branch with a root redirect so the site never falls back
-          # to rendering a README; the dashboard itself lives in axvisor-perf/.
-          redirect=$(mktemp)
-          cat > "${redirect}" <<'HTML'
-          <!DOCTYPE html>
-          <html>
-            <head>
-              <meta charset="utf-8">
-              <meta http-equiv="refresh" content="0; url=axvisor-perf/">
-              <title>tgoskits performance dashboard</title>
-            </head>
-            <body>
-              <p>Redirecting to the <a href="axvisor-perf/">benchmark dashboard</a>.</p>
-            </body>
-          </html>
-          HTML
-          placeholder=$(mktemp)
-          cat > "${placeholder}" <<'HTML'
-          <!DOCTYPE html>
-          <html>
-            <head><meta charset="utf-8"><title>tgoskits performance dashboard</title></head>
-            <body>
-              <h1>No benchmark data yet</h1>
-              <p>This dashboard is populated by the nightly performance-history job.</p>
-            </body>
-          </html>
-          HTML
-          root_blob=$(git hash-object -w "${redirect}")
-          placeholder_blob=$(git hash-object -w "${placeholder}")
-          inner_tree=$(printf '100644 blob %s\tindex.html\n' "${placeholder_blob}" | git mktree)
-          tree=$(printf '100644 blob %s\tindex.html\n040000 tree %s\taxvisor-perf\n' "${root_blob}" "${inner_tree}" | git mktree)
-          commit=$(git commit-tree "${tree}" -m "chore: initialize gh-pages for benchmark history")
-          git push origin "${commit}:refs/heads/gh-pages"
-
-      - name: Update benchmark history
+      - name: Publish dashboard branch
         if: steps.collect.outputs.metrics != '0'
         env:
           NIGHTLY_REVISION: ${{ needs.plan.outputs.revision }}
         run: |
           set -euo pipefail
-          git fetch origin gh-pages
-          git worktree add --detach "${RUNNER_TEMP}/gh-pages" FETCH_HEAD
+          # perf-data is a data-only branch; docs.yml merges it into the site,
+          # so this job never touches the Pages deployment itself.
+          dashboard="${RUNNER_TEMP}/dashboard"
+          mkdir -p "${dashboard}"
+          if git fetch --depth=1 origin perf-data 2>/dev/null; then
+            git show FETCH_HEAD:history.json > "${dashboard}/history.json"
+          fi
           python3 scripts/test/ci_perf_dashboard.py \
             --metrics "${RUNNER_TEMP}/bench.json" \
-            --history "${RUNNER_TEMP}/gh-pages/axvisor-perf/history.json" \
+            --history "${dashboard}/history.json" \
             --date "$(date -u +%F)" \
             --revision "${NIGHTLY_REVISION}" \
             --title "AxVisor Nightly Benchmarks" \
             --window 7 \
-            --output "${RUNNER_TEMP}/gh-pages/axvisor-perf/index.html"
-          cd "${RUNNER_TEMP}/gh-pages"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add axvisor-perf
-          git commit -m "chore: update axvisor-perf dashboard"
-          git push origin HEAD:refs/heads/gh-pages
+            --output "${dashboard}/index.html"
+          html_blob=$(git hash-object -w "${dashboard}/index.html")
+          json_blob=$(git hash-object -w "${dashboard}/history.json")
+          tree=$(printf '100644 blob %s\tindex.html\n100644 blob %s\thistory.json\n' \
+            "${html_blob}" "${json_blob}" | git mktree)
+          commit=$(git commit-tree "${tree}" -m "chore: update perf dashboard for $(date -u +%F)")
+          git push --force origin "${commit}:refs/heads/perf-data"
+
+      - name: Refresh docs pages
+        if: steps.collect.outputs.metrics != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run docs.yml --ref main

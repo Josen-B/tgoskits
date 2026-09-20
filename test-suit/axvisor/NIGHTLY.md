@@ -64,14 +64,15 @@ section (retained 30 days). Reports render only when the check succeeds; a
 failed run still exposes its numbers through the matrix job log.
 
 A final `Performance History` job also collects the per-check benchmark JSON,
-appends it to `axvisor-perf/history.json` on the `gh-pages` branch, and renders
-`axvisor-perf/index.html` with `scripts/test/ci_perf_dashboard.py` (Chart.js).
-Each test case gets its own chart (vCPU throughput, IVC send, IVC receive), the
-x-axis is the nightly date, and lines are unfilled; charts show the most recent
-7 nightly entries while `history.json` keeps all of them, and re-running the
-same nightly date replaces its entry. The site
-root redirects to `axvisor-perf/`. The dashboard requires Pages to be enabled
-(deploy from `gh-pages` root); nightly writes history only in
+appends it to the `perf-data` branch, and renders a Chart.js dashboard
+(`scripts/test/ci_perf_dashboard.py`). Each test case gets its own chart (vCPU
+throughput, IVC send, IVC receive), the x-axis is the nightly date, lines are
+unfilled, and charts show the most recent 7 nightly entries while
+`history.json` keeps all of them. The job then dispatches `docs.yml`, which
+merges `perf-data` into `docs/build/axvisor-perf` before publishing Pages, so
+the dashboard appears next to the documentation at
+`<docs-site>/axvisor-perf/`. `docs.yml` also rebuilds nightly as a fallback.
+The job never touches the Pages deployment itself and writes history only in
 `rcore-os/tgoskits`.
 
 Nightly runs do not cancel one another. Board availability, reservation and
