@@ -93,4 +93,5 @@ jobs:
         if: steps.collect.outputs.metrics != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run docs.yml --ref main
+        # The fork's github-pages environment only allows its default branch (dev).
+        run: gh workflow run docs.yml --ref dev
