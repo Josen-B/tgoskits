@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AxVisor Nightly Benchmarks</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+h1 { font-size: 1.5rem; }
+h2 { font-size: 1.15rem; margin-bottom: 0.5rem; }
+section { margin: 2.5rem 0; }
+.chart-wrap { position: relative; height: 420px; }
+code { background: #f1f5f9; padding: 0.1rem 0.3rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>AxVisor Nightly Benchmarks</h1>
+<p>Last nightly: 2026-09-20 · revision <code>verify-19</code> · showing last 7 of 8 nightly entries</p>
+<section>
+<h2>vcpu-perf</h2>
+<div class="chart-wrap"><canvas id="chart-0"></canvas></div>
+<script>
+new Chart(document.getElementById('chart-0'), {"type": "line", "data": {"labels": ["2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20"], "datasets": [{"label": "blocks_per_second", "data": [368008.45, 368008.45, 368008.45, 368008.45, 368008.45, 368008.45, 368008.45], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "blocks/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+</section><section>
+<h2>ivc-bench/send</h2>
+<div class="chart-wrap"><canvas id="chart-1"></canvas></div>
+<script>
+new Chart(document.getElementById('chart-1'), {"type": "line", "data": {"labels": ["2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20"], "datasets": [{"label": "256KiB", "data": [2263.1, 2263.1, 2263.1, 2263.1, 2263.1, 2263.1, 2263.1], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "512KiB", "data": [2284.72, 2284.72, 2284.72, 2284.72, 2284.72, 2284.72, 2284.72], "borderColor": "#dc2626", "backgroundColor": "#dc2626", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "1MiB", "data": [2287.42, 2287.42, 2287.42, 2287.42, 2287.42, 2287.42, 2287.42], "borderColor": "#16a34a", "backgroundColor": "#16a34a", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "10MiB", "data": [2238.97, 2238.97, 2238.97, 2238.97, 2238.97, 2238.97, 2238.97], "borderColor": "#9333ea", "backgroundColor": "#9333ea", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "MB/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+</section><section>
+<h2>ivc-bench/receive</h2>
+<div class="chart-wrap"><canvas id="chart-2"></canvas></div>
+<script>
+new Chart(document.getElementById('chart-2'), {"type": "line", "data": {"labels": ["2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20", "2026-09-20"], "datasets": [{"label": "256KiB", "data": [1505.03, 1505.03, 1505.03, 1505.03, 1505.03, 1505.03, 1505.03], "borderColor": "#2563eb", "backgroundColor": "#2563eb", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "512KiB", "data": [1959.02, 1959.02, 1959.02, 1959.02, 1959.02, 1959.02, 1959.02], "borderColor": "#dc2626", "backgroundColor": "#dc2626", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "1MiB", "data": [2045.21, 2045.21, 2045.21, 2045.21, 2045.21, 2045.21, 2045.21], "borderColor": "#16a34a", "backgroundColor": "#16a34a", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}, {"label": "10MiB", "data": [2074.69, 2074.69, 2074.69, 2074.69, 2074.69, 2074.69, 2074.69], "borderColor": "#9333ea", "backgroundColor": "#9333ea", "fill": false, "tension": 0.15, "pointRadius": 3, "spanGaps": true}]}, "options": {"responsive": true, "maintainAspectRatio": false, "scales": {"y": {"title": {"display": true, "text": "MB/s"}}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+</section>
+</body>
+</html>
