@@ -8,11 +8,25 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from scripts.test.check_ci_routing import mapping_block, named_step_block
+from scripts.test.check_ci_routing import (
+    list_items_in_order,
+    mapping_block,
+    named_step_block,
+)
+# The CI unittest invocation lists test modules explicitly; importing the Pages
+# script tests here keeps them part of the routing suite.
+from scripts.test.test_ci_perf_pages import (  # noqa: F401
+    FetchPublishedFileTests,
+    PrepareDashboardTests,
+)
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CI_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/ci.yml"
+STARRY_APPS_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/starry-apps.yml"
+AXVISOR_NIGHTLY_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/axvisor-nightly.yml"
+BENCHMARKS_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/benchmarks.yml"
+DOCS_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/docs.yml"
 REUSABLE_CHECK_MATRIX = (
     WORKSPACE_ROOT / ".github/workflows/reusable-check-matrix.yml"
 )
@@ -140,6 +154,202 @@ class MatrixParallelismTests(unittest.TestCase):
             reusable_workflow,
             r"(?ms)^      max_parallel:\n.*?^        default: (?:[2-9]|[1-9][0-9]+)$",
         )
+
+
+class ScheduledWorkflowOwnershipTests(unittest.TestCase):
+    def test_ci_pull_request_paths_cover_daily_workflows(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        triggers = mapping_block(workflow, "on", 0)
+        pull_request = mapping_block(triggers, "pull_request", 2)
+        paths = list_items_in_order(pull_request, "paths", 4)
+
+        for workflow_path in (
+            ".github/workflows/starry-apps.yml",
+            ".github/workflows/axvisor-nightly.yml",
+            ".github/workflows/benchmarks.yml",
+            ".github/workflows/docs.yml",
+        ):
+            self.assertIn(workflow_path, paths)
+
+    def test_benchmarks_workflow_owns_every_performance_matrix(self) -> None:
+        workflow = BENCHMARKS_WORKFLOW.read_text(encoding="utf-8")
+        triggers = mapping_block(workflow, "on", 0)
+        schedule = mapping_block(triggers, "schedule", 2)
+        jobs = mapping_block(workflow, "jobs", 0)
+        plan = mapping_block(jobs, "plan", 2)
+        plan_step = named_step_block(plan, "Plan benchmark matrices")
+
+        self.assertIn('cron: "40 21 * * *"', schedule)
+        self.assertIn("workflow_dispatch:", triggers)
+        self.assertIn("--mode benchmarks", plan_step)
+        for output in (
+            "prepare_matrix",
+            "axvisor_performance_matrix",
+            "starry_performance_matrix",
+            "starry_board_performance_matrix",
+        ):
+            self.assertIn(f"steps.matrix.outputs.{output}", plan)
+
+        for job_id, matrix_name in (
+            ("prepare", "prepare_matrix"),
+            ("axvisor_performance", "axvisor_performance_matrix"),
+            ("starry_performance", "starry_performance_matrix"),
+            ("starry_board_performance", "starry_board_performance_matrix"),
+        ):
+            with self.subTest(job_id=job_id):
+                job = mapping_block(jobs, job_id, 2)
+                self.assertTrue(job)
+                self.assertIn(
+                    "uses: ./.github/workflows/reusable-check-matrix.yml",
+                    job,
+                )
+                self.assertIn(
+                    f"matrix_json: ${{{{ needs.plan.outputs.{matrix_name} }}}}",
+                    job,
+                )
+
+        board_job = mapping_block(jobs, "starry_board_performance", 2)
+        self.assertIn("max_parallel: 1", board_job)
+
+        self.assertNotIn("perf-data", workflow)
+        self.assertNotIn("perf-history-axvisor", workflow)
+        self.assertNotIn("perf-history-starry", workflow)
+        self.assertNotIn("git push", workflow)
+        self.assertNotIn("push --force", workflow)
+        self.assertNotIn("git commit-tree", workflow)
+        self.assertNotIn("git mktree", workflow)
+
+        benchmark_updates = mapping_block(jobs, "benchmark-updates", 2)
+        self.assertTrue(benchmark_updates)
+        self.assertIn("axvisor-nightly-performance-*", benchmark_updates)
+        self.assertIn("continue-on-error: true", benchmark_updates)
+        self.assertIn("needs.plan.result == 'success'", benchmark_updates)
+        self.assertNotIn(
+            "needs.axvisor_performance.result == 'success'",
+            benchmark_updates,
+        )
+        self.assertIn("starry-apps-nightly-performance-*", benchmark_updates)
+        self.assertIn(
+            "needs.starry_performance.result == 'success'",
+            benchmark_updates,
+        )
+        self.assertIn(
+            "needs.starry_board_performance.result == 'success'",
+            benchmark_updates,
+        )
+        self.assertIn("name: benchmark-updates", benchmark_updates)
+        self.assertIn("retention-days: 30", benchmark_updates)
+        self.assertIn(
+            "steps.updates.outputs.has_updates == 'true'",
+            benchmark_updates,
+        )
+        self.assertIn("gh workflow run docs.yml --ref dev", benchmark_updates)
+        for dispatch_input in (
+            "benchmark_run_id",
+            "benchmark_revision",
+            "benchmark_date",
+        ):
+            self.assertIn(f"-f {dispatch_input}=", benchmark_updates)
+
+    def test_docs_workflow_is_the_only_published_benchmark_writer(self) -> None:
+        workflow = DOCS_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("git push", workflow)
+        self.assertNotIn("push --force", workflow)
+
+        triggers = mapping_block(workflow, "on", 0)
+        dispatch = mapping_block(triggers, "workflow_dispatch", 2)
+        for input_name in (
+            "benchmark_run_id",
+            "benchmark_revision",
+            "benchmark_date",
+        ):
+            self.assertIn(f"{input_name}:", dispatch)
+
+        permissions = mapping_block(workflow, "permissions", 0)
+        self.assertIn("actions: read", permissions)
+        self.assertIn("contents: read", permissions)
+        self.assertIn("pages: write", permissions)
+        self.assertIn("id-token: write", permissions)
+
+        concurrency = mapping_block(workflow, "concurrency", 0)
+        self.assertIn("group: docs-pages", concurrency)
+        self.assertIn("queue: max", concurrency)
+        self.assertNotIn("cancel-in-progress", concurrency)
+
+        jobs = mapping_block(workflow, "jobs", 0)
+        build = mapping_block(jobs, "build", 2)
+        pages = named_step_block(build, "Set up Pages")
+        self.assertIn("id: pages", pages)
+        self.assertIn("uses: actions/configure-pages@v6", pages)
+
+        download = named_step_block(build, "Download benchmark updates")
+        self.assertIn(
+            "github.event_name == 'workflow_dispatch'",
+            download,
+        )
+        self.assertIn("inputs.benchmark_run_id != ''", download)
+        self.assertIn("name: benchmark-updates", download)
+        self.assertIn("run-id: ${{ inputs.benchmark_run_id }}", download)
+        self.assertIn("github-token: ${{ github.token }}", download)
+
+        prepare = named_step_block(build, "Prepare performance dashboard")
+        for fragment in (
+            "PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}",
+            "BENCHMARK_UPDATES: ${{ runner.temp }}/benchmark-updates",
+            "python3 scripts/test/ci_perf_pages.py",
+            '--base-url "${PAGES_BASE_URL}"',
+            "--output-dir docs/build",
+            '--updates-dir "${BENCHMARK_UPDATES}"',
+            '--benchmark-run-id "${BENCHMARK_RUN_ID}"',
+            '--benchmark-revision "${BENCHMARK_REVISION}"',
+            '--benchmark-date "${BENCHMARK_DATE}"',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, prepare)
+        # The fetch, cache-buster, legacy bootstrap and merge branches moved
+        # into ci_perf_pages.py, so the workflow step must not keep them.
+        for fragment in (
+            "curl ",
+            "--header 'Cache-Control: no-cache'",
+            "cache_buster=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+            "git fetch --depth=1 origin perf-data",
+            "git show FETCH_HEAD:history.json",
+            "git show FETCH_HEAD:index.html",
+            "::error::Failed to fetch",
+            "::error::Unexpected published dashboard state",
+            "docs/build/benchmark/index.html",
+            "docs/build/benchmark/history.json",
+        ):
+            with self.subTest(removed_fragment=fragment):
+                self.assertNotIn(fragment, prepare)
+        self.assertNotIn("perf-data", workflow)
+        self.assertLess(
+            build.index("- name: Set up Pages"),
+            build.index("- name: Prepare performance dashboard"),
+        )
+        self.assertLess(
+            build.index("- name: Prepare performance dashboard"),
+            build.index("- name: Upload Pages artifact"),
+        )
+
+        deploy = mapping_block(jobs, "deploy", 2)
+        self.assertIn("name: github-pages", deploy)
+        self.assertIn("uses: actions/deploy-pages@v5", deploy)
+
+    def test_daily_workflows_do_not_own_benchmark_execution(self) -> None:
+        starry_apps = STARRY_APPS_WORKFLOW.read_text(encoding="utf-8")
+        axvisor_nightly = AXVISOR_NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("--mode starry-apps", starry_apps)
+        self.assertIn("--mode axvisor-nightly", axvisor_nightly)
+        for workflow in (starry_apps, axvisor_nightly):
+            self.assertNotIn("benchmarks.toml", workflow)
+            self.assertNotIn("performance_matrix", workflow)
+            self.assertNotIn("axvisor-nightly-performance", workflow)
+            self.assertNotIn("starry-apps-nightly-performance", workflow)
+            self.assertNotIn("--source axvisor", workflow)
+            self.assertNotIn("--source starry", workflow)
+            self.assertNotIn("perf-data-publish", workflow)
 
 
 class WifiSecretRoutingTests(unittest.TestCase):
